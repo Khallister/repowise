@@ -119,6 +119,34 @@ class TestTsTypeRefExtraction:
         assert "Inner" in names
         assert "ns" not in names
 
+    def test_generic_call_type_arg_captured(self) -> None:
+        """Type arg in a generic call: defineEmits<Emits>() must capture Emits."""
+        refs = self._parse(
+            "interface Emits { (e: 'click'): void }\n"
+            "const emit = defineEmits<Emits>()\n"
+        )
+        names = {r.type_name for r in refs}
+        assert "Emits" in names
+
+    def test_generic_new_expression_type_arg_captured(self) -> None:
+        """Type arg in new expression: new Map<string, Config>() must capture Config."""
+        refs = self._parse(
+            "interface Config { key: string }\n"
+            "const m = new Map<string, Config>()\n"
+        )
+        names = {r.type_name for r in refs}
+        assert "Config" in names
+        assert "string" not in names  # builtin filtered
+
+    def test_ref_composable_type_arg_captured(self) -> None:
+        """Vue composables: ref<State>(), reactive<State>() must capture State."""
+        refs = self._parse(
+            "interface State { count: number }\n"
+            "const s = ref<State>({ count: 0 })\n"
+        )
+        names = {r.type_name for r in refs}
+        assert "State" in names
+
 
 # ---------------------------------------------------------------------------
 # type_use edges + dead-code outcome (end-to-end through GraphBuilder)
@@ -225,6 +253,49 @@ class TestTsDeadCodeOutcome:
             if f.kind == DeadCodeKind.UNUSED_EXPORT
         }
         assert "GenuinelyDead" in unused
+
+    def test_interface_used_only_as_generic_call_arg_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """Exported interface used only as defineEmits<Emits>() type arg in the
+        same file must NOT be flagged — local_type_uses rescue must fire."""
+        sources = {
+            "component.ts": (
+                "export interface Emits {\n"
+                "  (e: 'update:modelValue', value: string): void\n"
+                "  (e: 'input', value: string): void\n"
+                "}\n"
+                "export const emit = defineEmits<Emits>()\n"
+            ),
+            "entry.ts": "import './component'\n",
+        }
+        report = self._report(_build_graph(tmp_path, sources))
+        unused = {
+            f.symbol_name
+            for f in report.findings
+            if f.kind == DeadCodeKind.UNUSED_EXPORT
+        }
+        assert "Emits" not in unused
+
+    def test_interface_used_as_ref_type_arg_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """Exported interface used only as ref<State>() type arg in the same
+        file must NOT be flagged."""
+        sources = {
+            "store.ts": (
+                "export interface State { count: number }\n"
+                "export const state = ref<State>({ count: 0 })\n"
+            ),
+            "entry.ts": "import './store'\n",
+        }
+        report = self._report(_build_graph(tmp_path, sources))
+        unused = {
+            f.symbol_name
+            for f in report.findings
+            if f.kind == DeadCodeKind.UNUSED_EXPORT
+        }
+        assert "State" not in unused
 
 
 # ---------------------------------------------------------------------------

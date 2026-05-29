@@ -200,3 +200,12 @@
 (union_type (_) @param.type)
 (intersection_type (_) @param.type)
 (conditional_type (_) @param.type)
+
+; Generic type arguments in call and new expressions:
+;   defineEmits<Emits>()  ref<State>()  new Map<string, MyType>()
+; Without these, a locally-defined interface/type alias used only as a
+; generic argument reads as unreferenced and is flagged as dead code.
+(call_expression
+  type_arguments: (type_arguments (_) @param.type))
+(new_expression
+  type_arguments: (type_arguments (_) @param.type))
