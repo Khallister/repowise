@@ -203,3 +203,43 @@ function multi(
         multi = next(s for s in result.symbols if s.name == "multi")
         assert multi.start_line == 4
         assert multi.end_line == 7
+
+
+class TestDynamicImports:
+    def test_dynamic_import_vue_component(self) -> None:
+        """import('./Component.vue') must be captured as an import edge."""
+        src = """\
+<script setup lang="ts">
+import { defineAsyncComponent } from 'vue'
+const Tab = defineAsyncComponent(() => import('./Tabs/CommonTasksTab.vue'))
+</script>
+"""
+        result = _parse(src)
+        modules = {imp.module_path for imp in result.imports}
+        assert "./Tabs/CommonTasksTab.vue" in modules
+
+    def test_dynamic_import_plain_script(self) -> None:
+        """Dynamic import in a plain <script> block (no setup) is also captured."""
+        src = """\
+<script lang="ts">
+const LazyView = () => import('./views/LazyView.vue')
+</script>
+"""
+        result = _parse(src)
+        modules = {imp.module_path for imp in result.imports}
+        assert "./views/LazyView.vue" in modules
+
+    def test_dynamic_import_alongside_static(self) -> None:
+        """Static and dynamic imports are both captured in the same file."""
+        src = """\
+<script setup lang="ts">
+import { ref } from 'vue'
+import StaticComp from './components/StaticComp.vue'
+const DynamicComp = defineAsyncComponent(() => import('./components/DynamicComp.vue'))
+</script>
+"""
+        result = _parse(src)
+        modules = {imp.module_path for imp in result.imports}
+        assert "vue" in modules
+        assert "./components/StaticComp.vue" in modules
+        assert "./components/DynamicComp.vue" in modules

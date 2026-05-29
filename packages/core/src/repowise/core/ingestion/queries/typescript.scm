@@ -89,6 +89,17 @@
   source: (string) @import.module
 ) @import.statement
 
+; Dynamic import: import('./module') / import('./Component.vue')
+; The `import` keyword in call position is a dedicated tree-sitter node
+; type (not an identifier), so this pattern only matches real dynamic
+; imports and never fires on a user-defined function named "import".
+(call_expression
+  function: (import)
+  arguments: (arguments
+    (string) @import.module
+  )
+) @import.statement
+
 ; ---------------------------------------------------------------------------
 ; Calls
 ; ---------------------------------------------------------------------------

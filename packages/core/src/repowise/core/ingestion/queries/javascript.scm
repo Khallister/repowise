@@ -44,6 +44,14 @@
   source: (string) @import.module
 ) @import.statement
 
+; Dynamic import: import('./module') / import('./Component.vue')
+(call_expression
+  function: (import)
+  arguments: (arguments
+    (string) @import.module
+  )
+) @import.statement
+
 ; ---------------------------------------------------------------------------
 ; Calls
 ; ---------------------------------------------------------------------------
