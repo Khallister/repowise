@@ -38,6 +38,7 @@ from .scala import ScalaDynamicHints
 from .jvm import JvmDynamicHints
 from .spring import SpringDynamicHints
 from .swift import SwiftDynamicHints
+from .vue import VueDynamicHints
 from .xaml import XamlDynamicHints
 
 log = structlog.get_logger(__name__)
@@ -61,6 +62,7 @@ class HintRegistry:
             PythonDynamicHints(),
             NodeDynamicHints(),
             AlpineDynamicHints(),
+            VueDynamicHints(),
             DotNetDynamicHints(),
             XamlDynamicHints(),
             SpringDynamicHints(),

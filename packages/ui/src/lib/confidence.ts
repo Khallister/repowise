@@ -70,6 +70,7 @@ export const LANGUAGE_COLORS: Record<string, string> = {
   python: "#3776AB",
   typescript: "#3178C6",
   javascript: "#3178C6",
+  vue: "#41b883",
   go: "#00ADD8",
   rust: "#DEA584",
   java: "#ED8B00",

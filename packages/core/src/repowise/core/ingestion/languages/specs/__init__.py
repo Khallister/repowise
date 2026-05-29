@@ -52,6 +52,7 @@ from .terraform import SPEC as _TERRAFORM
 from .toml import SPEC as _TOML
 from .typescript import SPEC as _TYPESCRIPT
 from .unknown import SPEC as _UNKNOWN
+from .vue import SPEC as _VUE
 from .xaml import SPEC as _XAML
 from .yaml import SPEC as _YAML
 from .zig import SPEC as _ZIG
@@ -64,6 +65,7 @@ ALL_SPECS: tuple[LanguageSpec, ...] = (
     _PYTHON,
     _TYPESCRIPT,
     _JAVASCRIPT,
+    _VUE,
     _GO,
     _RUST,
     _JAVA,

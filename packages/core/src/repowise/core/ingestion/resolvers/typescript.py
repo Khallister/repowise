@@ -22,6 +22,10 @@ def resolve_ts_js_import(module_path: str, importer_path: str, ctx: ResolverCont
         base_posix = posixpath.normpath(
             posixpath.join(importer_dir.as_posix(), module_path)
         )
+        # Try the exact path first — handles imports that already carry an
+        # explicit extension, e.g. `import Nav from './Nav.vue'`.
+        if base_posix in ctx.path_set:
+            return base_posix
         exts: tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js")
         if ctx.has_sfc_files:
             exts = exts + (".vue", ".svelte", ".astro")

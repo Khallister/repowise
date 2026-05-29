@@ -51,6 +51,7 @@ from .models import (
     CallSite,
     FileInfo,
     Import,
+    LanguageTag,
     ParsedFile,
     Symbol,
     TypeReference,
@@ -77,6 +78,13 @@ log = structlog.get_logger(__name__)
 # can decide whether to add the file to ``_NEVER_FLAG_PATTERNS`` or to
 # exclude it via traversal.
 _SYMBOL_COUNT_WARN_THRESHOLD = 500
+
+# Matches <script> and <script setup> blocks in Vue SFCs.
+# Named groups: attrs (everything between <script and >), body (content).
+_VUE_SCRIPT_RE = re.compile(
+    r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 QUERIES_DIR = Path(__file__).parent / "queries"
 
@@ -219,6 +227,10 @@ class ASTParser:
     def parse_file(self, file_info: FileInfo, source: bytes) -> ParsedFile:
         """Parse *source* bytes and return a fully populated ParsedFile."""
         lang = file_info.language
+
+        if lang == "vue":
+            return self._parse_vue(file_info, source)
+
         config = LANGUAGE_CONFIGS.get(lang)
         # .tsx files need the JSX-aware grammar; tree-sitter-typescript's
         # default `language_typescript` errors out on every `<Component />`
@@ -292,6 +304,78 @@ class ASTParser:
             docstring=docstring,
             parse_errors=parse_errors,
             type_refs=type_refs,
+        )
+
+    # ------------------------------------------------------------------
+    # Vue SFC handler
+    # ------------------------------------------------------------------
+
+    def _parse_vue(self, file_info: FileInfo, source: bytes) -> ParsedFile:
+        """Two-phase Vue SFC parse: extract <script> block, re-parse as TS/JS.
+
+        Prefers <script setup> over plain <script> when both are present.
+        Falls back to JavaScript when no lang="ts" attribute is found.
+        Line numbers are corrected by counting newlines before the script body
+        so they reference the full .vue file, not the extracted block.
+        """
+        text = source.decode("utf-8", errors="replace")
+        script_body: str | None = None
+        inner_lang: LanguageTag = "typescript"
+        script_line_offset: int = 0
+
+        for m in _VUE_SCRIPT_RE.finditer(text):
+            attrs = m.group("attrs")
+            body = m.group("body")
+            is_ts = 'lang="ts"' in attrs or "lang='ts'" in attrs
+            candidate_lang: LanguageTag = "typescript" if is_ts else "javascript"
+            if "setup" in attrs:
+                script_body = body
+                inner_lang = candidate_lang
+                script_line_offset = text[: m.start("body")].count("\n")
+                break
+            if script_body is None:
+                script_body = body
+                inner_lang = candidate_lang
+                script_line_offset = text[: m.start("body")].count("\n")
+
+        if not script_body or not script_body.strip():
+            return ParsedFile(file_info=file_info, symbols=[], imports=[], exports=[])
+
+        inner_file_info = FileInfo(
+            path=file_info.path,
+            abs_path=file_info.abs_path,
+            language=inner_lang,
+            size_bytes=len(script_body.encode("utf-8")),
+            git_hash=file_info.git_hash,
+            last_modified=file_info.last_modified,
+            is_test=file_info.is_test,
+            is_config=False,
+            is_api_contract=False,
+            is_entry_point=False,
+        )
+        inner = self.parse_file(inner_file_info, script_body.encode("utf-8"))
+
+        if script_line_offset:
+            for sym in inner.symbols:
+                sym.start_line += script_line_offset
+                sym.end_line += script_line_offset
+            for call in inner.calls:
+                call.line += script_line_offset
+            for rel in inner.heritage:
+                rel.line += script_line_offset
+            for ref in inner.type_refs:
+                ref.line += script_line_offset
+
+        return ParsedFile(
+            file_info=file_info,
+            symbols=inner.symbols,
+            imports=inner.imports,
+            exports=inner.exports,
+            calls=inner.calls,
+            heritage=inner.heritage,
+            docstring=inner.docstring,
+            parse_errors=inner.parse_errors,
+            type_refs=inner.type_refs,
         )
 
     # ------------------------------------------------------------------

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import networkx as nx
 
+from repowise.core.ingestion.resolvers import resolve_import
 from repowise.core.ingestion.resolvers.context import ResolverContext
 from repowise.core.ingestion.resolvers.ts_workspace import (
     build_workspace_map,
@@ -46,6 +47,27 @@ class TestSfcExtensions:
         assert ctx.has_sfc_files is False
         result = resolve_ts_js_import("./missing", "src/foo.ts", ctx)
         assert result is None
+
+    def test_explicit_vue_extension_in_import(self, tmp_path: Path) -> None:
+        # `import Nav from './components/Nav.vue'` — specifier already has
+        # the .vue suffix; the resolver must return it verbatim instead of
+        # appending another extension and returning None.
+        ctx = _ctx(tmp_path, ["src/components/Nav.vue", "src/App.vue"])
+        result = resolve_ts_js_import("./components/Nav.vue", "src/App.vue", ctx)
+        assert result == "src/components/Nav.vue"
+
+    def test_explicit_vue_extension_from_vue_file(self, tmp_path: Path) -> None:
+        # Vue-language importer: resolve_import must dispatch to TS/JS resolver
+        # (not generic stem-matching) when language="vue".
+        ctx = _ctx(tmp_path, ["src/components/Nav.vue", "src/App.vue"])
+        result = resolve_import("./components/Nav.vue", "src/App.vue", "vue", ctx)
+        assert result == "src/components/Nav.vue"
+
+    def test_vue_language_extensionless_import(self, tmp_path: Path) -> None:
+        # Extensionless import from a .vue file resolved via language="vue".
+        ctx = _ctx(tmp_path, ["src/components/Button.vue", "src/App.vue"])
+        result = resolve_import("./components/Button", "src/App.vue", "vue", ctx)
+        assert result == "src/components/Button.vue"
 
 
 class TestWorkspaceMap:

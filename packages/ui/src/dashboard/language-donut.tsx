@@ -8,6 +8,7 @@ const LANG_COLORS: Record<string, string> = {
   python: "var(--color-lang-python)",
   typescript: "var(--color-lang-typescript)",
   javascript: "var(--color-lang-typescript)",
+  vue: "var(--color-lang-vue)",
   go: "var(--color-lang-go)",
   rust: "var(--color-lang-rust)",
   java: "var(--color-lang-java)",

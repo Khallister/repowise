@@ -32,6 +32,8 @@ class GraphEdgeResponse(BaseModel):
     source: str
     target: str
     imported_names: list[str]
+    edge_type: str = "imports"
+    confidence: float = 1.0
 
 
 class GraphExportResponse(BaseModel):

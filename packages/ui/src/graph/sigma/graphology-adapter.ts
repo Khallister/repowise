@@ -35,6 +35,9 @@ function classifyEdge(
 ): SigmaEdgeAttributes["edgeKind"] {
   if (link.confidence !== undefined && link.confidence < 0.5)
     return "lowConfidence";
+  // Use explicit edge_type when the server provides it.
+  // Fall back to the imported_names heuristic for older backends.
+  if (link.edge_type && link.edge_type !== "imports") return "dynamic";
   if (link.imported_names.length === 0) return "dynamic";
   const sourceNode = nodeMap.get(link.source);
   const targetNode = nodeMap.get(link.target);

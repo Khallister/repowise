@@ -22,6 +22,7 @@ LanguageTag = Literal[
     "python",
     "typescript",
     "javascript",
+    "vue",
     "go",
     "rust",
     "java",
