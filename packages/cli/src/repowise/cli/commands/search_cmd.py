@@ -10,7 +10,6 @@ from repowise.cli.helpers import (
     ensure_repowise_dir,
     get_db_url_for_repo,
     resolve_command_target,
-    resolve_repo_path,
     run_async,
 )
 
@@ -71,9 +70,7 @@ def search_command(
     if target.is_workspace:
         assert target.ws_root is not None and target.ws_config is not None
         if search_all:
-            repo_paths = [
-                (target.ws_root / e.path).resolve() for e in target.ws_config.repos
-            ]
+            repo_paths = [(target.ws_root / e.path).resolve() for e in target.ws_config.repos]
         elif target.repo_filter is not None:
             picked = target.resolve_repo_alias(target.repo_filter)
             if picked is None:
@@ -152,26 +149,16 @@ def _search_semantic(repo_path, query: str, limit: int) -> None:
     async def _run():
         from pathlib import Path
 
-        from repowise.core.persistence import MockEmbedder
-
         # Try LanceDB first (populated during repowise init)
         lance_dir = Path(repo_path) / ".repowise" / "lancedb"
         if lance_dir.exists():
             try:
                 from repowise.cli.commands.init_cmd import _resolve_embedder
+                from repowise.cli.providers.embedders import build_embedder
                 from repowise.core.persistence.vector_store import LanceDBVectorStore
 
                 embedder_name = _resolve_embedder(None)
-                if embedder_name == "gemini":
-                    from repowise.core.providers.embedding.gemini import GeminiEmbedder
-
-                    embedder = GeminiEmbedder()
-                elif embedder_name == "openai":
-                    from repowise.core.providers.embedding.openai import OpenAIEmbedder
-
-                    embedder = OpenAIEmbedder()
-                else:
-                    embedder = MockEmbedder()
+                embedder = build_embedder(embedder_name)
                 store = LanceDBVectorStore(str(lance_dir), embedder=embedder)
                 results = await store.search(query, limit=limit)
                 await store.close()
@@ -280,25 +267,17 @@ def _collect_semantic(repo_path, query: str, limit: int):
     async def _run():
         from pathlib import Path
 
-        from repowise.core.persistence import FullTextSearch, MockEmbedder, create_engine
+        from repowise.core.persistence import FullTextSearch, create_engine
 
         lance_dir = Path(repo_path) / ".repowise" / "lancedb"
         if lance_dir.exists():
             try:
                 from repowise.cli.commands.init_cmd import _resolve_embedder
+                from repowise.cli.providers.embedders import build_embedder
                 from repowise.core.persistence.vector_store import LanceDBVectorStore
 
                 embedder_name = _resolve_embedder(None)
-                if embedder_name == "gemini":
-                    from repowise.core.providers.embedding.gemini import GeminiEmbedder
-
-                    embedder = GeminiEmbedder()
-                elif embedder_name == "openai":
-                    from repowise.core.providers.embedding.openai import OpenAIEmbedder
-
-                    embedder = OpenAIEmbedder()
-                else:
-                    embedder = MockEmbedder()
+                embedder = build_embedder(embedder_name)
                 store = LanceDBVectorStore(str(lance_dir), embedder=embedder)
                 results = await store.search(query, limit=limit)
                 await store.close()

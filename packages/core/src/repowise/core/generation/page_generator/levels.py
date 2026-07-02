@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ...analysis.knowledge_graph import _slugify
 from .. import onboarding as _onboarding
 from ..context_assembler import FilePageContext
 from ..models import compute_page_id
@@ -130,6 +131,59 @@ async def _prefetch_dependency_summaries(run: _GenerationRun) -> None:
         log.debug("rag.batch_dep_prefetch_failed", error=str(exc))
 
 
+async def _prefetch_rag_context(
+    run: _GenerationRun, items: list[tuple[Any, FilePageContext]]
+) -> bool:
+    """Resolve RAG context for all tier-1 file pages in one batched search.
+
+    Replicates the per-page gating in ``_generate_file_page_from_ctx`` (flag,
+    store size, query-term derivation, self-exclusion) but runs BEFORE the
+    level starts, outside the LLM semaphore, with all queries embedded in a
+    single embedder call via :meth:`VectorStore.search_many`. The store is
+    static for the whole level (pages embed in one batch at level end), so
+    prefetched results are identical to what each page would have fetched.
+
+    Returns True when the per-page search can be skipped (results resolved,
+    or the per-page gate would have skipped every search anyway); False on
+    batch failure so pages fall back to the per-page path.
+    """
+    if run.vector_store is None or not getattr(run.config, "enable_rag_context", True):
+        return False
+    min_store_size = max(0, int(getattr(run.config, "rag_min_store_size", 10) or 0))
+    if min_store_size > 0:
+        try:
+            current_ids = await run.vector_store.list_page_ids()
+            if len(current_ids) < min_store_size:
+                # Store too small for useful RAG — the per-page gate would
+                # skip every search this level, so there is nothing to fetch.
+                return True
+        except Exception:
+            pass  # same as the per-page gate: fall through to the search
+    queries: list[str] = []
+    targets: list[tuple[Any, FilePageContext]] = []
+    for p, ctx in items:
+        query_terms = p.exports or [
+            s["name"] for s in ctx.symbols[:3] if s.get("visibility") == "public"
+        ]
+        if not query_terms:
+            continue
+        queries.append(", ".join(query_terms[:5]))
+        targets.append((p, ctx))
+    if not queries:
+        return True
+    try:
+        all_results = await run.vector_store.search_many(queries, limit=3)
+    except Exception as exc:
+        log.debug("rag.batch_search_failed", error=str(exc))
+        return False
+    for (p, ctx), results in zip(targets, all_results, strict=False):
+        self_id = f"file_page:{p.file_info.path}"
+        ctx.rag_context = [
+            f"[{r.page_id}]\n{r.snippet}" for r in results if r.page_id != self_id
+        ]
+    return True
+
+
 async def build_level2_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
     """Level 2 (file_page): topo-ordered context assembly + tier routing.
 
@@ -141,7 +195,13 @@ async def build_level2_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
     _topo_order_code_files(run)
     await _prefetch_dependency_summaries(run)
 
-    coros: list[tuple[str, Any]] = []
+    # One pass over the graph's symbol nodes feeds every file's call-graph /
+    # heritage extraction (instead of a full node scan per file).
+    from ..context.graph_intelligence import build_symbol_index
+
+    symbol_index = build_symbol_index(run.graph)
+
+    items: list[tuple[Any, FilePageContext]] = []
     for p in run.code_files:
         kg_file_ctx = run.kg_ctx.get_file_context(p.file_info.path) if run.kg_ctx.available else None
         ctx: FilePageContext = gen._assembler.assemble_file_page(
@@ -156,13 +216,32 @@ async def build_level2_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
             dead_code_findings=run.dead_code_by_file.get(p.file_info.path),
             decision_records=run.decisions_by_file.get(p.file_info.path),
             kg_context=kg_file_ctx,
+            symbol_index=symbol_index,
         )
         run.file_page_contexts[p.file_info.path] = ctx
+        items.append((p, ctx))
+
+    def _emits_tier1(p: Any) -> bool:
+        path = p.file_info.path
+        return (
+            path in run.sel_file_paths
+            and path in run.tier1_paths
+            and compute_page_id("file_page", path) not in run.completed_ids
+        )
+
+    rag_prefetched = await _prefetch_rag_context(
+        run, [(p, ctx) for p, ctx in items if _emits_tier1(p)]
+    )
+
+    coros: list[tuple[str, Any]] = []
+    for p, ctx in items:
         path = p.file_info.path
         pid = compute_page_id("file_page", path)
         if path in run.sel_file_paths and pid not in run.completed_ids:
             if path in run.tier1_paths:
-                coros.append((pid, gen._generate_file_page_from_ctx(p, ctx)))
+                coros.append(
+                    (pid, gen._generate_file_page_from_ctx(p, ctx, rag_prefetched=rag_prefetched))
+                )
             else:
                 coros.append((pid, gen._generate_file_page_tier2(p, ctx)))
     return coros
@@ -239,7 +318,13 @@ def build_level5_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
             continue
 
         layer_name = layer.get("name", "")
-        page_id = compute_page_id("layer_page", f"layer:{layer_name}")
+        # Key the page by the layer's STABLE slug id (``layer:<slug>``), not its
+        # display name: the LLM layer-name enrichment rewrites ``name`` after
+        # generation, so a name-keyed page would no longer join to its KG layer.
+        # ``id`` is derived from the deterministic heuristic name at curation
+        # time and never changes under enrichment.
+        layer_id = layer.get("id", "") or f"layer:{_slugify(layer_name)}"
+        page_id = compute_page_id("layer_page", layer_id)
         if page_id in run.completed_ids:
             continue
 
@@ -276,6 +361,7 @@ def build_level5_coros(run: _GenerationRun) -> list[tuple[str, Any]]:
 
         ctx = LayerPageContext(
             layer_name=layer_name,
+            layer_id=layer_id,
             layer_description=layer.get("description", ""),
             file_count=len(file_paths),
             key_files=key_files,

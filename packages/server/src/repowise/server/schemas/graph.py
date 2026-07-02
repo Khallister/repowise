@@ -19,7 +19,7 @@ class GraphNodeResponse(BaseModel):
     is_test: bool = False
     is_entry_point: bool = False
     has_doc: bool = False
-    # Cross-link signals (populated by _collect_node_signals)
+    # Cross-link signals (populated by services.node_signals.collect_node_signals)
     is_hotspot: bool = False
     churn_percentile: float | None = None
     is_dead: bool = False
@@ -69,6 +69,23 @@ class ArchitectureEdgeResponse(BaseModel):
 class ArchitectureGraphResponse(BaseModel):
     nodes: list[ArchitectureNodeResponse]
     edges: list[ArchitectureEdgeResponse]
+
+
+class CommunitySliceNodeResponse(GraphNodeResponse):
+    # True for one-hop neighbor stubs outside the community: rendered tiny/dimmed
+    # so cross-cluster edges can draw, without pulling the whole neighbor cluster in.
+    is_boundary: bool = False
+
+
+class CommunitySliceResponse(BaseModel):
+    # Member nodes of the community plus minimal one-hop boundary stubs.
+    nodes: list[CommunitySliceNodeResponse]
+    # Edges among members, plus member<->boundary edges (cross-cluster links).
+    links: list[GraphEdgeResponse]
+    community_id: int
+    member_count: int
+    # True if members were capped (very large community).
+    truncated: bool = False
 
 
 class EgoGraphResponse(BaseModel):

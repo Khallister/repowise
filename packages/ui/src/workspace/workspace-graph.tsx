@@ -27,6 +27,7 @@ export interface WorkspaceGraphData {
     file_count: number;
     coverage_pct: number;
     health_score: number;
+    health_score_source?: "canonical" | "derived";
     top_language: string;
   }>;
   edges: Array<{
@@ -90,6 +91,7 @@ function computeLayout(data: WorkspaceGraphData): { nodes: Node[]; edges: Edge[]
         fileCount: apiNode.file_count,
         coveragePct: apiNode.coverage_pct,
         healthScore: apiNode.health_score,
+        healthScoreSource: apiNode.health_score_source ?? "derived",
         topLanguage: apiNode.top_language,
       } satisfies WorkspaceGraphNodeData,
     };
@@ -103,8 +105,8 @@ function computeLayout(data: WorkspaceGraphData): { nodes: Node[]; edges: Edge[]
       target: e.target,
       label: e.label ?? undefined,
       style: {
-        strokeWidth: 1 + e.strength * 4,
-        stroke: e.type === "contract" ? "#3b82f6" : "#8b5cf6",
+        strokeWidth: Math.min(1 + e.strength * 4, 10),
+        stroke: e.type === "contract" ? "var(--color-accent-secondary)" : "var(--color-edge-co-change)",
         strokeDasharray: e.type === "co_change" ? "6 3" : undefined,
       },
       labelStyle: { fontSize: 10, fill: "var(--color-text-tertiary)" },

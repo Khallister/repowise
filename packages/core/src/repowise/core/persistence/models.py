@@ -19,6 +19,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -207,6 +208,10 @@ class ExternalSystem(Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     ecosystem: Mapped[str] = mapped_column(String(32), nullable=False)
     category: Mapped[str] = mapped_column(String(32), nullable=False, default="library")
+    # Boundary type in {db, network, filesystem, subprocess, lock}; nullable.
+    # NULL means "untyped" and every consumer (C4, perf, security) degrades
+    # gracefully. Populated by ingestion.external_systems.io_kind.
+    io_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     declared_in: Mapped[str] = mapped_column(Text, nullable=False)
     is_dev_dep: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -272,6 +277,39 @@ class GraphMetric(Base):
     )
 
     __table_args__ = (UniqueConstraint("repository_id", "node_id", name="uq_graph_metric"),)
+
+
+class GraphNodeMembership(Base):
+    """Materialized component memberships — SCCs and symbol communities.
+
+    Persists two structural facts the graph carries but never exposed as
+    queryable rows: file-level strongly-connected components (import cycles,
+    ``scc_id`` / ``scc_size`` with ``scc_size >= 2``) and symbol-level
+    communities (``symbol_community_id``). The break-cycle and move-method
+    refactoring detectors compute the same structure from the in-memory graph
+    at health time; this snapshot lets the web layer read cycles and
+    communities without rebuilding the graph. Additive to ``graph_nodes`` /
+    ``graph_metrics``; non-load-bearing.
+    """
+
+    __tablename__ = "graph_node_membership"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    node_id: Mapped[str] = mapped_column(Text, nullable=False)
+    node_type: Mapped[str] = mapped_column(String(16), nullable=False, default="file")
+    scc_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scc_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    symbol_community_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+
+    __table_args__ = (
+        UniqueConstraint("repository_id", "node_id", name="uq_graph_node_membership"),
+    )
 
 
 class WebhookEvent(Base):
@@ -388,8 +426,156 @@ class GitMetadata(Base):
     original_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     merge_commit_count_90d: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Prior-defect history: bug-fix commits touching this file in the trailing
+    # ~6-month defect window (anchored to the index's as_of reference). Consumed
+    # by the ``prior_defect`` health biomarker — a leakage-aware process signal.
+    prior_defect_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # Temporal hotspot score: exponentially time-decayed churn signal
     temporal_hotspot_score: Mapped[float | None] = mapped_column(Float, nullable=True, default=0.0)
+
+    # Change entropy (Hassan History Complexity Metric): decay-weighted sum of
+    # per-commit scatter (log2(files-touched)/files-touched) and its repo-wide
+    # percentile. Populated by the FULL-tier co-change walk.
+    change_entropy: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    change_entropy_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    # Agent-provenance rollup: how much of this file's indexed history is
+    # agent-attributed (deterministic local-channel classification — identity
+    # fields, message footers, co-author trailers; see
+    # ingestion.git_indexer.agent_provenance). agent_tier_counts_json maps
+    # autonomy tier ("1" near-autonomous / "2" human-driven / "3" assisted)
+    # to commit counts. agent_authored_pct stays NULL until the next reindex.
+    agent_commit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    agent_authored_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    agent_tier_counts_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
+    )
+
+
+class GitCommit(Base):
+    """Per-commit git history: one row per commit in the indexed window.
+
+    Captures the change-level signals the per-file ``GitMetadata`` aggregates
+    away — diff size/diffusion (Kamei change metrics) and a calibrated
+    just-in-time ``change_risk`` score — written during the same single
+    repo-wide ``git log`` walk that builds the commit index (no extra git
+    pass). The walk excludes merges, so every row is a real content change.
+    Bounded by the indexer's ``commit_limit`` (newest-first), like the rest of
+    the git data.
+    """
+
+    __tablename__ = "git_commits"
+    __table_args__ = (
+        UniqueConstraint("repository_id", "sha", name="uq_git_commit"),
+        Index("ix_git_commits_repo_risk", "repository_id", "change_risk_score"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    sha: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    # Authorship + timeline
+    author_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    author_email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    subject: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Kamei change features (diff size + diffusion of THIS change)
+    lines_added: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lines_deleted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    files_changed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dirs_changed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    subsystems_changed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    entropy: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    is_fix: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Author experience at the time of the commit: the author's cumulative prior
+    # commit count, reconstructed in-memory over the walk (no extra git pass).
+    # The one change-risk feature not derivable from the diff alone — persisted
+    # so the per-commit risk breakdown reproduces the stored score exactly.
+    author_experience: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Just-in-time change-risk: 0-10 score + level ("low"/"moderate"/"high")
+    # from the calibrated linear ``change_risk`` model. Author experience is
+    # computed in-memory across the walk (cumulative prior-commit count); the
+    # score is pure arithmetic on already-parsed diff data (zero LLM, no blame).
+    change_risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    change_risk_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # Agent provenance: which coding agent (if any) authored this commit, at
+    # what autonomy tier (1 near-autonomous bot account · 2 human-driven agent
+    # · 3 assisted/co-authored), via which attribution channel, and with what
+    # confidence band. NULL throughout = human-authored (or pre-migration rows;
+    # back-populated on the next index). Deterministic local-git channels only.
+    agent_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_autonomy_tier: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    agent_channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_confidence: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
+    )
+
+
+class GitFunctionBlame(Base):
+    """Per-function blame rollup: function-granular git signals derived from the
+    per-line ``BlameIndex`` during FULL-tier health analysis.
+
+    The blame index is built once per file (one ``git blame`` call) and was
+    previously consumed in-memory by the ``function_hotspot`` /
+    ``code_age_volatility`` biomarkers and then discarded. This table persists
+    the cheap per-function rollup (bounded by the number of *modified*
+    functions) so a function-level health surface can read it without
+    re-blaming: modification count, median line age, recent-modification count,
+    and the blame owner over the function's line range. Raw per-line blame is
+    NOT persisted (size ~ LOC x history; recomputable).
+
+    Keyed ``(repository_id, symbol_id)`` where ``symbol_id = "{path}::{name}"``
+    mirrors :class:`WikiSymbol.symbol_id`, so callers can join straight to the
+    symbol graph.
+    """
+
+    __tablename__ = "git_function_blame"
+    __table_args__ = (
+        UniqueConstraint("repository_id", "symbol_id", name="uq_git_function_blame"),
+        Index("ix_git_function_blame_repo_mods", "repository_id", "mod_count"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    # "{path}::{name}" — mirrors WikiSymbol.symbol_id.
+    symbol_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    function_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    start_line: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    end_line: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    line_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Distinct commits touching the function's line range (its churn).
+    mod_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Distinct commits touching the range within the recent window.
+    recent_mod_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Median author time (unix seconds) over the range — a line-age proxy that
+    # ages naturally; the UI derives "median age" relative to display time.
+    median_author_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Blame owner over the function's lines.
+    owner_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    owner_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    owner_line_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
@@ -700,6 +886,8 @@ class DeadCodeFinding(Base):
     last_commit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     commit_count_90d: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lines: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    start_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    end_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
     package: Mapped[str | None] = mapped_column(String(255), nullable=True)
     evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     safe_to_delete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -732,6 +920,48 @@ class HealthFinding(Base):
     details_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     health_impact: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Health dimension this finding homes under (defect / maintainability /
+    # performance). Nullable + no backfill: old rows stay NULL until the next
+    # index recomputes them; new writes always set it (defaults to "defect").
+    dimension: Mapped[str | None] = mapped_column(String(16), nullable=True, default="defect")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
+    )
+
+
+class RefactoringSuggestion(Base):
+    """One deterministic refactoring opportunity from the refactoring layer.
+
+    Mirrors the ``RefactoringSuggestion`` dataclass in
+    ``analysis/health/refactoring/models.py``. ``plan_json`` /
+    ``evidence_json`` / ``blast_radius_json`` carry the structured,
+    type-specific payloads (open dicts) so later refactoring types add no
+    columns. Written delete-then-insert per repo (or upserted per changed
+    file on incremental updates), exactly like ``health_findings``.
+    """
+
+    __tablename__ = "refactoring_suggestions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    refactoring_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    target_symbol: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    line_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    line_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    impact_delta: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    effort_bucket: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    blast_radius_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    confidence: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
+    source_biomarker: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
@@ -760,6 +990,13 @@ class HealthFileMetric(Base):
     line_coverage_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     branch_coverage_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     module: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Three-signal split. ``score`` above stays the overall surfaced number and
+    # equals ``defect_score`` until a deliberate blend decision. ``performance_score``
+    # is NULL until the performance detectors land. All nullable + no backfill:
+    # recompute on the next index repopulates them.
+    defect_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maintainability_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    performance_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
     )
@@ -859,6 +1096,8 @@ class KnowledgeGraphLayer(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     node_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Curated sub-groups within the layer: [{"id", "name", "nodeIds"}].
+    sub_groups_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
     )
@@ -877,11 +1116,66 @@ class KnowledgeGraphTourStep(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     node_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # Curated, layer-aware tour fields (empty/None for legacy LLM tours).
+    target_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    layer_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    depth: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    page_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
     )
 
     __table_args__ = (UniqueConstraint("repository_id", "step_order", name="uq_kg_tour_step"),)
+
+
+class KnowledgeGraphProjectMeta(Base):
+    """Project-level curated KG metadata — one row per repository.
+
+    Holds the ranked entry points surfaced by the curation pass so the server
+    never has to read workspace files at request time. JSON columns leave room
+    for future project-level curated metadata.
+    """
+
+    __tablename__ = "kg_project_meta"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    entry_points_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    entry_candidates_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+
+    __table_args__ = (UniqueConstraint("repository_id", name="uq_kg_project_meta"),)
+
+
+class KnowledgeGraphNodeMeta(Base):
+    """Per-node curated KG metadata (presentation view only).
+
+    Stores the curated ``type``/``summary``/``tags`` for file nodes so the
+    architecture view can prefer them over heuristics after the one-time
+    file → DB migration. The AST graph's ``graph_nodes`` rows are untouched.
+    """
+
+    __tablename__ = "kg_node_meta"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    node_id: Mapped[str] = mapped_column(Text, nullable=False)
+    node_type: Mapped[str] = mapped_column(Text, nullable=False, default="file")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    tags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+
+    __table_args__ = (UniqueConstraint("repository_id", "node_id", name="uq_kg_node_meta"),)
 
 
 class PipelineJob(Base):

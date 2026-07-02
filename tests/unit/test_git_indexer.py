@@ -248,6 +248,128 @@ class TestHotspotClassification:
             assert 0.0 <= m["churn_percentile"] <= 1.0
 
 
+class TestHotspotAbsoluteFloors:
+    """Issue #361: top-quartile percentile alone must not flag a hotspot on
+    a quiet repo — the file also needs absolute recent activity."""
+
+    @staticmethod
+    def _quiet_repo(active_meta: dict) -> list[dict]:
+        """9 dormant files + the file under test → it always tops the
+        percentile ranking, isolating the absolute floors."""
+        from repowise.core.ingestion.git_indexer.enrich import compute_percentiles
+
+        metadata_list = [
+            {
+                "file_path": f"dormant_{i}.py",
+                "commit_count_90d": 0,
+                "temporal_hotspot_score": 0.0,
+                "is_hotspot": False,
+            }
+            for i in range(9)
+        ]
+        metadata_list.append({"is_hotspot": False, **active_meta})
+        compute_percentiles(metadata_list)
+        return metadata_list
+
+    def test_single_drive_by_commit_is_not_a_hotspot(self) -> None:
+        """The issue's exact failure mode: one maintenance commit on an
+        otherwise-quiet repo made the file a top-quartile 'hotspot'."""
+        metas = self._quiet_repo(
+            {"file_path": "touched.py", "commit_count_90d": 1, "temporal_hotspot_score": 0.2}
+        )
+        touched = next(m for m in metas if m["file_path"] == "touched.py")
+        assert touched["churn_percentile"] >= 0.75  # top quartile, as before
+        assert touched["is_hotspot"] is False  # but floors hold it back
+
+    def test_repeated_trivial_commits_are_not_a_hotspot(self) -> None:
+        """3 one-line maintenance commits clear the count floor but not the
+        decayed-churn floor."""
+        metas = self._quiet_repo(
+            {"file_path": "config.py", "commit_count_90d": 3, "temporal_hotspot_score": 0.03}
+        )
+        cfg = next(m for m in metas if m["file_path"] == "config.py")
+        assert cfg["is_hotspot"] is False
+
+    def test_real_activity_is_a_hotspot(self) -> None:
+        """Repeated commits moving real lines clear both floors."""
+        metas = self._quiet_repo(
+            {"file_path": "core.py", "commit_count_90d": 4, "temporal_hotspot_score": 1.2}
+        )
+        core = next(m for m in metas if m["file_path"] == "core.py")
+        assert core["is_hotspot"] is True
+
+    def test_high_commit_volume_escape_hatch(self) -> None:
+        """8+ commits in 90d is hotspot-grade even with no line counts
+        (binary files / missing numstat)."""
+        metas = self._quiet_repo(
+            {"file_path": "assets.bin", "commit_count_90d": 9, "temporal_hotspot_score": 0.0}
+        )
+        assets = next(m for m in metas if m["file_path"] == "assets.bin")
+        assert assets["is_hotspot"] is True
+
+
+class TestCountActiveContributors:
+    """count_active_contributors derives the repo's 90-day team size from
+    per-author last_commit_ts in top_authors_json."""
+
+    @staticmethod
+    def _meta(*authors: tuple[str, int]) -> dict:
+        import json as _json
+
+        return {
+            "top_authors_json": _json.dumps(
+                [
+                    {"name": n, "email": f"{n}@x", "commit_count": 5, "last_commit_ts": ts}
+                    for n, ts in authors
+                ]
+            )
+        }
+
+    def test_counts_distinct_recent_authors(self) -> None:
+        from repowise.core.ingestion.git_indexer.enrich import count_active_contributors
+
+        anchor = 1_700_000_000
+        old = anchor - 200 * 86400  # well outside the 90d window
+        metas = [
+            self._meta(("Alice", anchor), ("Bob", anchor - 86400)),
+            self._meta(("Alice", anchor - 5 * 86400), ("Carol", old)),
+        ]
+        assert count_active_contributors(metas) == 2  # Alice + Bob; Carol aged out
+
+    def test_bots_are_excluded(self) -> None:
+        from repowise.core.ingestion.git_indexer.enrich import count_active_contributors
+
+        anchor = 1_700_000_000
+        metas = [self._meta(("Alice", anchor), ("dependabot[bot]", anchor))]
+        assert count_active_contributors(metas) == 1
+
+    def test_unknown_when_no_timestamps(self) -> None:
+        """Indexes predating per-author last_commit_ts must yield None
+        (unknown), never a phantom team size of 0."""
+        import json as _json
+
+        from repowise.core.ingestion.git_indexer.enrich import count_active_contributors
+
+        metas = [
+            {
+                "top_authors_json": _json.dumps(
+                    [{"name": "Alice", "email": "a@x", "commit_count": 7}]
+                )
+            }
+        ]
+        assert count_active_contributors(metas) is None
+        assert count_active_contributors([]) is None
+
+    def test_window_anchors_to_most_recent_author(self) -> None:
+        """Anchored to the repo's own most recent activity, not wall clock —
+        a historical checkout still gets a correct window."""
+        from repowise.core.ingestion.git_indexer.enrich import count_active_contributors
+
+        anchor = 900_000_000  # ancient wall-clock-wise; irrelevant
+        metas = [self._meta(("Alice", anchor), ("Bob", anchor - 30 * 86400))]
+        assert count_active_contributors(metas) == 2
+
+
 # ---------------------------------------------------------------------------
 # 4. test_stable_classification
 # ---------------------------------------------------------------------------
@@ -263,13 +385,13 @@ class TestStableClassification:
 
         # Build 15 commits all older than 90 days.
         # _index_file now uses repo.git.log with NUL-delimited format:
-        # \x00<sha>\x1f<author>\x1f<email>\x1f<unix_ts>\x1f<parents>\x1f<subject>\x1f<body>
+        # \x00<sha>\x1f<author>\x1f<email>\x1f<committer>\x1f<committer_email>\x1f<unix_ts>\x1f<parents>\x1f<subject>\x1f<body>
         old_date = datetime.now(UTC) - timedelta(days=180)
         log_lines = []
         for i in range(15):
             ts = int((old_date - timedelta(days=i)).timestamp())
             log_lines.append(
-                f"\x00sha{i:04d}\x1fAlice\x1falice@example.com\x1f{ts}\x1f\x1ffeat: old commit {i}\x1f"
+                f"\x00sha{i:04d}\x1fAlice\x1falice@example.com\x1fAlice\x1falice@example.com\x1f{ts}\x1f\x1ffeat: old commit {i}\x1f"
             )
         mock_repo.git.log.return_value = "\n".join(log_lines)
 
@@ -278,6 +400,181 @@ class TestStableClassification:
         assert meta["commit_count_total"] == 15
         assert meta["commit_count_90d"] == 0
         assert meta["is_stable"] is True
+
+    def test_top_authors_carry_per_author_timestamps(self) -> None:
+        """Each top-author entry records that author's own first/last commit ts
+        so the owner aggregator doesn't credit one author for another's commit."""
+        import json
+
+        indexer = GitIndexer("/tmp/repo")
+        mock_repo = MagicMock()
+
+        base = datetime.now(UTC) - timedelta(days=200)
+        # Alice: days 0 and 5 (older). Bob: day 40 (most recent on this file).
+        specs = [
+            ("Alice", "alice@example.com", base),
+            ("Alice", "alice@example.com", base + timedelta(days=5)),
+            ("Bob", "bob@example.com", base + timedelta(days=40)),
+        ]
+        log_lines = []
+        for i, (name, email, when) in enumerate(specs):
+            ts = int(when.timestamp())
+            log_lines.append(
+                f"\x00sha{i:04d}\x1f{name}\x1f{email}\x1f{name}\x1f{email}\x1f{ts}\x1f\x1ffeat: c{i}\x1f"
+            )
+        mock_repo.git.log.return_value = "\n".join(log_lines)
+
+        meta = indexer._index_file("shared.py", mock_repo)
+        authors = {a["name"]: a for a in json.loads(meta["top_authors_json"])}
+
+        alice_last = int((base + timedelta(days=5)).timestamp())
+        bob_last = int((base + timedelta(days=40)).timestamp())
+        assert authors["Alice"]["last_commit_ts"] == alice_last
+        assert authors["Alice"]["first_commit_ts"] == int(base.timestamp())
+        # Alice's last must NOT be bumped to Bob's later commit on the same file.
+        assert authors["Alice"]["last_commit_ts"] < authors["Bob"]["last_commit_ts"]
+        assert authors["Bob"]["last_commit_ts"] == bob_last
+
+
+class TestGitWindowAnchor:
+    """REPOWISE_GIT_WINDOW_ANCHOR anchors recency windows to the repo's most
+    recent commit instead of wall-clock now() — default off (product unchanged),
+    on for historical T0 scoring so windowed signals aren't silently empty."""
+
+    def _mock_repo_with_old_commits(self) -> tuple[MagicMock, datetime]:
+        mock_repo = MagicMock()
+        old_date = datetime.now(UTC) - timedelta(days=180)
+        log_lines = []
+        for i in range(15):
+            ts = int((old_date - timedelta(days=i)).timestamp())
+            log_lines.append(
+                f"\x00sha{i:04d}\x1fAlice\x1falice@example.com\x1fAlice\x1falice@example.com\x1f{ts}\x1f\x1ffeat: old {i}\x1f"
+            )
+        mock_repo.git.log.return_value = "\n".join(log_lines)
+        # HEAD tip = the newest of the (old) batch.
+        mock_repo.head.commit.committed_date = int(old_date.timestamp())
+        return mock_repo, old_date
+
+    def test_default_uses_wall_clock(self, monkeypatch) -> None:
+        monkeypatch.delenv("REPOWISE_GIT_WINDOW_ANCHOR", raising=False)
+        indexer = GitIndexer("/tmp/repo")
+        mock_repo, _ = self._mock_repo_with_old_commits()
+        meta = indexer._index_file("f.py", mock_repo)
+        # 180-day-old commits are outside a now()-anchored 90d window.
+        assert meta["commit_count_90d"] == 0
+
+    def test_anchor_to_head_commit(self, monkeypatch) -> None:
+        monkeypatch.setenv("REPOWISE_GIT_WINDOW_ANCHOR", "head")
+        indexer = GitIndexer("/tmp/repo")
+        mock_repo, _ = self._mock_repo_with_old_commits()
+        meta = indexer._index_file("f.py", mock_repo)
+        # Anchored to the latest commit, all 15 fall within its preceding 90d.
+        assert meta["commit_count_90d"] == 15
+
+
+class TestFixCommitClassifier:
+    """``is_fix_commit`` must agree byte-for-byte with the benchmark's
+    ``lib/defect_counter.find_fix_commits`` keyword rule (product == benchmark)."""
+
+    def test_include_patterns_match(self) -> None:
+        from repowise.core.ingestion.git_indexer._constants import is_fix_commit
+
+        assert is_fix_commit("fix: null deref in parser")
+        assert is_fix_commit("Resolve crash on empty input")
+        assert is_fix_commit("patch the off-by-one")
+        assert is_fix_commit("closes #123")
+        assert is_fix_commit("fixes #99 regression")
+        assert is_fix_commit("squash a nasty bug")
+
+    def test_exclude_overrides_include(self) -> None:
+        from repowise.core.ingestion.git_indexer._constants import is_fix_commit
+
+        # "fix" present, but excluded keyword wins (matches the bench's order).
+        assert not is_fix_commit("fix lint")
+        assert not is_fix_commit("fix formatting in docs")
+        assert not is_fix_commit("Merge fix branch")
+        assert not is_fix_commit("bump deps to fix CVE")
+        assert not is_fix_commit("fix a typo")
+
+    def test_non_fixes_silent(self) -> None:
+        from repowise.core.ingestion.git_indexer._constants import is_fix_commit
+
+        assert not is_fix_commit("feat: add new endpoint")
+        assert not is_fix_commit("refactor the walker")
+        assert not is_fix_commit("")
+
+
+class TestPriorDefectCount:
+    """``compute_prior_defects`` walks a dedicated windowed ``prior_sha..HEAD``
+    git-log pass (NOT the depth-capped commit index), classifies fixes with the
+    shared keyword rule, and attributes each fix to every indexable file it
+    touched — mirroring the defect benchmark's prior-defects baseline."""
+
+    def _mock_repo(self, records: list[tuple[str, list[str]]]) -> MagicMock:
+        """records: list of (subject, [touched paths]). Builds the --name-only
+        log output and routes prior_sha resolution vs the windowed walk."""
+        mock_repo = MagicMock()
+        mock_repo.head.commit.hexsha = "HEADSHA"
+        chunks = []
+        for i, (subject, paths) in enumerate(records):
+            body = "\n".join(paths)
+            chunks.append(f"\x00sha{i:04d}\x1f{subject}\n{body}")
+        log_out = "\n".join(chunks)
+
+        def _log(*args, **kwargs):
+            # prior_sha resolution carries --before / -1; the walk carries
+            # --name-only. Route on that.
+            if any(str(a).startswith("--before") for a in args):
+                return "PRIORSHA"
+            return log_out
+
+        mock_repo.git.log.side_effect = _log
+        return mock_repo
+
+    def test_counts_and_attributes_fixes(self) -> None:
+        from repowise.core.ingestion.git_indexer.prior_defects import (
+            compute_prior_defects,
+        )
+
+        repo = self._mock_repo(
+            [
+                ("fix: crash on empty config", ["src/app.py", "src/util.py"]),
+                ("resolve race in scheduler", ["src/app.py"]),
+                ("feat: add flag", ["src/app.py"]),  # not a fix
+                ("fix lint", ["src/app.py"]),  # excluded keyword
+            ]
+        )
+        counts = compute_prior_defects(
+            repo, {"src/app.py", "src/util.py"}, as_of_ts=1_700_000_000.0
+        )
+        assert counts == {"src/app.py": 2, "src/util.py": 1}
+
+    def test_ignores_non_indexable_paths(self) -> None:
+        from repowise.core.ingestion.git_indexer.prior_defects import (
+            compute_prior_defects,
+        )
+
+        repo = self._mock_repo(
+            [
+                ("fix: bug", ["src/app.py", "docs/readme.md"]),
+            ]
+        )
+        counts = compute_prior_defects(repo, {"src/app.py"}, as_of_ts=1_700_000_000.0)
+        assert counts == {"src/app.py": 1}
+
+    def test_zero_when_no_fixes(self) -> None:
+        from repowise.core.ingestion.git_indexer.prior_defects import (
+            compute_prior_defects,
+        )
+
+        repo = self._mock_repo(
+            [
+                ("feat: add thing", ["src/app.py"]),
+                ("docs: update readme", ["src/app.py"]),
+            ]
+        )
+        counts = compute_prior_defects(repo, {"src/app.py"}, as_of_ts=1_700_000_000.0)
+        assert counts == {}
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +600,8 @@ class TestNumstatParsing:
             header = (
                 f"\x00{e['sha']}\x1f{e.get('author', 'Dev')}"
                 f"\x1f{e.get('email', 'dev@x.com')}"
+                f"\x1f{e.get('committer', e.get('author', 'Dev'))}"
+                f"\x1f{e.get('committer_email', e.get('email', 'dev@x.com'))}"
                 f"\x1f{e['ts']}\x1f{e.get('parents', '')}"
                 f"\x1f{e.get('subject', 'some commit')}"
                 f"\x1f{e.get('body', '')}"
@@ -321,18 +620,21 @@ class TestNumstatParsing:
         now = datetime.now(UTC)
         recent_ts = int((now - timedelta(days=5)).timestamp())
 
-        raw = self._build_log_output("src/app.py", [
-            {
-                "sha": "aaa11111",
-                "ts": recent_ts,
-                "subject": "feat: big change",
-                "numstat_lines": [
-                    ("100", "50", "src/app.py"),       # target: should count
-                    ("500", "300", "src/other.py"),     # not target: must NOT count
-                    ("200", "100", "src/utils.py"),     # not target: must NOT count
-                ],
-            },
-        ])
+        raw = self._build_log_output(
+            "src/app.py",
+            [
+                {
+                    "sha": "aaa11111",
+                    "ts": recent_ts,
+                    "subject": "feat: big change",
+                    "numstat_lines": [
+                        ("100", "50", "src/app.py"),  # target: should count
+                        ("500", "300", "src/other.py"),  # not target: must NOT count
+                        ("200", "100", "src/utils.py"),  # not target: must NOT count
+                    ],
+                },
+            ],
+        )
         mock_repo.git.log.return_value = raw
 
         meta = indexer._index_file("src/app.py", mock_repo)
@@ -348,16 +650,19 @@ class TestNumstatParsing:
 
         recent_ts = int((datetime.now(UTC) - timedelta(days=5)).timestamp())
 
-        raw = self._build_log_output("icon.png", [
-            {
-                "sha": "bbb22222",
-                "ts": recent_ts,
-                "subject": "feat: add icon",
-                "numstat_lines": [
-                    ("-", "-", "icon.png"),
-                ],
-            },
-        ])
+        raw = self._build_log_output(
+            "icon.png",
+            [
+                {
+                    "sha": "bbb22222",
+                    "ts": recent_ts,
+                    "subject": "feat: add icon",
+                    "numstat_lines": [
+                        ("-", "-", "icon.png"),
+                    ],
+                },
+            ],
+        )
         mock_repo.git.log.return_value = raw
 
         meta = indexer._index_file("icon.png", mock_repo)
@@ -385,7 +690,7 @@ class TestNumstatParsing:
         # First record is malformed (only 3 fields), second is valid
         raw = (
             f"\x00badsha\x1fAlice\x1falice@x.com\n"  # only 3 fields
-            f"\x00goodsha\x1fBob\x1fbob@x.com\x1f{recent_ts}\x1f\x1ffeat: valid commit\x1f\n"
+            f"\x00goodsha\x1fBob\x1fbob@x.com\x1fBob\x1fbob@x.com\x1f{recent_ts}\x1f\x1ffeat: valid commit\x1f\n"
             f"10\t5\ttest.py\n"
         )
         mock_repo.git.log.return_value = raw
@@ -402,7 +707,7 @@ class TestNumstatParsing:
 
         recent_ts = int((datetime.now(UTC) - timedelta(days=5)).timestamp())
         raw = (
-            f"\x00sha1\x1fAlice\x1fa@x.com\x1f{recent_ts}"
+            f"\x00sha1\x1fAlice\x1fa@x.com\x1fAlice\x1fa@x.com\x1f{recent_ts}"
             f"\x1fparent1 parent2\x1fMerge branch main\x1f\n"
             f"5\t2\tmerged.py\n"
         )
@@ -423,13 +728,13 @@ class TestNumstatParsing:
         # Simulates --follow output: recent commit uses new name,
         # older commit uses rename notation, oldest uses old name.
         raw = (
-            f"\x00sha1\x1fAlice\x1fa@x.com\x1f{recent_ts}\x1f\x1ffeat: update\x1f\n"
+            f"\x00sha1\x1fAlice\x1fa@x.com\x1fAlice\x1fa@x.com\x1f{recent_ts}\x1f\x1ffeat: update\x1f\n"
             f"10\t3\tsrc/new_name.py\n"
             f"\n"
-            f"\x00sha2\x1fAlice\x1fa@x.com\x1f{old_ts}\x1f\x1frename file\x1f\n"
+            f"\x00sha2\x1fAlice\x1fa@x.com\x1fAlice\x1fa@x.com\x1f{old_ts}\x1f\x1frename file\x1f\n"
             f"0\t0\t{{src/old_name.py => src/new_name.py}}\n"
             f"\n"
-            f"\x00sha3\x1fAlice\x1fa@x.com\x1f{old_ts - 86400}\x1f\x1ffeat: old work\x1f\n"
+            f"\x00sha3\x1fAlice\x1fa@x.com\x1fAlice\x1fa@x.com\x1f{old_ts - 86400}\x1f\x1ffeat: old work\x1f\n"
             f"20\t5\tsrc/old_name.py\n"
         )
         mock_repo.git.log.return_value = raw
@@ -497,6 +802,87 @@ class TestCoChangeBelowThresholdSkipped:
 
 
 # ---------------------------------------------------------------------------
+# 6b. test_change_entropy
+# ---------------------------------------------------------------------------
+
+
+class TestChangeEntropy:
+    """Hassan HCM: focused single-file commits → ~0 entropy; wide scattered
+    commits → high entropy; commits above the file-set cap are excluded."""
+
+    def test_change_entropy_focused_vs_scattered(self) -> None:
+        import time
+
+        from repowise.core.ingestion.git_indexer.co_change import (
+            compute_co_changes_and_entropy,
+        )
+
+        scattered_peers = [f"peer_{i}.py" for i in range(9)]
+        huge_peers = [f"huge_{i}.py" for i in range(34)]
+        all_files = {"focused.py", "scattered.py", "bigcommit.py"}
+        all_files.update(scattered_peers)
+        all_files.update(huge_peers)
+
+        now = int(time.time())
+        blocks: list[str] = []
+        # 3 focused commits: focused.py changes ALONE (|F| == 1 → log2(1) == 0).
+        for i in range(3):
+            blocks.append(f"\x00{now - i * 86400}\nfocused.py\n")
+        # 3 scattered commits: scattered.py amid 9 peers (|F| == 10).
+        for i in range(3):
+            files = "\n".join(["scattered.py", *scattered_peers])
+            blocks.append(f"\x00{now - i * 86400}\n{files}\n")
+        # 1 mass-edit commit (|F| == 35 > 30): bigcommit.py must get NO entropy.
+        big_files = "\n".join(["bigcommit.py", *huge_peers])
+        blocks.append(f"\x00{now}\n{big_files}\n")
+
+        mock_repo = MagicMock()
+        mock_repo.git.log.return_value = "".join(blocks)
+
+        _co, entropy = compute_co_changes_and_entropy(
+            mock_repo, all_files, commit_limit=2000, min_count=2
+        )
+
+        # Focused file changed alone → no entropy entry.
+        assert entropy.get("focused.py", 0.0) == 0.0
+        # Scattered file accrued positive entropy.
+        assert entropy.get("scattered.py", 0.0) > 0.0
+        # Mass-edit commit excluded → bigcommit.py gets nothing from it.
+        assert entropy.get("bigcommit.py", 0.0) == 0.0
+        # Scattered clearly dominates focused.
+        assert entropy["scattered.py"] > entropy.get("focused.py", 0.0)
+
+    def test_change_entropy_percentile_silent_when_all_zero(self) -> None:
+        """ESSENTIAL-tier shape (no entropy on any file) → all pct stay 0.0."""
+        from repowise.core.ingestion.git_indexer.enrich import compute_percentiles
+
+        metadata_list = [
+            {"file_path": f"f{i}.py", "commit_count_90d": 5, "change_entropy": 0.0}
+            for i in range(5)
+        ]
+        compute_percentiles(metadata_list)
+        for m in metadata_list:
+            assert m["change_entropy_pct"] == 0.0
+
+    def test_change_entropy_percentile_ranks_nonzero(self) -> None:
+        """Only files with positive entropy are ranked; zero-entropy files stay 0.0."""
+        from repowise.core.ingestion.git_indexer.enrich import compute_percentiles
+
+        metadata_list = [
+            {"file_path": "zero.py", "change_entropy": 0.0},
+            {"file_path": "low.py", "change_entropy": 0.5},
+            {"file_path": "mid.py", "change_entropy": 1.0},
+            {"file_path": "high.py", "change_entropy": 2.0},
+        ]
+        compute_percentiles(metadata_list)
+        pct = {m["file_path"]: m["change_entropy_pct"] for m in metadata_list}
+        assert pct["zero.py"] == 0.0
+        # Three nonzero files ranked 0, 1, 2 over n=3 → 0.0, 0.333, 0.667.
+        assert pct["high.py"] > pct["mid.py"] > pct["low.py"]
+        assert pct["high.py"] == pytest.approx(2 / 3)
+
+
+# ---------------------------------------------------------------------------
 # 7. test_blame_ownership_computed
 # ---------------------------------------------------------------------------
 
@@ -528,3 +914,25 @@ class TestBlameOwnershipComputed:
         assert name == "Alice"
         assert email == "alice@example.com"
         assert pct == pytest.approx(0.8)
+
+
+class TestExcludePatterns:
+    def test_get_tracked_files_respects_exclude_patterns(self) -> None:
+        indexer = GitIndexer("/tmp/fake", exclude_patterns=[".claude/", "tools/"])
+
+        fake_repo = MagicMock()
+        fake_repo.git.ls_files.return_value = (
+            "src/main.py\n.claude/config.yml\ntools/build.sh\nsrc/utils.py"
+        )
+
+        result = indexer._get_tracked_files(fake_repo)
+        assert result == ["src/main.py", "src/utils.py"]
+
+    def test_get_tracked_files_no_exclude_patterns(self) -> None:
+        indexer = GitIndexer("/tmp/fake")
+
+        fake_repo = MagicMock()
+        fake_repo.git.ls_files.return_value = "src/main.py\n.claude/config.yml"
+
+        result = indexer._get_tracked_files(fake_repo)
+        assert result == ["src/main.py", ".claude/config.yml"]

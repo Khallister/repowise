@@ -79,12 +79,12 @@ export function ScoreBreakdown({
                 </span>
                 <span className="tabular-nums text-[var(--color-text-tertiary)]">
                   −{c.applied_deduction.toFixed(2)} / cap −{cap.toFixed(1)}
-                  {c.capped ? <span className="ml-1 text-amber-500" title="Capped">(capped)</span> : null}
+                  {c.capped ? <span className="ml-1 text-[var(--color-warning)]" title="Capped">(capped)</span> : null}
                 </span>
               </div>
               <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-bg-muted)]">
                 <div
-                  className="h-full bg-red-500/70"
+                  className="h-full bg-[var(--color-error)]/70"
                   style={{ width: `${pct}%` }}
                 />
               </div>
@@ -93,10 +93,10 @@ export function ScoreBreakdown({
                   {c.findings.slice(0, 6).map((f) => (
                     <li
                       key={f.id}
-                      className="flex flex-wrap items-baseline gap-x-2 text-[11px]"
+                      className="flex flex-wrap items-baseline gap-x-2 text-xs"
                     >
                       <span
-                        className={`inline-block rounded px-1.5 py-px text-[9px] uppercase font-semibold ${SEVERITY_CHIP[f.severity]}`}
+                        className={`inline-block rounded px-1.5 py-px text-[10px] uppercase font-semibold ${SEVERITY_CHIP[f.severity]}`}
                       >
                         {SEVERITY_LABEL[f.severity]}
                       </span>
@@ -108,13 +108,13 @@ export function ScoreBreakdown({
                           {f.function_name}
                         </span>
                       ) : null}
-                      <span className="ml-auto tabular-nums text-red-500">
+                      <span className="ml-auto tabular-nums text-[var(--color-error)]">
                         −{f.applied_impact.toFixed(2)}
                       </span>
                     </li>
                   ))}
                   {c.findings.length > 6 ? (
-                    <li className="text-[11px] text-[var(--color-text-tertiary)]">
+                    <li className="text-xs text-[var(--color-text-tertiary)]">
                       + {c.findings.length - 6} more
                     </li>
                   ) : null}

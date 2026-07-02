@@ -300,6 +300,8 @@ def test_base_includes_all_models():
         "webhook_events",
         "wiki_symbols",
         "git_metadata",
+        "git_commits",
+        "git_function_blame",
         "dead_code_findings",
         "decision_records",
         "decision_evidence",
@@ -314,10 +316,14 @@ def test_base_includes_all_models():
         "health_findings",
         "health_file_metrics",
         "health_snapshots",
+        "refactoring_suggestions",
         "coverage_files",
         "pipeline_jobs",
         "graph_metrics",
+        "graph_node_membership",
         "knowledge_graph_layers",
         "knowledge_graph_tour_steps",
+        "kg_project_meta",
+        "kg_node_meta",
     }
     assert expected == table_names

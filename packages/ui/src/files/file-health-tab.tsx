@@ -1,0 +1,365 @@
+"use client";
+
+import { useMemo, useState, type ReactNode } from "react";
+import { HeartPulse } from "lucide-react";
+import { EmptyState } from "../shared/empty-state";
+import { VirtualizedTable, useVirtualRows } from "../shared/virtualized-table";
+import { ScoreBreakdown, type ScoreBreakdownCategory } from "../health/score-breakdown";
+import { BiomarkerDetails, type BiomarkerDetailsRecord } from "../health/biomarker-details";
+import {
+  biomarkerInfo,
+  biomarkerLabel,
+  biomarkerDimension,
+  CATEGORY_LABEL,
+  DIMENSION_CHIP,
+  DIMENSION_LABEL,
+  type BiomarkerDimension,
+} from "../health/biomarker-glossary";
+import { SEVERITY_CHIP, SEVERITY_LABEL, scoreBadgeClass, type Severity } from "../health/tokens";
+import { FileTrendChart } from "../health/file-trend-chart";
+import { FileSignalsPanel } from "../health/file-signals-panel";
+import type { FileDetailHealth, FunctionBlameRow } from "@repowise-dev/types/files";
+
+export type FindingStatus = "open" | "acknowledged" | "resolved" | "false_positive";
+
+const STATUS_OPTIONS: { value: FindingStatus; label: string }[] = [
+  { value: "open", label: "Open" },
+  { value: "acknowledged", label: "Acknowledged" },
+  { value: "resolved", label: "Resolved" },
+  { value: "false_positive", label: "False positive" },
+];
+
+interface FileHealthTabProps {
+  health: FileDetailHealth;
+  functionBlame: FunctionBlameRow[];
+  /** Triage callback — PATCH the finding status. Buttons hide when absent. */
+  onFindingStatusChange?:
+    | ((findingId: string, status: FindingStatus) => Promise<void> | void)
+    | undefined;
+  /** Build an href for a co-change partner file (hidden-coupling details). */
+  partnerHref?: ((path: string) => string) | undefined;
+  /** Build a symbol-page href for a function row. */
+  symbolHref?: ((symbolId: string) => string) | undefined;
+}
+
+/** Collapsed finding-card height guess; cards expand and are measured live. */
+const FINDING_CARD_ESTIMATE = 120;
+/** Blame table row height (compact `py-1.5` rows). */
+const BLAME_ROW_ESTIMATE = 32;
+
+function medianAgeDays(medianAuthorTime: number | null): number | null {
+  if (!medianAuthorTime) return null;
+  return Math.max(0, Math.round((Date.now() / 1000 - medianAuthorTime) / 86400));
+}
+
+export function FileHealthTab({
+  health,
+  functionBlame,
+  onFindingStatusChange,
+  partnerHref,
+  symbolHref,
+}: FileHealthTabProps) {
+  const [statusOverride, setStatusOverride] = useState<Record<string, FindingStatus>>({});
+  const [savingId, setSavingId] = useState<string | null>(null);
+  const { metric, breakdown, findings, trend, signals } = health;
+
+  // Window the findings card list. Cards expand, so this is variable-height —
+  // FINDING_CARD_ESTIMATE is the collapsed-card guess; real heights are measured.
+  const findingsVirtual = useVirtualRows<HTMLUListElement>({
+    count: findings.length,
+    estimateSize: FINDING_CARD_ESTIMATE,
+  });
+
+  // Hoist medianAgeDays + the row-name JSX out of the blame render loop so they
+  // run once per dataset change instead of on every render.
+  const blameRows = useMemo(
+    () =>
+      functionBlame.map((row) => ({
+        row,
+        age: medianAgeDays(row.median_author_time),
+        name: (
+          <span className="font-mono">
+            {row.function_name}
+            <span className="text-[var(--color-text-tertiary)]">:{row.start_line}</span>
+          </span>
+        ) as ReactNode,
+      })),
+    [functionBlame],
+  );
+
+  if (!metric && findings.length === 0) {
+    return (
+      <EmptyState
+        icon={<HeartPulse className="h-8 w-8" />}
+        title="No health data"
+        description="Run repowise init (or repowise health) to score this file."
+      />
+    );
+  }
+
+  const setStatus = async (id: string, status: FindingStatus) => {
+    if (!onFindingStatusChange) return;
+    setSavingId(id);
+    try {
+      await onFindingStatusChange(id, status);
+      setStatusOverride((m) => ({ ...m, [id]: status }));
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  return (
+    <div className="space-y-5">
+      {metric && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <Stat
+            label="Defect risk"
+            value={
+              <span
+                className={`inline-flex items-baseline rounded px-2 py-0.5 font-bold tabular-nums ${scoreBadgeClass(metric.score)}`}
+              >
+                {metric.score.toFixed(1)}
+                <span className="ml-0.5 text-[10px] font-normal opacity-70">/10</span>
+              </span>
+            }
+          />
+          <Stat label="Maintainability" value={<DimScore score={metric.maintainability_score} />} />
+          <Stat label="Performance" value={<DimScore score={metric.performance_score} />} />
+          <Stat label="Max CCN" value={<Num v={metric.max_ccn} />} />
+          <Stat label="Max nesting" value={<Num v={metric.max_nesting} />} />
+          <Stat label="NLOC" value={<Num v={metric.nloc} />} />
+          <Stat label="Tests" value={<span className="text-xs">{metric.has_test_file ? "Paired" : "None"}</span>} />
+          <Stat
+            label="Coverage"
+            value={
+              <span className="text-xs tabular-nums">
+                {metric.line_coverage_pct == null ? "—" : `${metric.line_coverage_pct.toFixed(0)}%`}
+              </span>
+            }
+          />
+          <Stat
+            label="Duplication"
+            value={
+              <span className="text-xs tabular-nums">
+                {metric.duplication_pct == null ? "—" : `${metric.duplication_pct.toFixed(0)}%`}
+              </span>
+            }
+          />
+          <Stat label="Module" value={<span className="text-xs">{metric.module ?? "—"}</span>} />
+        </div>
+      )}
+
+      {trend && trend.points.length >= 2 && <FileTrendChart trend={trend} />}
+
+      <FileSignalsPanel signals={signals} />
+
+      {breakdown && (
+        <section className="space-y-2">
+          <h3 className="text-xs font-medium uppercase tracking-wider text-[var(--color-text-tertiary)]">
+            Why this score?
+          </h3>
+          <ScoreBreakdown
+            score={breakdown.score}
+            totalDeduction={breakdown.total_deduction}
+            categories={breakdown.categories as ScoreBreakdownCategory[]}
+          />
+        </section>
+      )}
+
+      {findings.length > 0 && (
+        <section className="space-y-2">
+          <h3 className="text-xs font-medium uppercase tracking-wider text-[var(--color-text-tertiary)]">
+            Findings ({findings.length})
+          </h3>
+          <ul
+            ref={findingsVirtual.scrollRef}
+            className="space-y-2 overflow-auto"
+            style={{ maxHeight: 600 }}
+          >
+            {findingsVirtual.paddingTop > 0 && (
+              <li aria-hidden style={{ height: findingsVirtual.paddingTop }} />
+            )}
+            {findingsVirtual.virtualRows.map((vr) => {
+              const f = findings[vr.index];
+              if (f === undefined) return null;
+              const info = biomarkerInfo(f.biomarker_type);
+              const status = statusOverride[f.id] ?? (f.status as FindingStatus) ?? "open";
+              return (
+                <li
+                  key={f.id}
+                  ref={findingsVirtual.measureElement}
+                  data-index={vr.index}
+                  className="rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-surface)] p-3 space-y-1"
+                >
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span
+                      className={`inline-block rounded px-1.5 py-px text-[10px] uppercase font-semibold ${SEVERITY_CHIP[f.severity as Severity]}`}
+                    >
+                      {SEVERITY_LABEL[f.severity as Severity]}
+                    </span>
+                    <span className="text-xs font-semibold text-[var(--color-text-primary)]">
+                      {biomarkerLabel(f.biomarker_type)}
+                    </span>
+                    <span className="text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)]">
+                      {CATEGORY_LABEL[info.category]}
+                    </span>
+                    <DimensionChip dimension={findingDimension(f)} />
+                    {f.function_name && (
+                      <span className="text-xs font-mono text-[var(--color-text-tertiary)]">
+                        {f.function_name}
+                        {f.line_start ? `:${f.line_start}` : ""}
+                      </span>
+                    )}
+                    <span className="ml-auto text-xs tabular-nums text-[var(--color-error)]">
+                      −{f.health_impact.toFixed(2)}
+                    </span>
+                  </div>
+                  <p className="text-xs text-[var(--color-text-secondary)]">{f.reason}</p>
+                  <BiomarkerDetails
+                    biomarkerType={f.biomarker_type}
+                    details={f.details as BiomarkerDetailsRecord | null}
+                    onPartnerHref={partnerHref}
+                  />
+                  {onFindingStatusChange && (
+                    <div className="flex items-center gap-1.5 pt-1">
+                      {STATUS_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          disabled={savingId === f.id || status === opt.value}
+                          onClick={() => setStatus(f.id, opt.value)}
+                          className={`rounded border px-1.5 py-0.5 text-[10px] transition-colors ${
+                            status === opt.value
+                              ? "border-[var(--color-accent-primary)] text-[var(--color-accent-primary)]"
+                              : "border-[var(--color-border-default)] text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:border-[var(--color-border-strong)]"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+            {findingsVirtual.paddingBottom > 0 && (
+              <li aria-hidden style={{ height: findingsVirtual.paddingBottom }} />
+            )}
+          </ul>
+        </section>
+      )}
+
+      {functionBlame.length > 0 && (
+        <section className="space-y-2">
+          <h3 className="text-xs font-medium uppercase tracking-wider text-[var(--color-text-tertiary)]">
+            Functions by churn
+          </h3>
+          <VirtualizedTable
+            rows={blameRows}
+            rowKey={(b) => b.row.symbol_id}
+            estimateRowHeight={BLAME_ROW_ESTIMATE}
+            className="overflow-x-auto overflow-hidden border border-[var(--color-border-default)]"
+            tableClassName="text-xs"
+            headerClassName="bg-[var(--color-bg-surface)]"
+            header={
+              <tr className="border-b border-[var(--color-border-default)] text-left text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)]">
+                <th className="px-3 py-2 font-medium">Function</th>
+                <th className="px-3 py-2 font-medium text-right">Mods</th>
+                <th className="px-3 py-2 font-medium text-right">Recent</th>
+                <th className="px-3 py-2 font-medium text-right">Median age</th>
+                <th className="px-3 py-2 font-medium">Owner</th>
+              </tr>
+            }
+            renderRow={({ row: b, age, name }, index, measureRef) => (
+              <tr
+                ref={measureRef}
+                data-index={index}
+                className="border-b border-[var(--color-table-divider)] last:border-0 hover:bg-[var(--color-bg-elevated)]"
+              >
+                <td className="px-3 py-1.5 text-[var(--color-text-primary)]">
+                  {symbolHref ? (
+                    <a
+                      href={symbolHref(b.symbol_id)}
+                      className="hover:text-[var(--color-accent-primary)] hover:underline"
+                    >
+                      {name}
+                    </a>
+                  ) : (
+                    name
+                  )}
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{b.mod_count}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{b.recent_mod_count}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">
+                  {age == null ? "—" : `${age}d`}
+                </td>
+                <td className="px-3 py-1.5 text-[var(--color-text-secondary)]">
+                  {b.owner_name ?? "—"}
+                  {b.owner_line_pct != null && (
+                    <span className="text-[var(--color-text-tertiary)]">
+                      {" "}
+                      ({Math.round(b.owner_line_pct * 100)}%)
+                    </span>
+                  )}
+                </td>
+              </tr>
+            )}
+          />
+        </section>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] p-2.5">
+      <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)] mb-0.5">
+        {label}
+      </p>
+      <div className="text-[var(--color-text-primary)]">{value}</div>
+    </div>
+  );
+}
+
+function Num({ v }: { v: number }) {
+  return <span className="text-base font-semibold tabular-nums">{v}</span>;
+}
+
+/** A per-dimension pillar score badge, or "—" when the pillar is unmeasured. */
+function DimScore({ score }: { score?: number | null | undefined }) {
+  if (score == null) {
+    return <span className="text-xs text-[var(--color-text-tertiary)]">—</span>;
+  }
+  return (
+    <span
+      className={`inline-flex items-baseline rounded px-2 py-0.5 font-bold tabular-nums ${scoreBadgeClass(score)}`}
+    >
+      {score.toFixed(1)}
+      <span className="ml-0.5 text-[10px] font-normal opacity-70">/10</span>
+    </span>
+  );
+}
+
+/** A finding's home pillar, preferring the server value over the glossary. */
+function findingDimension(f: { dimension?: string; biomarker_type: string }): BiomarkerDimension {
+  if (
+    f.dimension === "defect" ||
+    f.dimension === "maintainability" ||
+    f.dimension === "performance"
+  ) {
+    return f.dimension;
+  }
+  return biomarkerDimension(f.biomarker_type);
+}
+
+function DimensionChip({ dimension }: { dimension: BiomarkerDimension }) {
+  return (
+    <span
+      className={`inline-flex items-center rounded px-1.5 py-px text-[10px] font-medium ${DIMENSION_CHIP[dimension]}`}
+      title={`${DIMENSION_LABEL[dimension]} pillar`}
+    >
+      {DIMENSION_LABEL[dimension]}
+    </span>
+  );
+}

@@ -39,8 +39,24 @@ const FLAVORS: {
 }[] = [
   { value: "generic", label: "Generic", Icon: Wand2, hint: "Any agent — Copilot, Codex, ChatGPT, custom." },
   { value: "claude-code", label: "Claude Code", Icon: Bot, hint: "Tuned for Claude Code's tools (Read / Edit / TodoWrite)." },
+  { value: "claude-code-mcp", label: "Claude + repowise MCP", Icon: Sparkles, hint: "Steers the agent to repowise's MCP tools (get_context / get_risk / get_why) instead of re-grepping." },
   { value: "cursor", label: "Cursor", Icon: Code2, hint: "Uses @file context, Cursor editing conventions." },
 ];
+
+const FLAVOR_STORAGE_KEY = "repowise:ai-prompt-flavor";
+
+function loadStoredFlavor(): AiPromptFlavor {
+  if (typeof window === "undefined") return "generic";
+  try {
+    const stored = window.localStorage.getItem(FLAVOR_STORAGE_KEY);
+    if (stored && FLAVORS.some((f) => f.value === stored)) {
+      return stored as AiPromptFlavor;
+    }
+  } catch {
+    /* storage blocked */
+  }
+  return "generic";
+}
 
 export function AiPromptModal({
   open,
@@ -50,8 +66,17 @@ export function AiPromptModal({
   title = "AI fix prompt",
   description = "A ready-to-paste prompt that gives your AI coding agent every detail needed to make this change in one focused pass.",
 }: AiPromptModalProps) {
-  const [flavor, setFlavor] = useState<AiPromptFlavor>("generic");
+  const [flavor, setFlavorState] = useState<AiPromptFlavor>(loadStoredFlavor);
   const [copied, setCopied] = useState(false);
+
+  const setFlavor = (next: AiPromptFlavor) => {
+    setFlavorState(next);
+    try {
+      window.localStorage.setItem(FLAVOR_STORAGE_KEY, next);
+    } catch {
+      /* storage blocked */
+    }
+  };
 
   const prompt = useMemo(
     () => (getPrompt ? getPrompt(flavor) : ""),
@@ -59,10 +84,7 @@ export function AiPromptModal({
   );
 
   useEffect(() => {
-    if (!open) {
-      setCopied(false);
-      setFlavor("generic");
-    }
+    if (!open) setCopied(false);
   }, [open]);
 
   const handleCopy = async () => {
@@ -80,7 +102,7 @@ export function AiPromptModal({
       <DialogContent className="max-w-3xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <Sparkles className="h-4 w-4 text-emerald-500" />
+            <Sparkles className="h-4 w-4 text-[var(--color-accent-primary)]" />
             {title}
             {filePath ? (
               <span className="ml-2 text-xs font-mono font-normal text-[var(--color-text-tertiary)] truncate max-w-[260px]">
@@ -93,10 +115,10 @@ export function AiPromptModal({
 
         <div className="space-y-3">
           <div>
-            <p className="text-[11px] uppercase tracking-wider text-[var(--color-text-tertiary)] mb-1.5">
+            <p className="text-xs uppercase tracking-wider text-[var(--color-text-tertiary)] mb-1.5">
               Target agent
             </p>
-            <div className="grid grid-cols-3 gap-2">
+            <div className="grid grid-cols-2 gap-2">
               {FLAVORS.map((f) => {
                 const active = flavor === f.value;
                 return (
@@ -107,18 +129,18 @@ export function AiPromptModal({
                     className={
                       "rounded-md border px-3 py-2 text-left transition-colors " +
                       (active
-                        ? "border-emerald-500 bg-emerald-500/10"
+                        ? "border-[var(--color-accent-primary)] bg-[var(--color-accent-muted)]"
                         : "border-[var(--color-border-default)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-bg-elevated)]")
                     }
                     title={f.hint}
                   >
                     <div className="flex items-center gap-1.5">
-                      <f.Icon className={`h-3.5 w-3.5 ${active ? "text-emerald-500" : "text-[var(--color-text-tertiary)]"}`} />
+                      <f.Icon className={`h-3.5 w-3.5 ${active ? "text-[var(--color-accent-primary)]" : "text-[var(--color-text-tertiary)]"}`} />
                       <span className="text-xs font-semibold text-[var(--color-text-primary)]">
                         {f.label}
                       </span>
                     </div>
-                    <p className="mt-0.5 text-[11px] text-[var(--color-text-tertiary)] leading-snug">
+                    <p className="mt-0.5 text-xs text-[var(--color-text-tertiary)] leading-snug">
                       {f.hint}
                     </p>
                   </button>
@@ -133,7 +155,7 @@ export function AiPromptModal({
             </pre>
           </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--color-text-tertiary)]">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--color-text-tertiary)]">
             <span>
               {prompt.length.toLocaleString()} chars · approx{" "}
               {Math.round(prompt.length / 4).toLocaleString()} tokens
@@ -145,7 +167,7 @@ export function AiPromptModal({
               className={
                 "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors " +
                 (copied
-                  ? "bg-emerald-500 text-white"
+                  ? "bg-[var(--color-success)] text-[var(--color-text-inverse)]"
                   : "bg-[var(--color-accent-primary)] text-[var(--color-bg-surface)] hover:opacity-90")
               }
             >

@@ -10,11 +10,13 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import update as sa_update
 
 from repowise.core.persistence.database import (
     create_engine,
@@ -23,6 +25,7 @@ from repowise.core.persistence.database import (
     init_db,
     resolve_db_url,
 )
+from repowise.core.persistence.models import GenerationJob
 from repowise.core.persistence.search import FullTextSearch
 from repowise.core.persistence.vector_store import InMemoryVectorStore
 from repowise.core.providers.embedding.base import MockEmbedder
@@ -34,20 +37,28 @@ from repowise.server.routers import (
     claude_md,
     code_health,
     costs,
+    coupling,
     dead_code,
     decisions,
+    external_systems,
+    files,
     git,
     graph,
     health,
     jobs,
     knowledge_map,
+    mcp,
+    meta,
     modules,
+    overview,
     owners,
     pages,
     providers,
+    refactoring,
     repos,
     search,
     security,
+    stats,
     symbols,
     webhooks,
     workspace,
@@ -55,6 +66,24 @@ from repowise.server.routers import (
 from repowise.server.scheduler import setup_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+async def reset_workspace_stale_jobs(app_state) -> int:
+    """Mark interrupted pending/running jobs failed across workspace repo DBs."""
+    reset_count = 0
+    for ws_factory in getattr(app_state, "workspace_sessions", {}).values():
+        async with get_session(ws_factory) as session:
+            stale_result = await session.execute(
+                sa_update(GenerationJob)
+                .where(GenerationJob.status.in_(["running", "pending"]))
+                .values(
+                    status="failed",
+                    error_message="Server restarted; job interrupted",
+                    finished_at=datetime.now(UTC),
+                )
+            )
+            reset_count += stale_result.rowcount or 0
+    return reset_count
 
 
 def _build_embedder():
@@ -67,10 +96,19 @@ def _build_embedder():
         openrouter — OpenRouterEmbedder via OPENROUTER_API_KEY env var
     """
     name = os.environ.get("REPOWISE_EMBEDDER", "mock").lower()
+    if name == "ollama":
+        from repowise.core.providers.embedding.ollama import OllamaEmbedder
+
+        return OllamaEmbedder()
     if name == "gemini":
         from repowise.core.providers.embedding.gemini import GeminiEmbedder
 
         dims = int(os.environ.get("REPOWISE_EMBEDDING_DIMS", "768"))
+        # Honour the indexed embedding model so serve doesn't silently rebuild
+        # the embedder with a different default than init used (issue #426).
+        model = os.environ.get("REPOWISE_EMBEDDING_MODEL")
+        if model:
+            return GeminiEmbedder(model=model, output_dimensionality=dims)
         return GeminiEmbedder(output_dimensionality=dims)
     if name == "openai":
         from repowise.core.providers.embedding.openai import OpenAIEmbedder
@@ -82,7 +120,9 @@ def _build_embedder():
 
         model = os.environ.get("REPOWISE_EMBEDDING_MODEL", "google/gemini-embedding-001")
         return OpenRouterEmbedder(model=model)
-    logger.warning("embedder.mock_active — set REPOWISE_EMBEDDER=gemini, openai, or openrouter for real RAG")
+    logger.warning(
+        "embedder.mock_active: set REPOWISE_EMBEDDER=gemini, openai, openrouter, or ollama for real RAG"
+    )
     return MockEmbedder()
 
 
@@ -178,12 +218,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.workspace_config = None
     app.state.workspace_root = None
     app.state.cross_repo_enricher = None
-    app.state.workspace_sessions = {}   # repo_id → session_factory
-    app.state.workspace_engines = []    # engines to dispose on shutdown
+    app.state.workspace_sessions = {}  # repo_id → session_factory
+    app.state.workspace_engines = []  # engines to dispose on shutdown
     # Per-repo FTS instances keyed by repo_id, used by the search router
     # to fan out across every workspace repo (single-repo FTS lives on
     # app.state.fts and stays as the primary).
-    app.state.workspace_fts = {}        # repo_id → FullTextSearch
+    app.state.workspace_fts = {}  # repo_id → FullTextSearch
     # repo_id → vector store (LanceDB-backed) for per-repo semantic search.
     # Populated lazily by the search router on first use, then cached.
     app.state.workspace_vector_stores = {}  # repo_id → VectorStore
@@ -258,13 +298,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     extra={"count": len(app.state.workspace_sessions)},
                 )
 
+            # Reset stale jobs in non-primary workspace DBs too. The primary
+            # DB was handled before workspace detection, but each secondary
+            # repo has its own generation_jobs table and stale running rows
+            # there would keep the UI showing an in-progress sync forever.
+            try:
+                reset_count = await reset_workspace_stale_jobs(app.state)
+                if reset_count:
+                    logger.warning(
+                        "reset_workspace_stale_jobs",
+                        extra={"count": reset_count},
+                    )
+            except Exception as exc:
+                logger.warning("workspace_stale_job_reset_failed", extra={"error": str(exc)})
+
+            from repowise.core.workspace.breaking_change import BREAKING_CHANGES_FILENAME
+            from repowise.core.workspace.conformance import CONFORMANCE_FILENAME
             from repowise.core.workspace.contracts import CONTRACTS_FILENAME
+            from repowise.core.workspace.system_graph import SYSTEM_GRAPH_FILENAME
             from repowise.server.mcp_server._enrichment import CrossRepoEnricher
 
             cross_repo_path = _Path(ws_root) / WORKSPACE_DATA_DIR / "cross_repo_edges.json"
             contracts_path = _Path(ws_root) / WORKSPACE_DATA_DIR / CONTRACTS_FILENAME
-            enricher = CrossRepoEnricher(cross_repo_path, contracts_path=contracts_path)
-            if enricher.has_data or enricher.has_contract_data:
+            system_graph_path = _Path(ws_root) / WORKSPACE_DATA_DIR / SYSTEM_GRAPH_FILENAME
+            breaking_changes_path = _Path(ws_root) / WORKSPACE_DATA_DIR / BREAKING_CHANGES_FILENAME
+            conformance_path = _Path(ws_root) / WORKSPACE_DATA_DIR / CONFORMANCE_FILENAME
+            enricher = CrossRepoEnricher(
+                cross_repo_path,
+                contracts_path=contracts_path,
+                system_graph_path=system_graph_path,
+                breaking_changes_path=breaking_changes_path,
+                conformance_path=conformance_path,
+            )
+            if enricher.has_data or enricher.has_contract_data or enricher.has_system_graph:
                 app.state.cross_repo_enricher = enricher
                 logger.info(
                     "repowise_workspace_detected",
@@ -294,10 +360,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.debug("workspace_vector_store_close_failed", exc_info=True)
     # Dispose workspace repo engines first
     for ws_engine in getattr(app.state, "workspace_engines", []):
-        try:
+        with suppress(Exception):
             await ws_engine.dispose()
-        except Exception:
-            pass
     await engine.dispose()
     logger.info("repowise_server_stopped")
 
@@ -342,16 +406,24 @@ def create_app() -> FastAPI:
     app.include_router(git.router)
     app.include_router(dead_code.router)
     app.include_router(code_health.router)
+    app.include_router(coupling.router)
     app.include_router(claude_md.router)
     app.include_router(decisions.router)
     app.include_router(chat.router)
     app.include_router(providers.router)
+    app.include_router(mcp.router)
+    app.include_router(meta.router)
     app.include_router(costs.router)
     app.include_router(security.router)
     app.include_router(blast_radius.router)
+    app.include_router(refactoring.router)
     app.include_router(knowledge_map.router)
     app.include_router(workspace.router)
     app.include_router(owners.router)
     app.include_router(modules.router)
+    app.include_router(overview.router)
+    app.include_router(stats.router)
+    app.include_router(files.router)
+    app.include_router(external_systems.router)
 
     return app

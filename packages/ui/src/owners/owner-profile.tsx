@@ -10,6 +10,7 @@ import {
   Users,
   Folder,
   TrendingUp,
+  Bot,
 } from "lucide-react";
 import type {
   OwnerProfile,
@@ -19,8 +20,14 @@ import type {
 } from "@repowise-dev/types/owners";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { Badge } from "../ui/badge";
+import { EmptyState } from "../shared/empty-state";
+import {
+  ResponsiveTable,
+  type ResponsiveColumn,
+} from "../shared/responsive-table";
 import { cn } from "../lib/cn";
-import { truncatePath } from "../lib/format";
+import { truncatePath, formatRelativeTimeOrNull } from "../lib/format";
+import { AgentTierBar } from "../git/agent-tier-bar";
 import { OwnerAvatar } from "./owner-avatar";
 
 const dateFormatter = new Intl.DateTimeFormat(undefined, {
@@ -41,15 +48,7 @@ function fmtCompact(n: number): string {
   return n.toLocaleString();
 }
 
-function timeAgo(iso: string | null): string {
-  if (!iso) return "never";
-  const d = Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
-  if (Number.isNaN(d) || d < 0) return "never";
-  if (d < 1) return "today";
-  if (d < 30) return `${d}d ago`;
-  if (d < 365) return `${Math.floor(d / 30)}mo ago`;
-  return `${Math.floor(d / 365)}y ago`;
-}
+const timeAgo = (iso: string | null) => formatRelativeTimeOrNull(iso, "never");
 
 export interface OwnerProfileViewProps {
   owner: OwnerProfile;
@@ -100,8 +99,13 @@ export function OwnerProfileView({
           <div className="flex flex-wrap items-start gap-5">
             <OwnerAvatar name={owner.name} email={owner.email} size="lg" />
             <div className="flex-1 min-w-0">
-              <h1 className="text-2xl font-bold text-[var(--color-text-primary)]">
+              <h1 className="flex flex-wrap items-center gap-2 text-2xl font-bold text-[var(--color-text-primary)]">
                 {owner.name}
+                {tenureDays !== null && tenureDays < 90 && (
+                  <Badge variant="outline" className="text-[10px] font-medium">
+                    new to this repo
+                  </Badge>
+                )}
               </h1>
               {owner.email && (
                 <a
@@ -148,28 +152,28 @@ export function OwnerProfileView({
       {/* ---------- Risk strip ---------- */}
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <RiskTile
-          icon={<Users className="h-4 w-4 text-amber-400" />}
+          icon={<Users className="h-4 w-4 text-[var(--color-warning)]" />}
           label="Silo modules"
           value={owner.silo_modules}
           help="modules where this person owns >80% of files"
           tone={owner.silo_modules > 0 ? "warn" : "ok"}
         />
         <RiskTile
-          icon={<ShieldAlert className="h-4 w-4 text-red-400" />}
+          icon={<ShieldAlert className="h-4 w-4 text-[var(--color-error)]" />}
           label="Bus-factor risk"
           value={owner.bus_factor_risk_files}
           help="files with bus_factor ≤ 1 that they own"
           tone={owner.bus_factor_risk_files > 0 ? "danger" : "ok"}
         />
         <RiskTile
-          icon={<Flame className="h-4 w-4 text-orange-400" />}
+          icon={<Flame className="h-4 w-4 text-[var(--color-warning)]" />}
           label="Hotspots owned"
           value={owner.hotspots_owned}
           help="high-churn files where they are primary owner"
           tone={owner.hotspots_owned > 0 ? "warn" : "ok"}
         />
         <RiskTile
-          icon={<Trash2 className="h-4 w-4 text-rose-400" />}
+          icon={<Trash2 className="h-4 w-4 text-[var(--color-text-tertiary)]" />}
           label="Dead-code burden"
           value={`${owner.dead_code_files_owned} files · ${fmtCompact(owner.dead_code_lines_owned)} lines`}
           help="dead code findings whose primary owner is this person"
@@ -193,10 +197,17 @@ export function OwnerProfileView({
               {owner.modules.slice(0, 12).map((m) => (
                 <ModuleRow key={m.module_path} mod={m} onClick={() => onSelectModule?.(m.module_path)} />
               ))}
-              {owner.modules.length === 0 && (
-                <p className="py-6 text-center text-xs text-[var(--color-text-tertiary)]">
-                  No module attribution yet.
+              {owner.modules.length > 12 && (
+                <p className="px-2 pt-1 text-[10px] text-[var(--color-text-tertiary)]">
+                  +{owner.modules.length - 12} more modules not shown
                 </p>
+              )}
+              {owner.modules.length === 0 && (
+                <EmptyState
+                  className="p-6"
+                  title="No module attribution yet"
+                  description="Module ownership appears after the next git sync."
+                />
               )}
             </CardContent>
           </Card>
@@ -212,6 +223,12 @@ export function OwnerProfileView({
             </CardHeader>
             <CardContent className="pt-0">
               <FileTable files={owner.top_files} onSelectFile={onSelectFile} />
+              {(owner.files_touched_total ?? 0) > Math.min(owner.top_files.length, 20) && (
+                <p className="pt-2 text-[10px] text-[var(--color-text-tertiary)]">
+                  +{(owner.files_touched_total ?? 0) - Math.min(owner.top_files.length, 20)}{" "}
+                  more files touched, not shown
+                </p>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -225,6 +242,16 @@ export function OwnerProfileView({
               <p className="text-xs text-[var(--color-text-tertiary)]">
                 People who edit the same files. Strong overlap = natural reviewer.
               </p>
+              {owner.co_authors.filter((c) => c.co_change_strength >= 0.3).length > 0 && (
+                <p className="text-[10px] text-[var(--color-text-secondary)]">
+                  Would review well for this person&apos;s changes:{" "}
+                  {owner.co_authors
+                    .filter((c) => c.co_change_strength >= 0.3)
+                    .slice(0, 2)
+                    .map((c) => c.name)
+                    .join(", ")}
+                </p>
+              )}
             </CardHeader>
             <CardContent className="pt-0 space-y-1.5">
               {owner.co_authors.slice(0, 10).map((c) => (
@@ -251,13 +278,62 @@ export function OwnerProfileView({
                   </div>
                 </button>
               ))}
-              {owner.co_authors.length === 0 && (
-                <p className="py-4 text-center text-xs text-[var(--color-text-tertiary)]">
-                  No co-authors detected.
+              {(owner.co_authors_total ?? owner.co_authors.length) >
+                Math.min(owner.co_authors.length, 10) && (
+                <p className="px-2 pt-1 text-[10px] text-[var(--color-text-tertiary)]">
+                  +
+                  {(owner.co_authors_total ?? owner.co_authors.length) -
+                    Math.min(owner.co_authors.length, 10)}{" "}
+                  more co-authors not shown
                 </p>
+              )}
+              {owner.co_authors.length === 0 && (
+                <EmptyState
+                  className="p-6"
+                  title="No co-authors detected"
+                  description="Nobody else edits the files this person owns."
+                />
               )}
             </CardContent>
           </Card>
+
+          {owner.agent_collab && owner.agent_collab.agent_commit_count > 0 && (
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm flex items-center gap-1.5">
+                  <Bot className="h-4 w-4" /> Agent collaboration
+                </CardTitle>
+                <p className="text-xs text-[var(--color-text-tertiary)]">
+                  Coding-agent activity on the files this person owns.
+                </p>
+              </CardHeader>
+              <CardContent className="pt-0 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-[var(--color-text-secondary)]">
+                    Agent-attributed commits
+                  </span>
+                  <span className="tabular-nums font-medium text-[var(--color-text-primary)]">
+                    {owner.agent_collab.agent_commit_count}
+                    {owner.agent_collab.agent_share_pct != null &&
+                      ` (${Math.round(owner.agent_collab.agent_share_pct)}%)`}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[var(--color-text-secondary)]">
+                    Owned files with agent commits
+                  </span>
+                  <span className="tabular-nums font-medium text-[var(--color-text-primary)]">
+                    {owner.agent_collab.files_with_agent_commits}
+                  </span>
+                </div>
+                {Object.keys(owner.agent_collab.tier_counts).length > 0 && (
+                  <div className="pt-1">
+                    <AgentTierBar tierCounts={owner.agent_collab.tier_counts} />
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
 
           <Card>
             <CardHeader className="pb-2">
@@ -268,9 +344,11 @@ export function OwnerProfileView({
             </CardHeader>
             <CardContent className="pt-0">
               {categories.length === 0 ? (
-                <p className="py-4 text-center text-xs text-[var(--color-text-tertiary)]">
-                  No category data.
-                </p>
+                <EmptyState
+                  className="p-6"
+                  title="No category data"
+                  description="Commit classification runs during indexing."
+                />
               ) : (
                 <div className="space-y-2">
                   {categories.map(([cat, n]) => (
@@ -320,9 +398,9 @@ function Headline({
 }) {
   const color =
     tone === "add"
-      ? "text-emerald-300"
+      ? "text-[var(--color-success)]"
       : tone === "del"
-        ? "text-rose-300"
+        ? "text-[var(--color-error)]"
         : "text-[var(--color-text-primary)]";
   return (
     <div className="rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-3 py-2">
@@ -350,15 +428,15 @@ function RiskTile({
 }) {
   const border =
     tone === "danger"
-      ? "border-red-500/40 bg-red-500/5"
+      ? "border-[var(--color-error)]/40 bg-[var(--color-error)]/5"
       : tone === "warn"
-        ? "border-amber-500/40 bg-amber-500/5"
+        ? "border-[var(--color-warning)]/40 bg-[var(--color-warning)]/5"
         : tone === "muted"
-          ? "border-rose-500/30 bg-rose-500/5"
+          ? "border-[var(--color-border-default)] bg-[var(--color-bg-elevated)]"
           : "border-[var(--color-border-default)] bg-[var(--color-bg-elevated)]";
   return (
     <div className={cn("rounded-lg border p-3", border)}>
-      <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-[var(--color-text-tertiary)]">
+      <div className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-[var(--color-text-tertiary)]">
         {icon}
         {label}
       </div>
@@ -399,7 +477,7 @@ function ModuleRow({
         <div
           className={cn(
             "h-full",
-            share > 80 ? "bg-amber-500" : "bg-[var(--color-accent-primary)]",
+            share > 80 ? "bg-[var(--color-warning)]" : "bg-[var(--color-accent-primary)]",
           )}
           style={{ width: `${share}%` }}
         />
@@ -411,6 +489,54 @@ function ModuleRow({
   );
 }
 
+const FILE_COLUMNS: ResponsiveColumn<OwnerFileEntry>[] = [
+  {
+    key: "file_path",
+    header: "File",
+    priority: 1,
+    cellClassName: "max-w-[320px]",
+    render: (f) => (
+      <span className="flex items-center gap-1.5 truncate font-mono text-xs text-[var(--color-text-primary)]">
+        {f.is_hotspot && <Flame className="h-3 w-3 shrink-0 text-[var(--color-warning)]" />}
+        {truncatePath(f.file_path, 48)}
+      </span>
+    ),
+  },
+  {
+    key: "commit_count_90d",
+    header: "Commits / 90d",
+    mobileLabel: "Commits",
+    align: "right",
+    priority: 2,
+    cellClassName: "tabular-nums",
+    render: (f) => f.commit_count_90d,
+  },
+  {
+    key: "churn",
+    header: "Churn",
+    align: "right",
+    priority: 2,
+    cellClassName: "tabular-nums",
+    render: (f) => <ChurnPill value={f.churn_percentile} />,
+  },
+  {
+    key: "bus",
+    header: "Bus",
+    align: "right",
+    priority: 3,
+    cellClassName: "tabular-nums",
+    render: (f) => <BusBadge bf={f.bus_factor} />,
+  },
+  {
+    key: "touched",
+    header: "Touched",
+    align: "right",
+    priority: 3,
+    cellClassName: "text-[10px] text-[var(--color-text-tertiary)]",
+    render: (f) => timeAgo(f.last_commit_at),
+  },
+];
+
 function FileTable({
   files,
   onSelectFile,
@@ -418,63 +544,32 @@ function FileTable({
   files: OwnerFileEntry[];
   onSelectFile?: ((path: string) => void) | undefined;
 }) {
-  if (files.length === 0) {
-    return (
-      <p className="py-4 text-center text-xs text-[var(--color-text-tertiary)]">
-        No file attribution.
-      </p>
-    );
-  }
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-xs">
-        <thead className="text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)]">
-          <tr>
-            <th className="py-1.5 px-2 text-left font-medium">File</th>
-            <th className="py-1.5 px-2 text-right font-medium">Commits / 90d</th>
-            <th className="py-1.5 px-2 text-right font-medium">Churn</th>
-            <th className="py-1.5 px-2 text-right font-medium">Bus</th>
-            <th className="py-1.5 px-2 text-right font-medium">Touched</th>
-          </tr>
-        </thead>
-        <tbody>
-          {files.slice(0, 20).map((f) => (
-            <tr
-              key={f.file_path}
-              onClick={() => onSelectFile?.(f.file_path)}
-              className={cn(
-                "border-t border-[var(--color-border-default)]/40",
-                onSelectFile && "cursor-pointer hover:bg-[var(--color-bg-elevated)]",
-              )}
-            >
-              <td className="py-1.5 px-2 max-w-[320px]">
-                <span className="flex items-center gap-1.5 truncate font-mono text-[11px] text-[var(--color-text-primary)]">
-                  {f.is_hotspot && <Flame className="h-3 w-3 shrink-0 text-orange-400" />}
-                  {truncatePath(f.file_path, 48)}
-                </span>
-              </td>
-              <td className="py-1.5 px-2 text-right tabular-nums">{f.commit_count_90d}</td>
-              <td className="py-1.5 px-2 text-right tabular-nums">
-                <ChurnPill value={f.churn_percentile} />
-              </td>
-              <td className="py-1.5 px-2 text-right tabular-nums">
-                <BusBadge bf={f.bus_factor} />
-              </td>
-              <td className="py-1.5 px-2 text-right text-[10px] text-[var(--color-text-tertiary)]">
-                {timeAgo(f.last_commit_at)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <ResponsiveTable
+      columns={FILE_COLUMNS}
+      rows={files.slice(0, 20)}
+      rowKey={(f) => f.file_path}
+      onRowClick={onSelectFile ? (f) => onSelectFile(f.file_path) : undefined}
+      bare
+      empty={
+        <EmptyState
+          className="p-6"
+          title="No file attribution"
+          description="File-level ownership appears after the next git sync."
+        />
+      }
+    />
   );
 }
 
 function ChurnPill({ value }: { value: number }) {
   const v = Math.round(value);
   const color =
-    v >= 80 ? "bg-red-500/20 text-red-300" : v >= 50 ? "bg-amber-500/20 text-amber-300" : "bg-[var(--color-bg-inset)] text-[var(--color-text-tertiary)]";
+    v >= 80
+      ? "bg-[var(--color-error)]/20 text-[var(--color-error)]"
+      : v >= 50
+        ? "bg-[var(--color-warning)]/20 text-[var(--color-warning)]"
+        : "bg-[var(--color-bg-inset)] text-[var(--color-text-tertiary)]";
   return (
     <span className={cn("inline-block rounded px-1.5 py-0.5 text-[10px] tabular-nums", color)}>
       {v}
@@ -484,19 +579,23 @@ function ChurnPill({ value }: { value: number }) {
 
 function BusBadge({ bf }: { bf: number }) {
   const color =
-    bf <= 1 ? "text-red-400" : bf === 2 ? "text-amber-300" : "text-emerald-300";
+    bf <= 1
+      ? "text-[var(--color-error)]"
+      : bf === 2
+        ? "text-[var(--color-warning)]"
+        : "text-[var(--color-success)]";
   return <span className={cn("font-semibold", color)}>{bf}</span>;
 }
 
 function categoryColor(category: string): string {
   const map: Record<string, string> = {
-    feat: "bg-emerald-400",
-    fix: "bg-rose-400",
-    refactor: "bg-sky-400",
-    docs: "bg-indigo-400",
-    test: "bg-violet-400",
-    chore: "bg-zinc-400",
-    perf: "bg-amber-400",
+    feat: "bg-[var(--color-success)]",
+    fix: "bg-[var(--color-error)]",
+    refactor: "bg-[var(--color-accent-secondary)]",
+    docs: "bg-[var(--color-info)]",
+    test: "bg-[var(--color-accent-primary)]",
+    chore: "bg-[var(--color-text-tertiary)]",
+    perf: "bg-[var(--color-warning)]",
   };
   return map[category] ?? "bg-[var(--color-accent-primary)]";
 }

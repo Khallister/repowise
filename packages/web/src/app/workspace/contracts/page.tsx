@@ -8,6 +8,7 @@ import { ContractLinksTable } from "@repowise-dev/ui/workspace/contract-links-ta
 import { ContractTypeBadge, RoleBadge } from "@repowise-dev/ui/workspace/contract-type-badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
 import { StatCard } from "@repowise-dev/ui/shared/stat-card";
+import { EmptyState } from "@repowise-dev/ui/shared";
 import { Skeleton } from "@repowise-dev/ui/ui/skeleton";
 
 const TYPE_OPTIONS = [
@@ -73,13 +74,13 @@ export default function ContractsPage() {
         <StatCard
           label="Matched Links"
           value={data?.total_links ?? "—"}
-          icon={<Link2 className="h-4 w-4 text-green-400" />}
+          icon={<Link2 className="h-4 w-4 text-[var(--color-success)]" />}
         />
         <StatCard
           label="Unmatched"
           value={isLoading ? "—" : unmatchedCount}
           description="No matching provider or consumer"
-          icon={<Link2 className="h-4 w-4 text-yellow-400" />}
+          icon={<Link2 className="h-4 w-4 text-[var(--color-warning)]" />}
         />
         <StatCard
           label="By Type"
@@ -95,7 +96,7 @@ export default function ContractsPage() {
                   .join(", ")
               : undefined
           }
-          icon={<Filter className="h-4 w-4 text-purple-400" />}
+          icon={<Filter className="h-4 w-4 text-[var(--color-accent-secondary)]" />}
         />
       </div>
 
@@ -178,9 +179,11 @@ export default function ContractsPage() {
               ))}
             </div>
           ) : (data?.contracts ?? []).length === 0 ? (
-            <p className="text-sm text-[var(--color-text-tertiary)] py-4 text-center">
-              No contracts detected.
-            </p>
+            <EmptyState
+              className="p-6"
+              title="No contracts detected"
+              description="API contracts are detected during workspace indexing when providers and consumers share schemas."
+            />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">

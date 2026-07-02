@@ -52,7 +52,16 @@ def _reparse(repo_path: Path, exclude_patterns: list[str]) -> tuple[list[Any], d
     """
     from repowise.core.ingestion import ASTParser, FileTraverser
 
-    traverser = FileTraverser(repo_path, extra_exclude_patterns=exclude_patterns or None)
+    # Honor the persisted submodule semantics of the original index — a
+    # fast index built with --include-submodules must not drop submodule
+    # files from the docs re-parse (missing key → False, legacy behavior).
+    state = load_state(repo_path)
+    traverser = FileTraverser(
+        repo_path,
+        extra_exclude_patterns=exclude_patterns or None,
+        include_submodules=bool(state.get("include_submodules", False)),
+        include_nested_repos=bool(state.get("include_nested_repos", False)),
+    )
     file_infos = list(traverser.traverse())
     repo_structure = traverser.get_repo_structure()
 
@@ -91,6 +100,7 @@ async def _backfill_git(
     from repowise.core.persistence import get_session
     from repowise.core.persistence.crud import (
         recompute_git_percentiles,
+        upsert_git_commits_bulk,
         upsert_git_metadata_bulk,
     )
     from repowise.core.persistence.stores.sql_job_store import SqlJobStore
@@ -115,6 +125,11 @@ async def _backfill_git(
         if git_results:
             await upsert_git_metadata_bulk(session, repo_id, git_results)
             await recompute_git_percentiles(session, repo_id)
+        # Persist the per-commit rows captured during the FULL-tier walk so the
+        # commits/change-risk surface lands on an ESSENTIAL→FULL promotion too
+        # (Foundation 1 only wrote them on the full orchestrator index).
+        if summary.commit_rows:
+            await upsert_git_commits_bulk(session, repo_id, summary.commit_rows)
 
     console.print(
         f"Git tier upgraded to FULL: [cyan]{summary.files_indexed}[/cyan] files "
@@ -179,8 +194,17 @@ async def _run_upgrade(
         "(graph reused from index — not re-resolved)."
     )
 
-    # 5. Generate the docs the fast index skipped.
-    cost_tracker = CostTracker(session_factory=sf, repo_id=repo_id)
+    # 5. Generate the docs the fast index skipped. Honor the cost-tracking
+    # opt-out (issue #326) so REPOWISE_NO_COST_TRACKING is respected here too;
+    # an in-memory tracker still powers the live cost readout.
+    from repowise.cli.providers import cost_tracking_disabled
+
+    if cost_tracking_disabled():
+        cost_tracker = CostTracker()
+    else:
+        # buffered=True defers cost INSERTs to a single post-generation flush so
+        # they never contend with the generation writer (issue #326).
+        cost_tracker = CostTracker(session_factory=sf, repo_id=repo_id, buffered=True)
     provider._cost_tracker = cost_tracker
     generated_pages = await run_generation(
         repo_path=repo_path,
@@ -197,6 +221,9 @@ async def _run_upgrade(
         cost_tracker=cost_tracker,
         generation_config=config,
     )
+
+    # Flush buffered cost rows now generation is done (best-effort).
+    await cost_tracker.flush()
 
     # 6. Persist pages + a GenerationJob marker, then build the FTS index.
     async with get_session(sf) as session:

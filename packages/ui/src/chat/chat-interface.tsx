@@ -24,6 +24,7 @@ import { Send, StopCircle, PanelRight } from "lucide-react";
 import { Button } from "../ui/button";
 import { ScrollArea } from "../ui/scroll-area";
 import { cn } from "../lib/cn";
+import { BrandMark } from "../shared/brand-mark";
 import { ChatMessage } from "./chat-message";
 import { ArtifactPanel, type Artifact } from "./artifact-panel";
 import type { ChatUIMessage } from "@repowise-dev/types/chat";
@@ -79,6 +80,13 @@ export interface ChatInterfaceProps {
   emptyStateLogoSrc?: string;
   /** Override default suggestion chips. */
   suggestions?: string[];
+  /** Orientation line under the empty-state subtitle — index status, page
+   *  counts, last sync. Keeps the blank page honest about what's loaded. */
+  statusSlot?: ReactNode;
+  /** Disables the composer (e.g. no chat provider configured). */
+  sendDisabled?: boolean;
+  /** Banner shown above the composer when sending is disabled. */
+  sendDisabledReason?: ReactNode;
 }
 
 export function ChatInterface({
@@ -96,6 +104,9 @@ export function ChatInterface({
   linkPrefix,
   emptyStateLogoSrc = "/repowise-logo.png",
   suggestions = DEFAULT_SUGGESTIONS,
+  statusSlot,
+  sendDisabled = false,
+  sendDisabledReason,
 }: ChatInterfaceProps) {
   const [input, setInput] = useState("");
   const [artifactPanelOpen, setArtifactPanelOpen] = useState(false);
@@ -133,9 +144,28 @@ export function ChatInterface({
     [],
   );
 
+  // Pulse the artifact-panel button when a new artifact lands while the
+  // panel is closed, so streamed diagrams don't arrive silently.
+  const prevArtifactCount = useRef(0);
+  const [artifactPulse, setArtifactPulse] = useState(false);
+  const totalArtifactCount = messages.reduce(
+    (count, m) => count + m.toolCalls.filter((tc) => tc.artifact).length,
+    0,
+  );
+  useEffect(() => {
+    if (totalArtifactCount > prevArtifactCount.current && !artifactPanelOpen) {
+      setArtifactPulse(true);
+      const t = setTimeout(() => setArtifactPulse(false), 2500);
+      prevArtifactCount.current = totalArtifactCount;
+      return () => clearTimeout(t);
+    }
+    prevArtifactCount.current = totalArtifactCount;
+    return undefined;
+  }, [totalArtifactCount, artifactPanelOpen]);
+
   async function handleSubmit() {
     const text = input.trim();
-    if (!text || isStreaming) return;
+    if (!text || isStreaming || sendDisabled) return;
     setInput("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
@@ -148,15 +178,11 @@ export function ChatInterface({
     textareaRef.current?.focus();
   }
 
-  const totalArtifactCount = messages.reduce(
-    (count, m) => count + m.toolCalls.filter((tc) => tc.artifact).length,
-    0,
-  );
-
   return (
     <div className="flex h-full flex-col min-h-0">
-      {/* Header bar (active conversation) */}
-      {!isEmpty && (
+      {/* Header bar — the single home for model + history (both empty and
+          active states), so the controls don't render twice. */}
+      {(historySlot || modelSelectorSlot) && (
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-[var(--color-border-default)] shrink-0 bg-[var(--color-bg-surface)]/95 backdrop-blur-sm">
           <div className="flex items-center gap-2">{historySlot}</div>
           <div className="flex items-center gap-2">
@@ -164,7 +190,11 @@ export function ChatInterface({
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-8 text-xs gap-1.5"
+                className={cn(
+                  "h-8 text-xs gap-1.5",
+                  artifactPulse &&
+                    "animate-pulse text-[var(--color-accent-primary)]",
+                )}
                 onClick={() => setArtifactPanelOpen(true)}
               >
                 <PanelRight className="h-4 w-4" />
@@ -182,13 +212,10 @@ export function ChatInterface({
           <div className="flex flex-col items-center justify-center h-full gap-10 px-4">
             <div className="text-center space-y-3">
               <div className="flex items-center justify-center mb-6">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={emptyStateLogoSrc}
-                  alt="repowise"
-                  width={48}
-                  height={48}
-                  className="drop-shadow-[0_0_12px_rgba(245,149,32,0.35)]"
+                <BrandMark
+                  darkSrc={emptyStateLogoSrc}
+                  size={48}
+                  className="drop-shadow-[0_0_8px_rgba(245,149,32,0.18)]"
                 />
               </div>
               <h2 className="text-xl font-semibold text-[var(--color-text-primary)]">
@@ -198,6 +225,11 @@ export function ChatInterface({
                 Explore architecture, assess risk, search code, trace
                 dependencies, and understand decisions.
               </p>
+              {statusSlot && (
+                <div className="text-xs text-[var(--color-text-tertiary)]">
+                  {statusSlot}
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-w-xl w-full">
@@ -210,16 +242,6 @@ export function ChatInterface({
                   {s}
                 </button>
               ))}
-            </div>
-
-            <div className="flex items-center gap-3">
-              {modelSelectorSlot && (
-                <span className="text-xs text-[var(--color-text-tertiary)]">
-                  Using:
-                </span>
-              )}
-              {modelSelectorSlot}
-              {historySlot}
             </div>
           </div>
         ) : (
@@ -237,7 +259,7 @@ export function ChatInterface({
                 />
               ))}
               {error && (
-                <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-400">
+                <div className="rounded-lg border border-[var(--color-error)]/30 bg-[var(--color-error)]/10 px-4 py-2.5 text-sm text-[var(--color-error)]">
                   {error}
                 </div>
               )}
@@ -255,10 +277,15 @@ export function ChatInterface({
         )}
       >
         <div className="max-w-3xl mx-auto">
+          {sendDisabled && sendDisabledReason && (
+            <div className="mb-2 rounded-lg border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 px-3 py-2 text-xs text-[var(--color-text-secondary)]">
+              {sendDisabledReason}
+            </div>
+          )}
           <div
             className={cn(
               "flex items-end gap-2 rounded-2xl border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-4 py-3",
-              isEmpty && "shadow-lg shadow-black/20",
+              sendDisabled && "opacity-60",
             )}
           >
             <textarea
@@ -273,6 +300,7 @@ export function ChatInterface({
               }}
               placeholder="Ask anything about this codebase..."
               aria-label="Chat message"
+              disabled={sendDisabled}
               rows={1}
               className="flex-1 resize-none bg-transparent text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-tertiary)] outline-none leading-6 max-h-36 overflow-y-auto"
               style={{ scrollbarWidth: "none" }}
@@ -281,7 +309,7 @@ export function ChatInterface({
               size="icon"
               className="h-8 w-8 shrink-0 rounded-xl"
               onClick={isStreaming ? onCancel : () => void handleSubmit()}
-              disabled={!input.trim() && !isStreaming}
+              disabled={(!input.trim() && !isStreaming) || sendDisabled}
               aria-label={isStreaming ? "Stop generation" : "Send message"}
               title={isStreaming ? "Stop generation" : "Send message"}
             >
@@ -293,7 +321,7 @@ export function ChatInterface({
             </Button>
           </div>
           {isEmpty && (
-            <p className="text-center text-[11px] text-[var(--color-text-tertiary)] mt-2.5">
+            <p className="text-center text-xs text-[var(--color-text-tertiary)] mt-2.5">
               Shift+Enter for newline · Enter to send
             </p>
           )}

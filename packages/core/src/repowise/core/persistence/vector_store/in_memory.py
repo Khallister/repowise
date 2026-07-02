@@ -5,7 +5,7 @@ from __future__ import annotations
 from repowise.core.providers.embedding.base import Embedder
 
 from ..search import SearchResult
-from ._base import VectorStore, cosine_similarity
+from ._base import VectorStore, cosine_similarity, iter_embed_chunks
 
 __all__ = ["InMemoryVectorStore"]
 
@@ -27,19 +27,17 @@ class InMemoryVectorStore(VectorStore):
         self._store[page_id] = (vectors[0], dict(metadata))
 
     async def embed_batch(self, items: list[tuple[str, str, dict]]) -> None:
+        # Chunked like the persistent stores: this store is also the runtime
+        # fallback when LanceDB isn't installed, so it can sit in front of a
+        # real embedder with real request limits.
         if not items:
             return
-        texts = [text for _, text, _ in items]
-        vectors = await self._embedder.embed(texts)
-        for (page_id, _text, metadata), vector in zip(items, vectors, strict=True):
-            self._store[page_id] = (vector, dict(metadata))
+        for chunk, texts in iter_embed_chunks(items):
+            vectors = await self._embedder.embed(texts)
+            for (page_id, _text, metadata), vector in zip(chunk, vectors, strict=True):
+                self._store[page_id] = (vector, dict(metadata))
 
-    async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
-        if not self._store:
-            return []
-        q_vecs = await self._embedder.embed([query])
-        q_vec = q_vecs[0]
-
+    def _search_by_vector(self, q_vec: list[float], limit: int) -> list[SearchResult]:
         scored: list[tuple[float, str, dict]] = []
         for pid, (vec, meta) in self._store.items():
             score = cosine_similarity(q_vec, vec)
@@ -63,8 +61,37 @@ class InMemoryVectorStore(VectorStore):
             )
         return results
 
+    async def upsert_vectors(self, items: list[tuple[str, list[float], dict]]) -> bool:
+        for page_id, vector, metadata in items:
+            self._store[page_id] = (list(vector), dict(metadata))
+        return True
+
+    async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
+        if not self._store:
+            return []
+        q_vecs = await self._embedder.embed([query])
+        return self._search_by_vector(q_vecs[0], limit)
+
+    async def search_by_vector(self, vector: list[float], limit: int = 10) -> list[SearchResult]:
+        if not self._store:
+            return []
+        return self._search_by_vector(vector, limit)
+
+    async def search_many(self, queries: list[str], limit: int = 10) -> list[list[SearchResult]]:
+        """One embedder call for all queries, then local scoring per query."""
+        if not queries:
+            return []
+        if not self._store:
+            return [[] for _ in queries]
+        q_vecs = await self._embedder.embed(list(queries))
+        return [self._search_by_vector(q_vec, limit) for q_vec in q_vecs]
+
     async def delete(self, page_id: str) -> None:
         self._store.pop(page_id, None)
+
+    async def delete_many(self, page_ids: list[str]) -> None:
+        for page_id in page_ids:
+            self._store.pop(page_id, None)
 
     async def close(self) -> None:
         self._store.clear()

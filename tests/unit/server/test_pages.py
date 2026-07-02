@@ -84,6 +84,38 @@ async def test_get_page_versions_empty(client: AsyncClient, app) -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_page_notes_roundtrip(client: AsyncClient, app) -> None:
+    _, page_id = await _create_page(client, app.state.session_factory)
+
+    resp = await client.patch(
+        "/api/pages/lookup/notes",
+        params={"page_id": page_id},
+        json={"human_notes": "Reviewed by platform team."},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["human_notes"] == "Reviewed by platform team."
+
+    # Whitespace-only clears the note back to null.
+    cleared = await client.patch(
+        "/api/pages/lookup/notes",
+        params={"page_id": page_id},
+        json={"human_notes": "   "},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["human_notes"] is None
+
+
+@pytest.mark.asyncio
+async def test_update_page_notes_not_found(client: AsyncClient) -> None:
+    resp = await client.patch(
+        "/api/pages/lookup/notes",
+        params={"page_id": "file_page:missing.py"},
+        json={"human_notes": "x"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_regenerate_page_returns_202(client: AsyncClient, app) -> None:
     _, page_id = await _create_page(client, app.state.session_factory)
     resp = await client.post("/api/pages/lookup/regenerate", params={"page_id": page_id})
@@ -99,3 +131,25 @@ async def test_regenerate_page_not_found(client: AsyncClient) -> None:
         params={"page_id": "file_page:nonexistent.py"},
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_regenerate_page_with_known_style_accepted(client: AsyncClient, app) -> None:
+    _, page_id = await _create_page(client, app.state.session_factory)
+    resp = await client.post(
+        "/api/pages/lookup/regenerate",
+        params={"page_id": page_id, "style": "caveman"},
+    )
+    assert resp.status_code == 202
+    assert "job_id" in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_regenerate_page_rejects_unknown_style(client: AsyncClient, app) -> None:
+    _, page_id = await _create_page(client, app.state.session_factory)
+    resp = await client.post(
+        "/api/pages/lookup/regenerate",
+        params={"page_id": page_id, "style": "bogus"},
+    )
+    assert resp.status_code == 400
+    assert "style" in resp.json()["detail"].lower()

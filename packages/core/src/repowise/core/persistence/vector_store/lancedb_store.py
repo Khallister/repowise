@@ -5,9 +5,30 @@ from __future__ import annotations
 from repowise.core.providers.embedding.base import Embedder
 
 from ..search import SearchResult
-from ._base import VectorStore
+from ._base import VectorStore, iter_embed_chunks
 
 __all__ = ["LanceDBVectorStore"]
+
+
+def _paths_in_filter(paths: list[str]) -> str:
+    """Build an SQL-injection-safe ``target_path IN (...)`` LanceDB filter.
+
+    LanceDB's ``.where()`` takes a DataFusion SQL string with no bind
+    parameters, so each path is quoted with the same quote-doubling escape
+    the single-path lookup uses.
+    """
+    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
+    return f"target_path IN ({quoted})"
+
+
+def _page_ids_in_filter(page_ids: list[str]) -> str:
+    """Build an SQL-injection-safe ``page_id IN (...)`` LanceDB filter.
+
+    Mirrors :func:`_paths_in_filter` but on the ``page_id`` column, using the
+    same quote-doubling escape as the single-id delete.
+    """
+    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in page_ids)
+    return f"page_id IN ({quoted})"
 
 
 class LanceDBVectorStore(VectorStore):
@@ -142,26 +163,37 @@ class LanceDBVectorStore(VectorStore):
         await self._upsert_rows([self._row(page_id, vector, meta)])
 
     async def embed_batch(self, items: list[tuple[str, str, dict]]) -> None:
+        """Embed and upsert in request-sized chunks with failure isolation.
+
+        One embedder call per :data:`EMBED_BATCH_MAX_ITEMS` items — a whole
+        generation level in a single request blew OpenAI's 300k-token cap
+        and silently lost every file-page embedding. A failed chunk no
+        longer sinks the rest; the summary error is raised at the end so
+        callers still see the loss.
+        """
         if not items:
             return
         await self._ensure_connected()
-        texts = [text for _, text, _ in items]
-        vectors = await self._embedder.embed(texts)
-        await self._ensure_table(vectors[0])
-        rows = [
-            self._row(page_id, vector, {"content": text, **metadata})
-            for (page_id, text, metadata), vector in zip(items, vectors, strict=True)
-        ]
-        await self._upsert_rows(rows)
+        failed = 0
+        last_exc: Exception | None = None
+        for chunk, texts in iter_embed_chunks(items):
+            try:
+                vectors = await self._embedder.embed(texts)
+                await self._ensure_table(vectors[0])
+                rows = [
+                    self._row(page_id, vector, {"content": text, **metadata})
+                    for (page_id, text, metadata), vector in zip(chunk, vectors, strict=True)
+                ]
+                await self._upsert_rows(rows)
+            except Exception as exc:  # isolate per chunk
+                failed += len(chunk)
+                last_exc = exc
+        if failed:
+            raise RuntimeError(
+                f"embed_batch: {failed}/{len(items)} items failed to embed"
+            ) from last_exc
 
-    async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
-        await self._ensure_connected()
-        if self._table is None:
-            return []
-
-        q_vecs = await self._embedder.embed([query])
-        q_vec = [float(v) for v in q_vecs[0]]
-
+    async def _search_by_vector(self, q_vec: list[float], limit: int) -> list[SearchResult]:
         # Query with explicit cosine distance so ``_distance`` is a cosine
         # distance (1 - cos); we return ``1 - _distance`` = cosine similarity.
         # This makes the score semantics match the other backends
@@ -185,11 +217,65 @@ class LanceDBVectorStore(VectorStore):
             for r in raw
         ]
 
+    async def upsert_vectors(self, items: list[tuple[str, list[float], dict]]) -> bool:
+        if not items:
+            return True
+        await self._ensure_connected()
+        await self._ensure_table([float(v) for v in items[0][1]])
+        rows = [
+            self._row(page_id, [float(v) for v in vector], metadata)
+            for page_id, vector, metadata in items
+        ]
+        await self._upsert_rows(rows)
+        return True
+
+    async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
+        await self._ensure_connected()
+        if self._table is None:
+            return []
+
+        q_vecs = await self._embedder.embed([query])
+        return await self._search_by_vector([float(v) for v in q_vecs[0]], limit)
+
+    async def search_by_vector(self, vector: list[float], limit: int = 10) -> list[SearchResult]:
+        await self._ensure_connected()
+        if self._table is None:
+            return []
+        return await self._search_by_vector([float(v) for v in vector], limit)
+
+    async def search_many(self, queries: list[str], limit: int = 10) -> list[list[SearchResult]]:
+        """One embedder call for all queries; the vector lookups are local."""
+        if not queries:
+            return []
+        await self._ensure_connected()
+        if self._table is None:
+            return [[] for _ in queries]
+        q_vecs = await self._embedder.embed(list(queries))
+        out: list[list[SearchResult]] = []
+        for q_vec in q_vecs:
+            try:
+                out.append(await self._search_by_vector([float(v) for v in q_vec], limit))
+            except Exception:
+                out.append([])
+        return out
+
     async def delete(self, page_id: str) -> None:
         await self._ensure_connected()
         if self._table is not None:
             safe_id = page_id.replace("'", "''")
             await self._table.delete(f"page_id = '{safe_id}'")  # type: ignore[union-attr]
+
+    async def delete_many(self, page_ids: list[str]) -> None:
+        if not page_ids:
+            return
+        await self._ensure_connected()
+        if self._table is None:
+            return
+        # LanceDB's ``.where()`` has no bind params, so build a quoted IN
+        # predicate; chunk to keep the SQL string bounded.
+        for i in range(0, len(page_ids), 500):
+            batch = page_ids[i : i + 500]
+            await self._table.delete(_page_ids_in_filter(batch))  # type: ignore[union-attr]
 
     async def close(self) -> None:
         self._table = None
@@ -230,3 +316,35 @@ class LanceDBVectorStore(VectorStore):
 
         summary = rows[0].get("content_snippet") or ""
         return {"summary": str(summary), "key_exports": []}
+
+    async def get_page_summaries_by_paths(self, paths: list[str]) -> dict[str, dict]:
+        """One ``IN``-filtered scan instead of one filtered query per path.
+
+        Mirrors the single-path semantics (first row per path wins, empty
+        summaries dropped, ``key_exports`` not stored in this schema).
+        """
+        if not paths:
+            return {}
+        await self._ensure_connected()
+        if self._table is None:
+            return {}
+
+        try:
+            rows = (
+                await self._table.query()  # type: ignore[union-attr]
+                .where(_paths_in_filter(paths))
+                .select(["target_path", "content_snippet"])
+                .to_list()
+            )
+        except Exception:
+            return {}
+
+        out: dict[str, dict] = {}
+        for r in rows:
+            tp = str(r.get("target_path") or "")
+            if not tp or tp in out:
+                continue
+            summary = r.get("content_snippet") or ""
+            if summary:
+                out[tp] = {"summary": str(summary), "key_exports": []}
+        return out

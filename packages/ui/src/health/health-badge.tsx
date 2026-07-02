@@ -1,21 +1,23 @@
+import { bandForScore } from "@repowise-dev/types";
+import type { HealthBand } from "@repowise-dev/types/health";
+import { healthBandSoftBadgeClass } from "./tokens";
+
 export interface HealthBadgeProps {
   score: number | null | undefined;
+  /** Explicit band from the API; when omitted it is derived from `score`
+   * via the shared `bandForScore` mirror (no hardcoded cutoffs). */
+  band?: HealthBand;
   size?: "xs" | "sm";
-}
-
-function scoreColor(score: number): string {
-  if (score < 4) return "bg-red-500/15 text-red-500";
-  if (score < 6) return "bg-amber-500/15 text-amber-500";
-  if (score < 8) return "bg-yellow-500/15 text-yellow-500";
-  return "bg-emerald-500/15 text-emerald-500";
 }
 
 /** Compact health-score pill, designed to inline next to a file path
  * on Hotspot / Ownership / Graph rows without changing those shared
- * components' shapes. Renders nothing when the score is missing. */
-export function HealthBadge({ score, size = "xs" }: HealthBadgeProps) {
+ * components' shapes. Renders nothing when the score is missing.
+ * Colored by the 3 defect-backed health bands. */
+export function HealthBadge({ score, band, size = "xs" }: HealthBadgeProps) {
   if (score == null) return null;
-  const cls = scoreColor(score);
+  const resolved = band ?? bandForScore(score);
+  const cls = healthBandSoftBadgeClass(resolved);
   const sizing =
     size === "xs"
       ? "text-[10px] px-1.5 py-0.5"

@@ -3,65 +3,28 @@
 import * as React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import Image from "next/image";
+import { BrandLogo } from "./brand-logo";
 import {
   Menu,
-  Activity,
-  BookOpen,
-  LayoutDashboard,
-  Lightbulb,
-  MessageSquare,
-  Settings,
   Search,
-  GitBranch,
-  Code2,
-  Users,
-  Flame,
-  Trash2,
-  Radar,
   ChevronDown,
   ChevronRight,
   Circle,
-  SlidersHorizontal,
-  Layers,
-  Link2,
-  GitMerge,
 } from "lucide-react";
 import { Button } from "@repowise-dev/ui/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@repowise-dev/ui/ui/sheet";
 import { ScrollArea } from "@repowise-dev/ui/ui/scroll-area";
 import { Separator } from "@repowise-dev/ui/ui/separator";
 import { AddRepoDialog } from "@/components/repos/add-repo-dialog";
+import { VersionFooter } from "./version-footer";
 import { cn } from "@/lib/utils/cn";
+import {
+  GLOBAL_NAV,
+  WORKSPACE_NAV,
+  repoNavGroups,
+  isNavItemActive,
+} from "./nav-items";
 import type { RepoResponse, WorkspaceResponse } from "@/lib/api/types";
-
-const GLOBAL_NAV = [
-  { label: "Dashboard", href: "/", icon: LayoutDashboard },
-  { label: "Settings", href: "/settings", icon: Settings },
-];
-
-function repoNavItems(repoId: string) {
-  return [
-    { label: "Overview", href: `/repos/${repoId}/overview`, icon: Activity },
-    { label: "Chat", href: `/repos/${repoId}`, icon: MessageSquare, exact: true },
-    { label: "Wiki", href: `/repos/${repoId}/docs`, icon: BookOpen },
-    { label: "Search", href: `/repos/${repoId}/search`, icon: Search },
-    { label: "Graph", href: `/repos/${repoId}/graph`, icon: GitBranch },
-    { label: "Symbols", href: `/repos/${repoId}/symbols`, icon: Code2 },
-    { label: "Ownership", href: `/repos/${repoId}/ownership`, icon: Users },
-    { label: "Hotspots", href: `/repos/${repoId}/hotspots`, icon: Flame },
-    { label: "Dead Code", href: `/repos/${repoId}/dead-code`, icon: Trash2 },
-    { label: "Blast Radius", href: `/repos/${repoId}/blast-radius`, icon: Radar },
-    { label: "Decisions", href: `/repos/${repoId}/decisions`, icon: Lightbulb },
-    { label: "Settings", href: `/repos/${repoId}/settings`, icon: SlidersHorizontal },
-  ];
-}
-
-const WORKSPACE_NAV = [
-  { label: "Overview", href: "/workspace", icon: Layers, exact: true as const },
-  { label: "Contracts", href: "/workspace/contracts", icon: Link2 },
-  { label: "Co-Changes", href: "/workspace/co-changes", icon: GitMerge },
-];
 
 interface MobileNavProps {
   repos?: RepoResponse[];
@@ -116,13 +79,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
         <Menu className="h-5 w-5" />
       </Button>
       <div className="flex items-center gap-2 min-w-0 flex-1">
-        <Image
-          src="/repowise-logo.png"
-          alt="repowise"
-          width={24}
-          height={24}
-          className="shrink-0 drop-shadow-[0_0_8px_rgba(245,149,32,0.3)]"
-        />
+        <BrandLogo size={24} />
         <span className="text-base font-semibold text-[var(--color-text-primary)] tracking-tight truncate">
           repowise
         </span>
@@ -142,13 +99,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
       <Sheet open={open} onOpenChange={setOpen}>
         <SheetContent side="left" className="w-72 p-0">
           <SheetHeader className="border-b border-[var(--color-border-default)] h-14 flex-row items-center gap-3 py-0 px-4">
-            <Image
-              src="/repowise-logo.png"
-              alt="repowise"
-              width={28}
-              height={28}
-              className="shrink-0 drop-shadow-[0_0_8px_rgba(245,149,32,0.3)]"
-            />
+            <BrandLogo size={28} />
             <SheetTitle className="text-base">repowise</SheetTitle>
           </SheetHeader>
 
@@ -217,7 +168,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                   <div className="space-y-0.5">
                     {repos.map((repo) => {
                       const isExpanded = expandedRepos.has(repo.id);
-                      const navItems = repoNavItems(repo.id);
+                      const navGroups = repoNavGroups(repo.id);
                       return (
                         <div key={repo.id}>
                           <button
@@ -237,27 +188,36 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                           </button>
                           {isExpanded && (
                             <div className="ml-3.5 mt-0.5 space-y-0.5 border-l border-[var(--color-border-default)] pl-3">
-                              {navItems.map((item) => {
-                                const Icon = item.icon;
-                                const isActive = (item as { exact?: boolean }).exact
-                                  ? pathname === item.href
-                                  : pathname === item.href || pathname.startsWith(`${item.href}/`);
-                                return (
-                                  <Link
-                                    key={item.href}
-                                    href={item.href}
-                                    className={cn(
-                                      "flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] transition-colors",
-                                      isActive
-                                        ? "bg-[var(--color-accent-muted)] text-[var(--color-accent-primary)]"
-                                        : "text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-primary)]",
-                                    )}
-                                  >
-                                    <Icon className="h-4 w-4 shrink-0" />
-                                    {item.label}
-                                  </Link>
-                                );
-                              })}
+                              {navGroups.map((group, gi) => (
+                                <React.Fragment key={group.label ?? gi}>
+                                  {group.label ? (
+                                    <p className="px-2 pt-2 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-[var(--color-text-tertiary)]">
+                                      {group.label}
+                                    </p>
+                                  ) : gi > 0 ? (
+                                    <div className="pt-1.5" />
+                                  ) : null}
+                                  {group.items.map((item) => {
+                                    const Icon = item.icon;
+                                    const isActive = isNavItemActive(item, pathname);
+                                    return (
+                                      <Link
+                                        key={item.href}
+                                        href={item.href}
+                                        className={cn(
+                                          "flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] transition-colors",
+                                          isActive
+                                            ? "bg-[var(--color-accent-muted)] text-[var(--color-accent-primary)]"
+                                            : "text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-primary)]",
+                                        )}
+                                      >
+                                        <Icon className="h-4 w-4 shrink-0" />
+                                        {item.label}
+                                      </Link>
+                                    );
+                                  })}
+                                </React.Fragment>
+                              ))}
                             </div>
                           )}
                         </div>
@@ -282,7 +242,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
           </ScrollArea>
 
           <div className="border-t border-[var(--color-border-default)] px-4 py-3">
-            <p className="text-xs text-[var(--color-text-tertiary)]">repowise v0.14.0</p>
+            <VersionFooter />
           </div>
         </SheetContent>
       </Sheet>

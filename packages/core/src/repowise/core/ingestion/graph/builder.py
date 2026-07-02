@@ -40,12 +40,42 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         pr = builder.pagerank()
     """
 
-    def __init__(self, repo_path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        repo_path: Path | str | None = None,
+        *,
+        exclude_patterns: list[str] | None = None,
+        centrality_cache_dir: Path | str | None = None,
+        include_submodules: bool = False,
+        include_nested_repos: bool = False,
+    ) -> None:
         self._graph: nx.DiGraph = nx.DiGraph()
         self._parsed_files: dict[str, ParsedFile] = {}  # path → ParsedFile
         self._built = False
+        # Resolver-built DotNetProjectIndex, stashed by build() for the
+        # dynamic-hints phase to reuse (see build()).
+        self.dotnet_index: Any | None = None
         self._repo_path: Path | None = Path(repo_path) if repo_path else None
+        # Mirrors the traverser flags: when submodules or nested repos are
+        # indexed, resolver filesystem scans must not prune them (both are
+        # ``.git``-bearing subdirs to fs_walk's prune_nested_git).
+        self._prune_nested_git: bool = not (include_submodules or include_nested_repos)
         self._tsconfig_resolver: Any | None = None  # TsconfigResolver (lazy import)
+        # Optional structure-keyed disk cache for betweenness (the most
+        # expensive metric kernel). Opt-in via *centrality_cache_dir* — the
+        # ingest paths pass ``<repo>/.repowise``; ad-hoc builders are unchanged.
+        self._centrality_cache: Any | None = None
+        if centrality_cache_dir is not None:
+            try:
+                from ._centrality_cache import CentralityCache
+
+                self._centrality_cache = CentralityCache(centrality_cache_dir)
+            except Exception:
+                self._centrality_cache = None
+
+        import pathspec
+
+        self._exclude = pathspec.PathSpec.from_lines("gitwildmatch", exclude_patterns or [])
 
         # Community / flow / metric caches (invalidated on build)
         self._community_cache: dict[str, int] | None = None
@@ -59,6 +89,34 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         self._symbol_pagerank_cache: dict[str, float] | None = None
         self._symbol_betweenness_cache: dict[str, float] | None = None
         self._execution_flow_cache: Any | None = None
+        # Filtered-subgraph caches — rebuilt lazily; guarded by a lock because
+        # the init pipeline computes metrics concurrently (asyncio.to_thread).
+        import threading
+
+        self._subgraph_lock = threading.Lock()
+        self._file_subgraph_cache: nx.DiGraph | None = None
+        self._symbol_subgraph_cache: nx.DiGraph | None = None
+        # Shared import-name maps (built once per build(), injected into the
+        # call + heritage resolvers; reset whenever files change).
+        self._import_name_maps: Any | None = None
+
+    def __getstate__(self) -> dict:
+        # GraphBuilder is pickled to hand a fully-built graph (structure +
+        # materialized metric caches) across a process boundary without a
+        # re-clone + re-run of the pipeline — e.g. the hosted static-state
+        # bundle that feeds doc generation. ``threading.Lock`` is not
+        # picklable, so drop it; every other member (the NetworkX graph,
+        # ParsedFiles, metric caches, the resolvers) pickles fine.
+        # ``__setstate__`` recreates the lock.
+        state = self.__dict__.copy()
+        state["_subgraph_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        import threading
+
+        self.__dict__.update(state)
+        self._subgraph_lock = threading.Lock()
 
     def set_tsconfig_resolver(self, resolver: Any) -> None:
         """Attach a :class:`TsconfigResolver` for TS/JS path-alias resolution."""
@@ -77,6 +135,20 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         self._symbol_pagerank_cache = None
         self._symbol_betweenness_cache = None
         self._execution_flow_cache = None
+        self._file_subgraph_cache = None
+        self._symbol_subgraph_cache = None
+        self._import_name_maps = None
+
+    def _invalidate_subgraph_caches(self) -> None:
+        """Clear only the filtered-subgraph caches.
+
+        Called by graph mutations that historically did NOT clear the metric
+        caches (co-change edge refresh, framework edges) — those keep their
+        existing semantics, but a cached subgraph must never go stale
+        structurally.
+        """
+        self._file_subgraph_cache = None
+        self._symbol_subgraph_cache = None
 
     def release_graph(self) -> None:
         """Drop the in-memory NetworkX object after metrics are materialized.
@@ -93,6 +165,7 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         """
         self._graph = nx.DiGraph()
         self._built = True
+        self._invalidate_subgraph_caches()  # they hold the old structure — free it
 
     # ------------------------------------------------------------------
     # Building
@@ -114,6 +187,11 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
             is_test=parsed.file_info.is_test,
             is_entry_point=parsed.file_info.is_entry_point,
             docstring=parsed.docstring,
+            # Same-file references (Python): names used intra-module in a
+            # non-call/non-import position. Rescues them in the unused-export
+            # pass. An immutable frozenset (never mutated post-stamp, unlike
+            # ``local_type_uses`` which the type-ref phase ``.update()``s).
+            local_refs=parsed.local_refs,
         )
 
         # --- Symbol nodes ---
@@ -193,14 +271,17 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         stem_map = build_stem_map(path_set)
 
         # Construct resolver context
-        go_modules = read_go_modules(self._repo_path)
+        go_modules = read_go_modules(self._repo_path, prune_nested_git=self._prune_nested_git)
         ctx = ResolverContext(
             path_set=path_set,
             stem_map=stem_map,
             graph=self._graph,
             repo_path=self._repo_path,
+            prune_nested_git=self._prune_nested_git,
             tsconfig_resolver=self._tsconfig_resolver,
-            go_module_path=(go_modules[-1][1] if go_modules else read_go_module_path(self._repo_path)),
+            go_module_path=(
+                go_modules[-1][1] if go_modules else read_go_module_path(self._repo_path)
+            ),
             go_modules=go_modules,
             has_sfc_files=any(p.endswith((".vue", ".svelte", ".astro")) for p in path_set),
             parsed_files=self._parsed_files,
@@ -247,6 +328,10 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
                     from ..resolvers.kotlin import resolve_kotlin_import_all
 
                     targets = resolve_kotlin_import_all(imp.module_path, path, ctx)
+                elif _lang == "scala":
+                    from ..resolvers.scala import resolve_scala_import_all
+
+                    targets = resolve_scala_import_all(imp.module_path, path, ctx)
                 elif _lang in ("cpp", "c"):
                     # Fan-out across sibling TUs in the same CMake/Bazel
                     # target so a public header reached by one ``.cc`` is
@@ -320,6 +405,44 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         # unused_export false positives (audit #23).
         self._resolve_member_reads(progress=progress)
 
+        # --- Ruby rspec directory-mirror edges ---
+        # Spec files carry no requires (rspec wires the helper + subject
+        # at runtime); the spec/ <-> lib/ mirror convention links them.
+        self._resolve_ruby_spec_mirrors(progress=progress)
+
+        # --- C/C++ header ↔ implementation pairing ---
+        # foo.h -> foo.c (same stem, same dir): consumers including the
+        # header must be able to reach the implementation.
+        self._resolve_cpp_header_pairs(progress=progress)
+
+        # --- C# partial-class co-fragments ---
+        # Fragments of one partial type across files are literally one
+        # class; link them bidirectionally so neither reads as orphaned.
+        self._resolve_csharp_partials(ctx, progress=progress)
+
+        # --- JVM same-package implicit references ---
+        # Java/Kotlin (and Scala) reference same-package types without an
+        # import statement; emit conservative sibling edges so cohesive
+        # packages don't read as disconnected files.
+        self._resolve_jvm_same_package(ctx, progress=progress)
+
+        # --- C# same-namespace + global-using implicit references ---
+        # C# references same-namespace types with no using directive, and
+        # global usings make namespaces visible project-wide; emit
+        # conservative sibling edges so neither reads as orphaned.
+        self._resolve_csharp_same_namespace(ctx, progress=progress)
+
+        # --- Swift intra-module type references ---
+        # Swift files see same-target siblings with no import statement;
+        # emit conservative type-reference edges per SPM target.
+        self._resolve_swift_same_module(ctx, progress=progress)
+
+        # --- F# fsproj compile-order spine ---
+        # fsproj <Compile Include> order is a real dependency constraint
+        # (files may only reference earlier files); adjacent pairs keep
+        # open-light projects connected.
+        self._resolve_fsharp_compile_order(ctx, progress=progress)
+
         # --- Phase 2: Resolve heritage (extends/implements) ---
         self._resolve_heritage(import_targets, progress=progress)
 
@@ -333,6 +456,15 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         self._resolve_calls(import_targets, progress=progress)
 
         self._built = True
+
+        # Keep the resolver-built DotNetProjectIndex reachable after the
+        # context goes out of scope: the dynamic-hints phase (XAML) needs
+        # the same type map and otherwise rebuilds the index from disk.
+        # Only stashed when this build pruned nested git repos, because a
+        # standalone rebuild always prunes — the maps must be identical.
+        self.dotnet_index = (
+            getattr(ctx, "_dotnet_index", None) if self._prune_nested_git else None
+        )
 
         # Count edge types for logging
         edge_counts: dict[str, int] = {}

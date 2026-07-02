@@ -1,71 +1,45 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback } from "react";
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
 import {
-  FileText,
-  Clock,
-  Cpu,
-  ExternalLink,
-  Download,
-  StickyNote,
-  ArrowRight,
-  ArrowLeft,
-  Loader2,
-  PanelRight,
-  PanelRightClose,
-  Network,
   Activity,
+  Network,
   GitBranch,
-  Layers,
+  ArrowRight,
   Flame,
-  FileInput,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { getGitMetadata } from "@/lib/api/git";
-import { WikiMarkdown } from "@repowise-dev/ui/wiki/wiki-markdown";
-import { getBacklinks, getWikiLinks } from "@repowise-dev/ui/wiki/wiki-links-types";
-import { TableOfContents } from "@repowise-dev/ui/wiki/table-of-contents";
-import { computeDocNav } from "@repowise-dev/ui/docs/doc-nav";
-import { Breadcrumb } from "@repowise-dev/ui/shared/breadcrumb";
-import { BacklinksPanel } from "@repowise-dev/ui/wiki/backlinks-panel";
-import { getPageTypeLabel } from "@repowise-dev/ui/lib/page-types";
-import {
-  DEFAULT_PERSONA,
-  READER_PERSONAS,
-  type ReaderPersona,
-  filterMarkdownByPersona,
-  isReaderPersona,
-} from "@repowise-dev/ui/docs/reader-persona";
-import { VersionHistoryWrapper } from "@/components/wiki/version-history";
-import { ConfidenceBadge } from "@repowise-dev/ui/wiki/confidence-badge";
+import { DocsReader } from "@repowise-dev/ui/docs/docs-reader";
 import { Badge } from "@repowise-dev/ui/ui/badge";
 import { Skeleton } from "@repowise-dev/ui/ui/skeleton";
-import { formatRelativeTime, formatTokens } from "@repowise-dev/ui/lib/format";
-import { downloadTextFile } from "@/lib/utils/download";
+import { VersionHistoryWrapper } from "@/components/wiki/version-history";
+import { SecurityPanelWrapper } from "@/components/wiki/security-panel";
 import { useGraphMetrics, useCallersCallees } from "@/lib/hooks/use-graph";
+import type { ReaderPersona } from "@repowise-dev/ui/docs/reader-persona";
+import type { DocPage } from "@repowise-dev/types/docs";
 import type { PageResponse } from "@/lib/api/types";
 
 function PercentileBar({ value, label }: { value: number; label: string }) {
   const pct = 100 - value;
   return (
     <div className="flex items-center justify-between gap-2">
-      <span className="text-[11px] text-[var(--color-text-tertiary)] shrink-0">{label}</span>
+      <span className="text-xs text-[var(--color-text-tertiary)] shrink-0">{label}</span>
       <div className="flex items-center gap-1.5">
         <div className="w-16 h-1.5 rounded-full bg-[var(--color-bg-elevated)] overflow-hidden">
           <div
             className={cn(
               "h-full rounded-full",
-              value >= 75 ? "bg-green-400" : value >= 50 ? "bg-yellow-400" : "bg-[var(--color-text-tertiary)]",
+              value >= 75 ? "bg-[var(--color-success)]" : value >= 50 ? "bg-[var(--color-warning)]" : "bg-[var(--color-text-tertiary)]",
             )}
             style={{ width: `${value}%` }}
           />
         </div>
         <span className={cn(
           "text-[10px] font-mono tabular-nums w-10 text-right",
-          value >= 75 ? "text-green-400" : value >= 50 ? "text-yellow-400" : "text-[var(--color-text-tertiary)]",
+          value >= 75 ? "text-[var(--color-success)]" : value >= 50 ? "text-[var(--color-warning)]" : "text-[var(--color-text-tertiary)]",
         )}>
           Top {pct}%
         </span>
@@ -82,7 +56,7 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
 
   if (metricsLoading) {
     return (
-      <div className="space-y-3 p-3">
+      <div className="space-y-3">
         <Skeleton className="h-4 w-20" />
         <Skeleton className="h-3 w-full" />
         <Skeleton className="h-3 w-full" />
@@ -91,21 +65,16 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
     );
   }
 
-  if (!metrics) {
-    return (
-      <div className="p-3">
-        <p className="text-[11px] text-[var(--color-text-tertiary)] italic">No graph data available</p>
-      </div>
-    );
-  }
+  // No graph data — render nothing rather than announcing the absence.
+  if (!metrics) return null;
 
   return (
-    <div className="space-y-4 p-3">
+    <div className="space-y-4">
       {/* Graph Metrics */}
       <div>
         <div className="flex items-center gap-1.5 mb-2">
           <Activity className="h-3 w-3 text-[var(--color-text-tertiary)]" />
-          <span className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
+          <span className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
             Importance
           </span>
         </div>
@@ -113,8 +82,8 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
           <PercentileBar value={metrics.pagerank_percentile} label="PageRank" />
           <PercentileBar value={metrics.betweenness_percentile} label="Centrality" />
           <div className="flex items-center justify-between">
-            <span className="text-[11px] text-[var(--color-text-tertiary)]">Degree</span>
-            <span className="text-[11px] font-mono text-[var(--color-text-secondary)]">
+            <span className="text-xs text-[var(--color-text-tertiary)]">Degree</span>
+            <span className="text-xs font-mono text-[var(--color-text-secondary)]">
               {metrics.in_degree} in &middot; {metrics.out_degree} out
             </span>
           </div>
@@ -129,13 +98,13 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
         <div>
           <div className="flex items-center gap-1.5 mb-2">
             <Network className="h-3 w-3 text-[var(--color-text-tertiary)]" />
-            <span className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
+            <span className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
               Community
             </span>
           </div>
           <Link
-            href={`/repos/${repoId}/graph?colorMode=community`}
-            className="inline-flex items-center gap-1 text-[11px] text-[var(--color-accent)] hover:underline"
+            href={`/repos/${repoId}/architecture?view=graph&colorMode=community`}
+            className="inline-flex items-center gap-1 text-xs text-[var(--color-accent)] hover:underline"
           >
             {metrics.community_label}
             <ArrowRight className="h-2.5 w-2.5" />
@@ -148,7 +117,7 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
         <div>
           <div className="flex items-center gap-1.5 mb-2">
             <GitBranch className="h-3 w-3 text-[var(--color-text-tertiary)]" />
-            <span className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
+            <span className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
               Call Graph
             </span>
           </div>
@@ -156,7 +125,7 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
             <div className="mb-2">
               <p className="text-[10px] text-[var(--color-text-tertiary)] mb-1">Called by ({callData.caller_count})</p>
               {callData.callers.slice(0, 5).map((c) => (
-                <p key={c.symbol_id} className="text-[11px] font-mono text-[var(--color-text-secondary)] truncate pl-2" title={c.symbol_id}>
+                <p key={c.symbol_id} className="text-xs font-mono text-[var(--color-text-secondary)] truncate pl-2" title={c.symbol_id}>
                   {c.name}
                 </p>
               ))}
@@ -166,7 +135,7 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
             <div>
               <p className="text-[10px] text-[var(--color-text-tertiary)] mb-1">Calls ({callData.callee_count})</p>
               {callData.callees.slice(0, 5).map((c) => (
-                <p key={c.symbol_id} className="text-[11px] font-mono text-[var(--color-text-secondary)] truncate pl-2" title={c.symbol_id}>
+                <p key={c.symbol_id} className="text-xs font-mono text-[var(--color-text-secondary)] truncate pl-2" title={c.symbol_id}>
                   {c.name}
                 </p>
               ))}
@@ -180,8 +149,8 @@ function DocsSidebar({ repoId, targetPath }: { repoId: string; targetPath: strin
 
 /**
  * Consolidated "At a glance" signals for a file page — hotspot, ownership,
- * churn, bus factor — pulled from the existing git-metadata endpoint so the
- * reader doesn't have to leave the wiki to learn how risky/owned a file is.
+ * churn, bus factor — pulled from the git-metadata endpoint so the reader
+ * doesn't have to leave the doc to learn how risky/owned a file is.
  * Renders nothing for non-file pages or files without git history.
  */
 function AtAGlance({ repoId, targetPath }: { repoId: string; targetPath: string }) {
@@ -202,13 +171,13 @@ function AtAGlance({ repoId, targetPath }: { repoId: string; targetPath: string 
     <div>
       <div className="flex items-center gap-1.5 mb-2">
         <Flame className="h-3 w-3 text-[var(--color-text-tertiary)]" />
-        <span className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
+        <span className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
           At a glance
         </span>
       </div>
       <div className="flex flex-wrap gap-1.5">
         {data.is_hotspot && (
-          <Badge variant="outline" className="text-[10px] border-amber-400/40 text-amber-300/90">
+          <Badge variant="outline" className="text-[10px] border-[var(--color-warning)]/40 text-[var(--color-warning)]">
             <Flame className="h-2.5 w-2.5 mr-1" />
             Hotspot · top {churnTop}%
           </Badge>
@@ -217,12 +186,12 @@ function AtAGlance({ repoId, targetPath }: { repoId: string; targetPath: string 
           <Badge variant="outline" className="text-[10px]">Stable</Badge>
         )}
         {data.bus_factor === 1 && (
-          <Badge variant="outline" className="text-[10px] border-amber-400/40 text-amber-300/90">
+          <Badge variant="outline" className="text-[10px] border-[var(--color-warning)]/40 text-[var(--color-warning)]">
             Bus factor 1
           </Badge>
         )}
       </div>
-      <div className="mt-2 space-y-1 text-[11px] text-[var(--color-text-secondary)]">
+      <div className="mt-2 space-y-1 text-xs text-[var(--color-text-secondary)]">
         {data.primary_owner_name && (
           <div className="flex items-center justify-between gap-2">
             <span className="text-[var(--color-text-tertiary)]">Owner</span>
@@ -241,6 +210,14 @@ function AtAGlance({ repoId, targetPath }: { repoId: string; targetPath: string 
           <span className="text-[var(--color-text-tertiary)]">Contributors</span>
           <span className="font-mono">{data.contributor_count}</span>
         </div>
+        {data.agent_authored_pct != null && (data.agent_commit_count ?? 0) > 0 && (
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[var(--color-text-tertiary)]">Agent-authored</span>
+            <span className="font-mono">
+              {Math.round(data.agent_authored_pct * 100)}% · {data.agent_commit_count}
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -254,563 +231,86 @@ interface DocsViewerProps {
   isLoading?: boolean;
   /** Select another page in-place (breadcrumb / prev-next / wiki links). */
   onSelectPage?: (page: PageResponse) => void;
+  persona: ReaderPersona;
+  sidebarOpen: boolean;
 }
 
+/**
+ * Web data wrapper around the presentational ``DocsReader`` ui shell. Owns the
+ * data-bound rail sections (git "at a glance", graph intelligence, version
+ * history) and the Next route shape; the reader layout itself lives in ui so
+ * the redesign ships through the package bump.
+ */
 export function DocsViewer({
   page,
   pages = [],
   repoId,
   isLoading,
   onSelectPage,
-}: DocsViewerProps) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-
-  // Reader persona — a client-side section filter, persisted in the URL
-  // (?reader=) so a chosen depth is shareable and survives navigation.
-  const router = useRouter();
-  const searchParams = useSearchParams();
-  const readerParam = searchParams.get("reader");
-  const persona: ReaderPersona = isReaderPersona(readerParam) ? readerParam : DEFAULT_PERSONA;
-  const setPersona = useCallback(
-    (next: ReaderPersona) => {
-      const params = new URLSearchParams(searchParams.toString());
-      if (next === DEFAULT_PERSONA) params.delete("reader");
-      else params.set("reader", next);
-      const qs = params.toString();
-      router.replace(qs ? `?${qs}` : "?", { scroll: false });
-    },
-    [router, searchParams],
-  );
-
-  // In-app navigation to another page by id (used by breadcrumbs, prev/next,
-  // and resolved wiki links). Falls back to the full wiki route when the
-  // target isn't in the loaded list or no handler was supplied.
-  const goToPageId = useCallback(
-    (pageId: string) => {
-      const target = pages.find((p) => p.id === pageId);
-      if (target && onSelectPage) onSelectPage(target);
-      else
-        window.location.href = `/repos/${repoId}/wiki/${encodeURIComponent(pageId)}`;
-    },
-    [pages, onSelectPage, repoId],
-  );
-
-  // Scroll to top when page changes
-  useEffect(() => {
-    scrollRef.current?.scrollTo(0, 0);
-  }, [page?.id]);
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <Loader2 className="h-5 w-5 animate-spin text-[var(--color-accent-primary)]" />
-      </div>
-    );
-  }
-
-  if (!page) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8">
-        <div className="rounded-full bg-[var(--color-bg-elevated)] border border-[var(--color-border-default)] p-4">
-          <FileText className="h-8 w-8 text-[var(--color-text-tertiary)]" />
-        </div>
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">
-            Select a page
-          </h3>
-          <p className="text-xs text-[var(--color-text-secondary)] max-w-sm">
-            Choose a file or module from the tree to view its AI-generated documentation.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  const hasTargetPath = !!page.target_path;
-
-  return (
-    <DocsViewerBody
-      page={page}
-      pages={pages}
-      repoId={repoId}
-      hasTargetPath={hasTargetPath}
-      sidebarOpen={sidebarOpen}
-      setSidebarOpen={setSidebarOpen}
-      scrollRef={scrollRef}
-      goToPageId={goToPageId}
-      persona={persona}
-      setPersona={setPersona}
-    />
-  );
-}
-
-function DocsViewerBody({
-  page,
-  pages,
-  repoId,
-  hasTargetPath,
-  sidebarOpen,
-  setSidebarOpen,
-  scrollRef,
-  goToPageId,
   persona,
-  setPersona,
-}: {
-  page: PageResponse;
-  pages: PageResponse[];
-  repoId: string;
-  hasTargetPath: boolean;
-  sidebarOpen: boolean;
-  setSidebarOpen: (fn: (o: boolean) => boolean) => void;
-  scrollRef: React.RefObject<HTMLDivElement | null>;
-  goToPageId: (pageId: string) => void;
-  persona: ReaderPersona;
-  setPersona: (next: ReaderPersona) => void;
-}) {
-  // Hierarchical breadcrumb + sibling prev/next, derived from the page list.
-  const nav = useMemo(() => computeDocNav(page, pages), [page, pages]);
-  const wikiLinks = useMemo(() => getWikiLinks(page.metadata), [page.metadata]);
-
-  // Persona-filtered markdown — hides reference-heavy sections for the lighter
-  // reading levels. The TOC + download still operate on the full content.
-  const visibleContent = useMemo(
-    () => filterMarkdownByPersona(page.content, persona),
-    [page.content, persona],
-  );
-
-  // Nearest ancestor that maps to a module page — the "zoom out" chip target.
-  const moduleSeg = useMemo(
-    () =>
-      [...nav.breadcrumbs]
-        .slice(0, -1)
-        .reverse()
-        .find((s) => s.pageId && s.pageId !== page.id),
-    [nav.breadcrumbs, page.id],
-  );
-
-  const buildWikiHref = useCallback(
+  sidebarOpen,
+}: DocsViewerProps) {
+  const buildPageHref = useCallback(
     (pageId: string) =>
       `/repos/${repoId}/docs?page=${encodeURIComponent(pageId)}`,
     [repoId],
   );
 
-  // Forward "Related" links: distinct wiki-link targets resolved to titles
-  // from the loaded page list. Pure metadata — no extra request.
-  const relatedLinks = useMemo(() => {
-    const byId = new Map(pages.map((p) => [p.id, p]));
-    const seen = new Set<string>();
-    const out: { id: string; title: string }[] = [];
-    for (const link of wikiLinks) {
-      const target = link.target_page_id;
-      if (target === page.id || seen.has(target)) continue;
-      const hit = byId.get(target);
-      if (!hit) continue;
-      seen.add(target);
-      out.push({ id: hit.id, title: hit.title });
-      if (out.length >= 8) break;
-    }
-    return out;
-  }, [wikiLinks, pages, page.id]);
-
-  // KG layer this file belongs to (P1.4 "layer Y" chip). Links to the layer
-  // page when one was generated, otherwise renders as a static chip.
-  const layerName =
-    typeof page.metadata?.layer_name === "string" ? page.metadata.layer_name : "";
-  const layerPage = useMemo(
-    () =>
-      layerName
-        ? pages.find(
-            (p) =>
-              p.page_type === "layer_page" &&
-              p.target_path === `layer:${layerName}`,
-          )
-        : undefined,
-    [pages, layerName],
+  // Fall back to the wiki deep-link route only when the target isn't in the
+  // loaded list (which itself opens the unified reader via redirect).
+  const onNavigatePageId = useCallback(
+    (pageId: string) => {
+      window.location.href = `/repos/${repoId}/wiki/${encodeURIComponent(pageId)}`;
+    },
+    [repoId],
   );
 
-  // Provenance: the inputs this page was synthesised from (metadata.sources).
-  // Each is linked to its own page when one exists.
-  const sources = useMemo(() => {
-    const raw = page.metadata?.sources;
-    if (!Array.isArray(raw)) return [];
-    const byPath = new Map(pages.map((p) => [p.target_path, p]));
-    return (raw as Array<{ path?: string; kind?: string }>)
-      .map((s) => {
-        const path = typeof s?.path === "string" ? s.path : "";
-        return { path, kind: s?.kind ?? "", pageId: byPath.get(path)?.id };
-      })
-      .filter((s) => s.path)
-      .slice(0, 8);
-  }, [page.metadata, pages]);
-
-  // Renders a resolved wiki link as an <a> with a real href (middle-click /
-  // open-in-new-tab still work) but intercepts plain clicks for in-app nav.
-  const WikiInlineLink = useMemo(() => {
-    function Comp({
-      href,
-      className,
-      title,
-      children,
-    }: {
-      href: string;
-      className?: string;
-      title?: string;
-      children: React.ReactNode;
-    }) {
-      return (
-        <a
-          href={href}
-          className={className}
-          title={title}
-          onClick={(e) => {
-            if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
-            try {
-              const u = new URL(href, window.location.origin);
-              const pid = u.searchParams.get("page");
-              if (pid) {
-                e.preventDefault();
-                goToPageId(pid);
-              }
-            } catch {
-              /* fall through to default navigation */
-            }
-          }}
-        >
-          {children}
-        </a>
-      );
-    }
-    return Comp;
-  }, [goToPageId]);
+  const hasTargetPath = !!page?.target_path;
+  const targetPath = page?.target_path ?? "";
+  // Security findings only make sense for real source files.
+  const isFilePath =
+    hasTargetPath &&
+    !targetPath.includes("::") &&
+    !targetPath.startsWith("onboarding/") &&
+    !targetPath.startsWith("layer:");
 
   return (
-    <div className="flex h-full">
-      {/* Main content */}
-      <div className="flex flex-col flex-1 min-w-0">
-        {/* Sticky header */}
-        <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-[var(--color-border-default)] bg-[var(--color-bg-surface)]/95 backdrop-blur px-4 sm:px-6 py-2.5 flex-wrap sm:flex-nowrap shrink-0">
-          {/* Hierarchical breadcrumb: module / file, ancestors clickable */}
-          <div className="min-w-0 flex-1 overflow-hidden">
-            <Breadcrumb
-              segments={nav.breadcrumbs.map((seg) => ({
-                label: seg.label,
-                ...(seg.pageId && seg.pageId !== page.id
-                  ? { href: buildWikiHref(seg.pageId) }
-                  : {}),
-              }))}
-              LinkComponent={WikiInlineLink}
-            />
-          </div>
-
-          {/* Confidence */}
-          <ConfidenceBadge
-            score={page.confidence}
-            status={page.freshness_status}
-            showScore
+    <DocsReader
+      page={page as unknown as DocPage | null}
+      pages={pages as unknown as DocPage[]}
+      repoId={repoId}
+      isLoading={isLoading}
+      onSelectPage={onSelectPage as ((p: DocPage) => void) | undefined}
+      onNavigatePageId={onNavigatePageId}
+      persona={persona}
+      sidebarOpen={sidebarOpen}
+      buildPageHref={buildPageHref}
+      LinkComponent={Link}
+      versionHistorySlot={
+        page ? (
+          <VersionHistoryWrapper
+            pageId={page.id}
+            currentVersion={page.version}
+            currentContent={page.content}
           />
-
-          {/* Provider */}
-          <Badge variant="outline" className="font-mono text-[10px] hidden sm:flex shrink-0">
-            <Cpu className="h-2.5 w-2.5 mr-1" />
-            <span className="truncate max-w-[100px]">{page.model_name}</span>
-          </Badge>
-
-          {/* Download as markdown */}
-          <button
-            onClick={() => {
-              const filename = (page.target_path || page.title).replace(/\//g, "_") + ".md";
-              const header = `# ${page.title}\n\n> Path: ${page.target_path}\n\n`;
-              downloadTextFile(header + page.content, filename);
-            }}
-            className="text-[var(--color-text-tertiary)] hover:text-[var(--color-accent-primary)] transition-colors shrink-0"
-            title="Download as Markdown"
-          >
-            <Download className="h-3.5 w-3.5" />
-          </button>
-
-          {/* Open full page link */}
-          <Link
-            href={`/repos/${repoId}/wiki/${encodeURIComponent(page.id)}`}
-            className="text-[var(--color-text-tertiary)] hover:text-[var(--color-accent-primary)] transition-colors shrink-0"
-            title="Open full page"
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-          </Link>
-
-          {/* Reader persona — Overview / Contributor / Deep section filter */}
-          <div
-            className="hidden md:inline-flex items-center rounded-md border border-[var(--color-border-default)] p-0.5 shrink-0"
-            role="group"
-            aria-label="Reader level"
-          >
-            {READER_PERSONAS.map((p) => (
-              <button
-                key={p.value}
-                onClick={() => setPersona(p.value)}
-                title={p.hint}
-                className={cn(
-                  "rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors",
-                  persona === p.value
-                    ? "bg-[var(--color-accent-primary)] text-white"
-                    : "text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]",
-                )}
-              >
-                {p.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Sidebar toggle */}
-          {(
-            <button
-              onClick={() => setSidebarOpen((o) => !o)}
-              className={cn(
-                "transition-colors shrink-0",
-                sidebarOpen
-                  ? "text-[var(--color-accent)] hover:text-[var(--color-accent)]"
-                  : "text-[var(--color-text-tertiary)] hover:text-[var(--color-accent-primary)]",
-              )}
-              title={sidebarOpen ? "Hide insights" : "Show insights"}
-            >
-              {sidebarOpen ? (
-                <PanelRightClose className="h-3.5 w-3.5" />
-              ) : (
-                <PanelRight className="h-3.5 w-3.5" />
-              )}
-            </button>
-          )}
-        </div>
-
-        {/* Content */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto">
-          <div className="px-4 sm:px-6 py-6 max-w-[768px] mx-auto">
-            {/* Title */}
-            <h1 className="text-xl font-semibold text-[var(--color-text-primary)] mb-1 break-words">
-              {page.title}
-            </h1>
-
-            {/* Context chips: page type + "in module" (zoom-out) */}
-            <div className="flex flex-wrap items-center gap-1.5 mb-2">
-              <span className="rounded-full bg-[var(--color-bg-elevated)] px-2 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)]">
-                {getPageTypeLabel(page.page_type)}
-              </span>
-              {moduleSeg && (
-                <button
-                  onClick={() => goToPageId(moduleSeg.pageId!)}
-                  className="rounded-full border border-[var(--color-border-default)] px-2 py-0.5 text-[10px] text-[var(--color-text-secondary)] transition-colors hover:border-[var(--color-border-accent)] hover:text-[var(--color-accent-primary)]"
-                >
-                  in {moduleSeg.label}
-                </button>
-              )}
-              {layerName &&
-                (layerPage ? (
-                  <button
-                    onClick={() => goToPageId(layerPage.id)}
-                    className="inline-flex items-center gap-1 rounded-full border border-[var(--color-border-default)] px-2 py-0.5 text-[10px] text-[var(--color-text-secondary)] transition-colors hover:border-[var(--color-border-accent)] hover:text-[var(--color-accent-primary)]"
-                  >
-                    <Layers className="h-2.5 w-2.5" />
-                    {layerName}
-                  </button>
-                ) : (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-[var(--color-bg-elevated)] px-2 py-0.5 text-[10px] text-[var(--color-text-tertiary)]">
-                    <Layers className="h-2.5 w-2.5" />
-                    {layerName}
-                  </span>
-                ))}
-            </div>
-
-            {/* Low-confidence flag */}
-            {page.confidence > 0 && page.confidence < 0.5 && (
-              <div className="mb-4 flex items-start gap-1.5 rounded-md border border-amber-400/30 bg-amber-50/5 px-3 py-2">
-                <span className="text-xs text-amber-300/90">
-                  This page was generated with low confidence — verify against the source before relying on it.
-                </span>
-              </div>
-            )}
-
-            {/* Meta row */}
-            <div className="flex items-center gap-3 text-[10px] text-[var(--color-text-tertiary)] mb-6">
-              <span className="flex items-center gap-1">
-                <Clock className="h-3 w-3" />
-                {formatRelativeTime(page.updated_at)}
-              </span>
-              <span>v{page.version}</span>
-              <span className="font-mono">
-                {formatTokens(page.input_tokens)} in · {formatTokens(page.output_tokens)} out
-              </span>
-            </div>
-
-            {/* Human notes */}
-            {page.human_notes && (
-              <div className="mb-4 rounded-lg border border-[var(--color-border-accent)] bg-[var(--color-accent-blue)]/5 px-4 py-3">
-                <div className="flex items-center gap-1.5 mb-1.5">
-                  <StickyNote className="h-3.5 w-3.5 text-[var(--color-accent-blue)]" />
-                  <span className="text-xs font-medium text-[var(--color-accent-blue)] uppercase tracking-wider">
-                    Human Notes
-                  </span>
-                </div>
-                <p className="text-sm text-[var(--color-text-secondary)] whitespace-pre-wrap leading-relaxed">
-                  {page.human_notes}
+        ) : undefined
+      }
+      intelligenceSlot={
+        hasTargetPath ? (
+          <>
+            <AtAGlance repoId={repoId} targetPath={targetPath} />
+            <DocsSidebar repoId={repoId} targetPath={targetPath} />
+            {isFilePath && (
+              <div>
+                <p className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
+                  Security signals
                 </p>
+                <SecurityPanelWrapper repoId={repoId} filePath={targetPath} />
               </div>
             )}
-
-            {/* Markdown content */}
-            <article className="prose prose-invert max-w-none leading-relaxed overflow-hidden">
-              <WikiMarkdown
-                content={visibleContent}
-                wikiLinks={wikiLinks}
-                buildHref={(pid) => buildWikiHref(pid)}
-                LinkComponent={WikiInlineLink}
-              />
-            </article>
-
-            {/* Sibling prev / next */}
-            {(nav.prev || nav.next) && (
-              <nav className="mt-8 flex items-stretch gap-3 border-t border-[var(--color-border-default)] pt-4">
-                {nav.prev ? (
-                  <button
-                    onClick={() => goToPageId(nav.prev!.pageId)}
-                    className="group flex flex-1 items-center gap-2 rounded-lg border border-[var(--color-border-default)] px-3 py-2 text-left transition-colors hover:border-[var(--color-border-accent)] hover:bg-[var(--color-bg-elevated)]"
-                  >
-                    <ArrowLeft className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-tertiary)] group-hover:text-[var(--color-accent-primary)]" />
-                    <span className="min-w-0">
-                      <span className="block text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)]">
-                        Previous
-                      </span>
-                      <span className="block truncate text-xs text-[var(--color-text-secondary)]">
-                        {nav.prev.title}
-                      </span>
-                    </span>
-                  </button>
-                ) : (
-                  <span className="flex-1" />
-                )}
-                {nav.next && (
-                  <button
-                    onClick={() => goToPageId(nav.next!.pageId)}
-                    className="group flex flex-1 items-center justify-end gap-2 rounded-lg border border-[var(--color-border-default)] px-3 py-2 text-right transition-colors hover:border-[var(--color-border-accent)] hover:bg-[var(--color-bg-elevated)]"
-                  >
-                    <span className="min-w-0">
-                      <span className="block text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)]">
-                        Next
-                      </span>
-                      <span className="block truncate text-xs text-[var(--color-text-secondary)]">
-                        {nav.next.title}
-                      </span>
-                    </span>
-                    <ArrowRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-tertiary)] group-hover:text-[var(--color-accent-primary)]" />
-                  </button>
-                )}
-              </nav>
-            )}
-
-            {/* Version history */}
-            <div className="mt-8">
-              <VersionHistoryWrapper
-                pageId={page.id}
-                currentVersion={page.version}
-                currentContent={page.content}
-              />
-            </div>
-
-            {/* Metadata warnings */}
-            {Array.isArray(page.metadata?.hallucination_warnings) && (page.metadata.hallucination_warnings as string[]).length > 0 && (
-              <div className="mt-4 rounded-lg border border-amber-400/30 bg-amber-50/5 px-4 py-3">
-                <p className="text-xs font-medium text-amber-400 mb-1.5">
-                  Possible inaccuracies detected
-                </p>
-                <ul className="space-y-0.5">
-                  {(page.metadata.hallucination_warnings as string[]).map((w, i) => (
-                    <li key={i} className="text-xs text-amber-300/80 font-mono">
-                      {String(w)}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Right sidebar — on-page contents + graph intelligence */}
-      {sidebarOpen && (
-        <div className="hidden lg:flex flex-col border-l border-[var(--color-border-default)] bg-[var(--color-bg-surface)] shrink-0 w-[240px] overflow-auto">
-          {hasTargetPath && (
-            <div className="p-3 pb-0">
-              <AtAGlance repoId={repoId} targetPath={page.target_path} />
-            </div>
-          )}
-          <div className="p-3">
-            <TableOfContents content={page.content} />
-          </div>
-          {(relatedLinks.length > 0 || sources.length > 0 || hasTargetPath) && (
-            <div className="space-y-4 p-3 pt-0">
-              {sources.length > 0 && (
-                <div>
-                  <div className="flex items-center gap-1.5 mb-2">
-                    <FileInput className="h-3 w-3 text-[var(--color-text-tertiary)]" />
-                    <span className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
-                      Built from
-                    </span>
-                  </div>
-                  <ul className="space-y-1">
-                    {sources.map((s) => (
-                      <li key={s.path} className="text-[11px]">
-                        {s.pageId ? (
-                          <button
-                            onClick={() => goToPageId(s.pageId!)}
-                            className="truncate text-left font-mono text-[var(--color-text-secondary)] hover:text-[var(--color-accent-primary)] transition-colors w-full"
-                            title={`${s.path} (${s.kind})`}
-                          >
-                            {s.path}
-                          </button>
-                        ) : (
-                          <span
-                            className="block truncate font-mono text-[var(--color-text-tertiary)]"
-                            title={`${s.path} (${s.kind})`}
-                          >
-                            {s.path}
-                          </span>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {relatedLinks.length > 0 && (
-                <div>
-                  <p className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
-                    Related ({relatedLinks.length})
-                  </p>
-                  <ul className="space-y-1.5">
-                    {relatedLinks.map((r) => (
-                      <li key={r.id} className="text-xs">
-                        <button
-                          onClick={() => goToPageId(r.id)}
-                          className="truncate text-left text-[var(--color-text-secondary)] hover:text-[var(--color-accent-primary)] transition-colors w-full"
-                          title={r.title}
-                        >
-                          {r.title}
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              <BacklinksPanel
-                backlinks={getBacklinks(page.metadata)}
-                repoId={repoId}
-                buildHref={(rid, pid) =>
-                  `/repos/${rid}/docs?page=${encodeURIComponent(pid)}`
-                }
-              />
-            </div>
-          )}
-          {hasTargetPath && <DocsSidebar repoId={repoId} targetPath={page.target_path} />}
-        </div>
-      )}
-    </div>
+          </>
+        ) : undefined
+      }
+    />
   );
 }

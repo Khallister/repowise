@@ -7,6 +7,7 @@ import { Badge } from "../ui/badge";
 import { ScrollArea } from "../ui/scroll-area";
 import { Skeleton } from "../ui/skeleton";
 import { truncatePath } from "../lib/format";
+import { fileEntityPath } from "../shared/entity/routes";
 import { cn } from "../lib/cn";
 import type {
   CommunityDetail,
@@ -14,18 +15,29 @@ import type {
 } from "@repowise-dev/types/graph";
 
 const COMMUNITY_COLORS = [
-  "bg-indigo-400", "bg-pink-400", "bg-emerald-400", "bg-amber-400",
-  "bg-blue-400", "bg-purple-400", "bg-rose-400", "bg-teal-400",
-  "bg-orange-400", "bg-cyan-400",
+  "bg-[var(--color-community-1)]",
+  "bg-[var(--color-community-2)]",
+  "bg-[var(--color-community-3)]",
+  "bg-[var(--color-community-4)]",
+  "bg-[var(--color-community-5)]",
+  "bg-[var(--color-community-6)]",
+  "bg-[var(--color-community-7)]",
+  "bg-[var(--color-community-8)]",
+  "bg-[var(--color-community-9)]",
+  "bg-[var(--color-community-10)]",
+  "bg-[var(--color-community-11)]",
+  "bg-[var(--color-community-12)]",
 ];
 
 interface DetailPanelProps {
   detail: CommunityDetail | null;
   isLoading: boolean;
   onClose: () => void;
+  /** Build a member href — defaults to the canonical file page. */
+  memberHref?: ((path: string) => string) | undefined;
 }
 
-function DetailPanel({ detail, isLoading, onClose }: DetailPanelProps) {
+function DetailPanel({ detail, isLoading, onClose, memberHref }: DetailPanelProps) {
   if (isLoading) {
     return (
       <div className="p-4 space-y-2">
@@ -60,19 +72,29 @@ function DetailPanel({ detail, isLoading, onClose }: DetailPanelProps) {
             <div className="space-y-1">
               {detail.members.slice(0, 20).map((m) => (
                 <div key={m.path} className="flex items-center justify-between gap-2 py-0.5">
-                  <span
-                    className="text-[11px] font-mono text-[var(--color-text-secondary)] truncate"
-                    title={m.path}
-                  >
-                    {truncatePath(m.path)}
-                  </span>
+                  {memberHref ? (
+                    <a
+                      href={memberHref(m.path)}
+                      className="text-xs font-mono text-[var(--color-text-secondary)] truncate hover:text-[var(--color-accent-primary)] hover:underline"
+                      title={m.path}
+                    >
+                      {truncatePath(m.path)}
+                    </a>
+                  ) : (
+                    <span
+                      className="text-xs font-mono text-[var(--color-text-secondary)] truncate"
+                      title={m.path}
+                    >
+                      {truncatePath(m.path)}
+                    </span>
+                  )}
                   <div className="flex items-center gap-1 shrink-0">
                     {m.is_entry_point && (
                       <Badge variant="accent" className="text-[8px] h-3.5">
                         EP
                       </Badge>
                     )}
-                    <span className="text-[9px] font-mono text-[var(--color-text-tertiary)] tabular-nums">
+                    <span className="text-[10px] font-mono text-[var(--color-text-tertiary)] tabular-nums">
                       {m.pagerank.toFixed(4)}
                     </span>
                   </div>
@@ -97,11 +119,11 @@ function DetailPanel({ detail, isLoading, onClose }: DetailPanelProps) {
                 <div key={n.community_id} className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <ArrowRight className="h-2.5 w-2.5 shrink-0 text-[var(--color-text-tertiary)]" />
-                    <span className="text-[11px] text-[var(--color-text-secondary)] truncate">
+                    <span className="text-xs text-[var(--color-text-secondary)] truncate">
                       {n.label}
                     </span>
                   </div>
-                  <Badge variant="outline" className="text-[9px] h-4 shrink-0">
+                  <Badge variant="outline" className="text-[10px] h-4 shrink-0">
                     {n.cross_edge_count} edges
                   </Badge>
                 </div>
@@ -148,7 +170,7 @@ export function CommunitySummaryGrid({
             Architecture Communities ({communities.length})
           </CardTitle>
           {prefix && (
-            <a href={`${prefix}/graph?colorMode=community`} className="text-[10px] text-[var(--color-accent-primary)] hover:underline">
+            <a href={`${prefix}/architecture?view=graph&colorMode=community`} className="text-[10px] text-[var(--color-accent-primary)] hover:underline">
               View in Graph →
             </a>
           )}
@@ -201,6 +223,7 @@ export function CommunitySummaryGrid({
                     detail={details[c.community_id] ?? null}
                     isLoading={loadingDetailId === c.community_id && !details[c.community_id]}
                     onClose={() => setExpandedId(null)}
+                    memberHref={prefix ? (path) => fileEntityPath(prefix, path) : undefined}
                   />
                 )}
               </div>

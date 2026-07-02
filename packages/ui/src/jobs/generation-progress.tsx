@@ -33,6 +33,12 @@ export interface GenerationProgressProps {
   onCancel: () => void;
 }
 
+const PHASE_LABELS: Record<number, string> = {
+  0: "Indexing",
+  1: "Analysing",
+  2: "Generating docs",
+};
+
 export function GenerationProgress({
   job,
   log,
@@ -54,6 +60,10 @@ export function GenerationProgress({
   const isInflight = isPending || isRunning;
   const isDone = job?.status === "completed";
   const isFailed = job?.status === "failed";
+  const phaseLabel =
+    job?.current_level == null
+      ? "Processing"
+      : PHASE_LABELS[job.current_level] ?? `Processing phase ${job.current_level}`;
 
   return (
     <div className="space-y-3">
@@ -64,7 +74,7 @@ export function GenerationProgress({
 
         <span className="text-sm font-medium text-[var(--color-text-primary)]">
           {isPending && "Queued — waiting for worker…"}
-          {isRunning && `Generating level ${job?.current_level ?? "?"}…`}
+          {isRunning && `${phaseLabel}…`}
           {isDone && "Generation complete"}
           {isFailed && "Generation failed"}
         </span>
@@ -89,11 +99,11 @@ export function GenerationProgress({
       </div>
 
       {stuckPending && (
-        <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+        <div className="flex items-start gap-2 rounded-md border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 px-3 py-2 text-xs text-[var(--color-text-primary)]">
+          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-[var(--color-warning)]" />
           <div className="flex-1">
             <p className="font-medium">Job hasn&apos;t started after {Math.round(elapsed / 1000)}s.</p>
-            <p className="mt-0.5 opacity-80">
+            <p className="mt-0.5 text-[var(--color-text-secondary)]">
               The server may have crashed before the worker could pick it up. Cancel
               this job and try again — if it keeps happening, check the server logs.
             </p>

@@ -63,6 +63,21 @@ _MIN_MESSAGE_LEN = 12
 # Default per-file commit history depth.
 _DEFAULT_COMMIT_LIMIT: int = 500
 
+# Depth of the second, deeper repo-wide log walk that serves files absent
+# from the recent-window commit index. On repos whose history is much
+# deeper than _DEFAULT_COMMIT_LIMIT, most tracked files miss the window
+# and previously each took a per-file ``git log`` subprocess (3,295
+# spawns on a 9k-commit WinUI monorepo). One --skip walk this deep
+# replaces them. Files older than window+deep still take the per-file
+# path, so behaviour degrades gracefully on very deep histories.
+_DEEP_WALK_COMMIT_LIMIT: int = 20_000
+
+# Minimum number of window-index misses before the deep walk pays for
+# itself. Below this, the handful of per-file ``git log`` fallbacks is
+# cheaper than walking the full history again (small repos typically
+# have zero misses and skip the deep walk entirely).
+_DEEP_WALK_MIN_FALLBACK: int = 100
+
 # Per-file persisted contributor / commit fan-out. Previously hard-coded
 # to 5 / 10 inline, which silently hid co-owners and meaningful history on
 # multi-team modules. 50 is generous enough that any realistic UI surface
@@ -123,6 +138,13 @@ _DEFAULT_CO_CHANGE_MIN_COUNT: int = 2
 # correctness change: typical commits sit well under 20 files.
 _MAX_FILES_PER_COMMIT_FOR_COCHANGE: int = 200
 
+# Change-entropy uses a tighter file-set cap than co-change. Hassan (2009)
+# excludes very wide commits from the History Complexity Metric because a
+# sweeping edit spreads its "change probability" so thinly that it adds noise
+# rather than signal. 30 follows the commonly cited Hassan filter; commits
+# above it are dropped from the entropy accumulation entirely.
+_MAX_FILES_PER_COMMIT_FOR_ENTROPY: int = 30
+
 # Commit message classification regexes (Phase 2.2).
 _COMMIT_CATEGORIES: dict[str, re.Pattern[str]] = {
     "feature": re.compile(
@@ -143,11 +165,186 @@ _COMMIT_CATEGORIES: dict[str, re.Pattern[str]] = {
     ),
 }
 
+# Bug-fix commit classifier — mirrors the defect benchmark's
+# ``lib/defect_counter.find_fix_commits`` (keyword strategy) so the product's
+# ``prior_defect`` signal counts exactly the commits the benchmark labels as
+# fixes (product == benchmark). A commit subject is a fix iff it matches an
+# INCLUDE pattern and NO EXCLUDE pattern; merge commits are excluded upstream
+# (the per-file walk skips ``is_merge``), mirroring the bench's ``--no-merges``.
+#
+# Deliberately NOT reusing ``_COMMIT_CATEGORIES["fix"]`` — that is a broader
+# classifier tuned for commit-category *ratios* (it catches "refactor to fix
+# crash", "error handling"), whereas the defect label wants high-precision
+# fix-only matches and must stay byte-identical to the benchmark's regex set.
+_FIX_COMMIT_INCLUDE: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bfix\b", re.IGNORECASE),
+    re.compile(r"\bbug\b", re.IGNORECASE),
+    re.compile(r"\bpatch\b", re.IGNORECASE),
+    re.compile(r"\bresolves?\b", re.IGNORECASE),
+    re.compile(r"closes?\s+#\d+", re.IGNORECASE),
+    re.compile(r"fixes?\s+#\d+", re.IGNORECASE),
+)
+_FIX_COMMIT_EXCLUDE: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^Merge ", re.IGNORECASE),
+    re.compile(r"\btypo\b", re.IGNORECASE),
+    re.compile(r"\bbump\b", re.IGNORECASE),
+    re.compile(r"\bdeps?\b", re.IGNORECASE),
+    re.compile(r"\bchore\b", re.IGNORECASE),
+    re.compile(r"\blint\b", re.IGNORECASE),
+    re.compile(r"\bformat\b", re.IGNORECASE),
+    re.compile(r"\bstyle\b", re.IGNORECASE),
+    re.compile(r"\bdocs?\b", re.IGNORECASE),
+)
+
+# Trailing window over which ``prior_defect`` counts bug-fix commits. 180 days
+# (≈6 months) intentionally matches the benchmark's ``defect_window_months: 6``
+# prior-defects baseline — a wider window than the 90d activity signals because
+# defect history is a slower-moving cluster than recent churn.
+PRIOR_DEFECT_WINDOW_DAYS: int = 180
+
+
+def is_fix_commit(subject: str) -> bool:
+    """Whether a commit *subject* is a bug-fix, per the benchmark's keyword rule."""
+    if not subject:
+        return False
+    if any(p.search(subject) for p in _FIX_COMMIT_EXCLUDE):
+        return False
+    return any(p.search(subject) for p in _FIX_COMMIT_INCLUDE)
+
+
+# ---------------------------------------------------------------------------
+# Single-label commit-category classification (powers the "Code Evolution"
+# timeline on the commits page). Unlike ``_COMMIT_CATEGORIES`` — which is
+# *multi-label* and tuned for per-file category *ratios* — this assigns each
+# commit exactly ONE category so a stacked timeline sums cleanly to 100%.
+#
+# Resolution order: an explicit conventional-commit prefix (``feat:``,
+# ``fix(scope):`` …) wins outright; otherwise the keyword patterns below are
+# tried in priority order and the first match decides. Anything unmatched
+# falls through to "other". The labels are the seven that read as a story arc
+# (feature-born → fix/refactor/docs as a repo matures) plus deps/chore/test.
+# ---------------------------------------------------------------------------
+
+# Ordered: more specific / higher-signal intents first so a "fix typo in docs"
+# resolves the way a human would skim it.
+EVOLUTION_CATEGORIES: tuple[str, ...] = (
+    "feature",
+    "fix",
+    "refactor",
+    "docs",
+    "test",
+    "deps",
+    "chore",
+    "other",
+)
+
+# Conventional-commit type -> our category. The prefix is authoritative when
+# present (``type(scope)!: subject``), so this short-circuits the keyword pass.
+_CONVENTIONAL_PREFIX = re.compile(
+    r"^\s*(?P<type>[a-z]+)(?:\([^)]*\))?!?:",
+    re.IGNORECASE,
+)
+_CONVENTIONAL_MAP: dict[str, str] = {
+    "feat": "feature",
+    "feature": "feature",
+    "fix": "fix",
+    "bugfix": "fix",
+    "hotfix": "fix",
+    "perf": "refactor",
+    "refactor": "refactor",
+    "style": "refactor",
+    "docs": "docs",
+    "doc": "docs",
+    "test": "test",
+    "tests": "test",
+    "build": "deps",
+    "deps": "deps",
+    "ci": "chore",
+    "chore": "chore",
+    "revert": "fix",
+}
+
+# Keyword fallback, tried in this exact order; first hit wins.
+_EVOLUTION_KEYWORDS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("docs", re.compile(r"\b(docs?|documentation|readme|changelog|comment)\b", re.IGNORECASE)),
+    ("test", re.compile(r"\b(test|tests|testing|spec|coverage|fixture)\b", re.IGNORECASE)),
+    (
+        "deps",
+        re.compile(
+            r"\b(bump|upgrade|downgrade|depend|dependency|dependencies|lockfile|"
+            r"requirements|vendor|pin)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    ("fix", re.compile(r"\b(fix|fixes|fixed|bug|patch|hotfix|regression|crash|revert)\b", re.IGNORECASE)),
+    (
+        "refactor",
+        re.compile(
+            r"\b(refactor|restructure|cleanup|clean.up|rename|reorganize|extract|"
+            r"simplify|move|tidy|dedupe|perf|optimi[sz]e)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "feature",
+        re.compile(
+            r"\b(add|adds|added|implement|introduce|create|new|feat|feature|support|enable)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "chore",
+        re.compile(r"\b(chore|lint|format|style|ci|build|release|merge|config|tooling)\b", re.IGNORECASE),
+    ),
+)
+
+
+def classify_commit_category(subject: str) -> str:
+    """Assign a commit *subject* exactly one :data:`EVOLUTION_CATEGORIES` label.
+
+    A leading conventional-commit prefix is authoritative; otherwise the first
+    matching keyword pattern (in priority order) wins. Unmatched -> ``"other"``.
+    """
+    if not subject:
+        return "other"
+    m = _CONVENTIONAL_PREFIX.match(subject)
+    if m:
+        mapped = _CONVENTIONAL_MAP.get(m.group("type").lower())
+        if mapped:
+            return mapped
+    for label, pattern in _EVOLUTION_KEYWORDS:
+        if pattern.search(subject):
+            return label
+    return "other"
+
+
 # Co-change temporal decay: half-life ~125 days (lambda for exp(-t/tau)).
 _CO_CHANGE_DECAY_TAU: float = 180.0
 
 # Hotspot temporal decay: half-life for exponentially weighted churn score.
 HOTSPOT_HALFLIFE_DAYS: float = 180.0
+
+# Absolute activity floors for hotspot classification (issue #361). The
+# churn percentile is repo-relative, so on a quiet repo "top quartile"
+# degenerates to "any file touched in the last 90 days" — a single drive-by
+# maintenance commit was enough to flag a hotspot. A file must clear BOTH
+# the relative gate (top-quartile decayed churn) and these absolute floors:
+#
+# - at least HOTSPOT_MIN_COMMITS_90D commits in the window (repeated
+#   recent activity, not one drive-by), AND
+# - a decayed-churn score of at least HOTSPOT_MIN_TEMPORAL_SCORE (the
+#   commits moved real lines — e.g. one ~50-line change today, or ~3
+#   focused 20-line changes this month — not a string of one-liners),
+#   OR HOTSPOT_HIGH_COMMITS_90D+ commits in the window (sustained high
+#   commit volume is hotspot-grade activity even when numstat line counts
+#   are unavailable, e.g. binary files). The 8-commit escape matches the
+#   threshold the health biomarkers already treat as hotspot-equivalent.
+#
+# Mirrored in the SQL PERCENT_RANK path (crud/git.py::recompute_git_percentiles)
+# — keep the two in sync.
+HOTSPOT_MIN_COMMITS_90D: int = 3
+HOTSPOT_MIN_TEMPORAL_SCORE: float = 0.5
+HOTSPOT_HIGH_COMMITS_90D: int = 8
 
 # Regex to extract PR/MR numbers from commit messages.
 # Matches: "#123", "Merge pull request #456", "(#789)", "!42" (GitLab MR)

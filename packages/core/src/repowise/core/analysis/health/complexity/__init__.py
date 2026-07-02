@@ -2,6 +2,28 @@
 
 from __future__ import annotations
 
-from .walker import ConditionComplexity, FunctionComplexity, walk_file_complexity
+from .walker import (
+    ClassComplexity,
+    CohesionGroup,
+    ConditionComplexity,
+    ErrorHandlingHit,
+    FileComplexity,
+    FunctionComplexity,
+    PerfFnFacts,
+    PerfHit,
+    walk_file,
+    walk_file_complexity,
+)
 
-__all__ = ["ConditionComplexity", "FunctionComplexity", "walk_file_complexity"]
+__all__ = [
+    "ClassComplexity",
+    "CohesionGroup",
+    "ConditionComplexity",
+    "ErrorHandlingHit",
+    "FileComplexity",
+    "FunctionComplexity",
+    "PerfFnFacts",
+    "PerfHit",
+    "walk_file",
+    "walk_file_complexity",
+]

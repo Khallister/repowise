@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.responses import StreamingResponse
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import func, select
+from starlette.responses import StreamingResponse
+
 from repowise.core.persistence import crud
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import GenerationJob, LlmCost
-from repowise.server.deps import get_db_session, verify_api_key
+from repowise.server.deps import resolve_session_factory, verify_api_key
 from repowise.server.schemas import JobResponse
 
 router = APIRouter(
@@ -51,25 +51,60 @@ async def _find_job_factory(app_state, job_id: str):
     return None, None
 
 
+def _created_sort_key(job: GenerationJob) -> datetime:
+    """Timezone-safe sort key for ``created_at`` across merged repo databases."""
+    dt = job.created_at
+    if dt is None:
+        return datetime.min.replace(tzinfo=UTC)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 @router.get("", response_model=list[JobResponse])
 async def list_jobs(
+    request: Request,
     repo_id: str | None = Query(None),
     status: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    session: AsyncSession = Depends(get_db_session),  # noqa: B008
 ) -> list[JobResponse]:
     """List generation jobs, optionally filtered by repository or status."""
-    q = select(GenerationJob)
-    if repo_id:
-        q = q.where(GenerationJob.repository_id == repo_id)
-    if status:
-        q = q.where(GenerationJob.status == status)
-    q = q.order_by(GenerationJob.created_at.desc()).limit(limit).offset(offset)
 
-    result = await session.execute(q)
-    jobs = result.scalars().all()
-    return [JobResponse.from_orm(j) for j in jobs]
+    async def _query_jobs(factory) -> list[GenerationJob]:
+        q = select(GenerationJob)
+        if repo_id:
+            q = q.where(GenerationJob.repository_id == repo_id)
+        if status:
+            q = q.where(GenerationJob.status == status)
+        q = q.order_by(GenerationJob.created_at.desc()).limit(limit + offset)
+        async with get_session(factory) as session:
+            result = await session.execute(q)
+            return list(result.scalars().all())
+
+    if repo_id:
+        factories = [resolve_session_factory(request.app.state, repo_id)]
+    else:
+        factories = [request.app.state.session_factory]
+        ws = getattr(request.app.state, "workspace_sessions", None)
+        if ws:
+            factories.extend(ws.values())
+
+    jobs: list[GenerationJob] = []
+    seen_factories: set[int] = set()
+    for factory in factories:
+        if id(factory) in seen_factories:
+            continue
+        seen_factories.add(id(factory))
+        try:
+            jobs.extend(await _query_jobs(factory))
+        except Exception:
+            continue
+
+    # Jobs are merged from several repo databases in workspace mode, and SQLite
+    # hands back a mix of timezone-aware and naive ``created_at`` values, which
+    # cannot be compared directly. Coerce naive timestamps to UTC for the sort
+    # (they are stored as UTC) so the merge never raises.
+    jobs.sort(key=_created_sort_key, reverse=True)
+    return [JobResponse.from_orm(j) for j in jobs[offset : offset + limit]]
 
 
 @router.get("/{job_id}", response_model=JobResponse)

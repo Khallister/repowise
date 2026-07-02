@@ -27,6 +27,13 @@ class ResolverContext:
     graph: nx.DiGraph
     repo_path: Path | None = None
 
+    # Whether repo-wide filesystem scans (fs_walk) skip nested git repos.
+    # True by default — sibling/vendored checkouts must not leak manifests.
+    # Set False when the pipeline indexes ``.git``-bearing subdirs (either
+    # ``include_submodules`` or ``include_nested_repos``) so resolver scans
+    # see the same files the traverser indexed.
+    prune_nested_git: bool = True
+
     # Language-specific state
     tsconfig_resolver: Any | None = None
     go_module_path: str | None = None
@@ -39,6 +46,22 @@ class ResolverContext:
     # ``_ruby_rails_index``, ``_swift_targets``, ``_scala_index``). This
     # mirrors the dotnet/index.py pattern and keeps language-specific bloat
     # off the dataclass.
+
+    # Cached sorted view of ``path_set``. Resolvers that scan for a *first*
+    # match MUST iterate this, never the raw set: set iteration order varies
+    # run-to-run (parallel parse insertion order + hash seeding), which made
+    # import targets — and everything downstream (PageRank, communities, the
+    # tour order) — nondeterministic across identical runs.
+    _sorted_paths_cache: tuple[str, ...] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @property
+    def sorted_paths(self) -> tuple[str, ...]:
+        """Deterministically ordered view of ``path_set`` (cached)."""
+        if self._sorted_paths_cache is None:
+            self._sorted_paths_cache = tuple(sorted(self.path_set))
+        return self._sorted_paths_cache
 
     def stem_lookup(self, stem: str) -> str | None:
         """Return the highest-priority path for *stem*, or None."""

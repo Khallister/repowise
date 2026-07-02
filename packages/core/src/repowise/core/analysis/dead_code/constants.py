@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from repowise.core.ingestion.languages.registry import REGISTRY as _LANG_REGISTRY
 
-
 # Non-code languages that should never be flagged as dead code.
 # Derived from the centralised LanguageRegistry — passthrough config/infra
 # languages plus "unknown".
@@ -483,6 +482,9 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "**/tests/**/*.rs",
     "tests/*.rs",
     "tests/**/*.rs",
+    # Unit-test sibling modules (e.g. `src/foo/tests.rs`) are loaded by
+    # `#[cfg(test)] mod tests;` and the Cargo test harness, not production imports.
+    "**/src/**/tests.rs",
     # Binary targets (separate executables in a crate)
     "**/src/bin/*.rs",
     "**/src/bin/**/*.rs",
@@ -580,11 +582,16 @@ _NEVER_FLAG_PATTERNS: tuple[str, ...] = (
     "*.test.jsx",
     "*.test.mjs",
     "*.test.cjs",
+    "*.test.mts",
+    "*.test.cts",
     "*.spec.ts",
     "*.spec.tsx",
     "*.spec.js",
     "*.spec.jsx",
     "*.spec.mjs",
+    "*.spec.cjs",
+    "*.spec.mts",
+    "*.spec.cts",
     "*/__tests__/*",
     "*/__mocks__/*",
     # Storybook stories — loaded by Storybook indexer via glob.
@@ -962,7 +969,6 @@ _NEVER_PACKAGE_DIRS: frozenset[str] = frozenset({
     ".circleci",
     ".buildkite",
     ".cargo",
-    ".husky",
     ".yarn",
     "docs",
     "doc",

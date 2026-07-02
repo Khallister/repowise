@@ -57,6 +57,7 @@ from .models import (
     TypeReference,
 )
 from .parser_helpers import (
+    TYPE_HEAD_EXTRACTORS,
     _build_qualified_name,
     _classify_param_origin,
     _collect_error_nodes,
@@ -67,8 +68,8 @@ from .parser_helpers import (
     _is_async_node,
     _qualified_cpp_parent,
     _run_query,
-    TYPE_HEAD_EXTRACTORS,
 )
+from .python_local_refs import extract_python_local_refs
 
 log = structlog.get_logger(__name__)
 
@@ -87,6 +88,12 @@ _VUE_SCRIPT_RE = re.compile(
 )
 
 QUERIES_DIR = Path(__file__).parent / "queries"
+
+# Node types whose .scm patterns are anchored at module/program level
+# (constants and module variables). They can never be function-local, so
+# the callable-ancestor filter must not apply — and for TS/JS declarators
+# it would misfire on the parent lexical_declaration kind mapping.
+_MODULE_ANCHORED_NODE_TYPES = frozenset({"assignment", "variable_declarator"})
 
 
 @lru_cache(maxsize=None)
@@ -246,10 +253,15 @@ class ASTParser:
                     language=lang,
                     path=file_info.path,
                 )
+            # Languages without a grammar may still carry regex-tier import
+            # extraction (their specs declare import_support="partial");
+            # symbols stay empty — the regex tier claims no symbol knowledge.
+            from .lightweight_imports import extract_lightweight_imports
+
             return ParsedFile(
                 file_info=file_info,
                 symbols=[],
-                imports=[],
+                imports=extract_lightweight_imports(file_info, source),
                 exports=[],
                 docstring=None,
                 parse_errors=[],
@@ -269,7 +281,13 @@ class ASTParser:
         parse_errors = _collect_error_nodes(root)
         query = self._get_query(lang, language, grammar_tag)
 
-        symbols = self._extract_symbols(tree, query, config, file_info, src)
+        # Execute the compiled query ONCE per file. The five extraction
+        # passes below all consume the same capture dicts read-only;
+        # re-running ``cursor.matches()`` per pass multiplied the most
+        # expensive part of parsing by five.
+        matches = _run_query(query, root) if query is not None else []
+
+        symbols = self._extract_symbols(matches, config, file_info, src)
         # Per-language synthetic-symbol pass — recognises source-generator
         # attributes (e.g. CommunityToolkit.Mvvm) and adds the symbols the
         # generator would emit at compile time. No-op for languages
@@ -278,12 +296,22 @@ class ASTParser:
         if synthetic:
             existing_ids = {s.id for s in symbols}
             symbols.extend(s for s in synthetic if s.id not in existing_ids)
-        imports = self._extract_imports(tree, query, config, file_info, src)
-        calls = self._extract_calls(tree, query, config, file_info, src, symbols)
-        heritage = extract_heritage(tree, query, config, file_info, src, run_query=_run_query)
+        imports = self._extract_imports(matches, config, file_info, src)
+        calls = self._extract_calls(matches, config, file_info, src, symbols)
+        heritage = extract_heritage(matches, config, file_info, src)
         exports = self._derive_exports(symbols, config, src)
         docstring = extract_module_docstring(root, src, lang)
-        type_refs = self._extract_type_refs(tree, query, src, lang)
+        type_refs = self._extract_type_refs(matches, src, lang)
+
+        # Same-file reference rescue (Python only): top-level symbols used
+        # elsewhere in their own module in a non-call / non-import position
+        # (callable passed as an arg, type annotation, decorator, default)
+        # carry no graph edge, so the dead-code unused-export pass would flag
+        # them. Stamp the referenced names so the analyzer can rescue them.
+        local_refs: frozenset[str] = frozenset()
+        if lang == "python":
+            top_level_names = {s.name for s in symbols if s.name and not s.parent_name}
+            local_refs = extract_python_local_refs(src, top_level_names)
 
         if len(symbols) > _SYMBOL_COUNT_WARN_THRESHOLD:
             log.warning(
@@ -304,6 +332,7 @@ class ASTParser:
             docstring=docstring,
             parse_errors=parse_errors,
             type_refs=type_refs,
+            local_refs=local_refs,
         )
 
     # ------------------------------------------------------------------
@@ -394,19 +423,15 @@ class ASTParser:
 
     def _extract_symbols(
         self,
-        tree: object,
-        query: object,
+        matches: list[dict],
         config: LanguageConfig,
         file_info: FileInfo,
         src: str,
     ) -> list[Symbol]:
-        if query is None:
-            return []
-
         symbols: list[Symbol] = []
         seen: set[tuple[int, str]] = set()  # (start_line, name) — dedup decorated dupes
 
-        for capture_dict in _run_query(query, tree.root_node):  # type: ignore[attr-defined]
+        for capture_dict in matches:
             def_nodes = capture_dict.get("symbol.def", [])
             name_nodes = capture_dict.get("symbol.name", [])
             params_nodes = capture_dict.get("symbol.params", [])
@@ -440,8 +465,13 @@ class ASTParser:
             # exports. Filtering by callable ancestor restricts extraction
             # to module-top-level + class-body members. Class bodies don't
             # match (``class_definition`` is not callable), so methods are
-            # preserved.
-            if _has_callable_ancestor(def_node, config.symbol_node_types):
+            # preserved. Module-anchored node types skip the check: their
+            # .scm patterns only match at module/program level, and a TS
+            # variable_declarator's parent (lexical_declaration → "function")
+            # would otherwise read as a callable ancestor.
+            if node_type not in _MODULE_ANCHORED_NODE_TYPES and _has_callable_ancestor(
+                def_node, config.symbol_node_types
+            ):
                 continue
 
             # Refine "struct" kind for Go type_spec (check if struct or interface body)
@@ -455,6 +485,15 @@ class ASTParser:
                 and def_node.type == "class_declaration"
             ):
                 kind = refine_kotlin_class_kind(def_node)
+
+            # Refine module-level assignments: SCREAMING_CASE names are
+            # constants by convention; the rest are module variables
+            # (singletons like ``app = FastAPI()``, registries, caches).
+            # ``str.isupper()`` requires at least one cased char, so names
+            # with no letters (``_``, ``__all__``) fall to "variable" rather
+            # than being mislabelled constants by ``name == name.upper()``.
+            if node_type in _MODULE_ANCHORED_NODE_TYPES:
+                kind = "constant" if name.isupper() else "variable"
 
             # Params signature text
             params_text = _node_text(params_nodes[0], src) if params_nodes else ""
@@ -586,19 +625,15 @@ class ASTParser:
 
     def _extract_imports(
         self,
-        tree: object,
-        query: object,
+        matches: list[dict],
         config: LanguageConfig,
         file_info: FileInfo,
         src: str,
     ) -> list[Import]:
-        if query is None:
-            return []
-
         imports: list[Import] = []
         seen_raws: set[str] = set()
 
-        for capture_dict in _run_query(query, tree.root_node):  # type: ignore[attr-defined]
+        for capture_dict in matches:
             stmt_nodes = capture_dict.get("import.statement", [])
             module_nodes = capture_dict.get("import.module", [])
 
@@ -613,6 +648,67 @@ class ASTParser:
 
             module_text = _node_text(module_nodes[0], src).strip().strip("\"'` ")
             if not module_text:
+                continue
+
+            # Scala: the query's ``(identifier)`` capture is only the FIRST
+            # path segment (``import com.foo.Bar`` arrived as ``com``), and
+            # one declaration can hold several clauses, brace selectors,
+            # renames, and wildcards. Reconstruct full dotted paths and emit
+            # one Import per selected name.
+            if file_info.language == "scala" and stmt_node.type == "import_declaration":
+                from .extractors.bindings.scala import expand_scala_import_clauses
+                from .models import NamedBinding
+
+                for clause_path, clause_names in expand_scala_import_clauses(stmt_node, src):
+                    local = clause_names[0]
+                    exported = None if local == "*" else clause_path.rsplit(".", 1)[-1]
+                    imports.append(
+                        Import(
+                            raw_statement=raw,
+                            module_path=clause_path,
+                            imported_names=clause_names,
+                            is_relative=False,
+                            resolved_file=None,
+                            bindings=[
+                                NamedBinding(
+                                    local_name=local,
+                                    exported_name=exported,
+                                    source_file=None,
+                                )
+                            ],
+                            is_reexport=False,
+                        )
+                    )
+                continue
+
+            # CommonJS assignment / Object.assign shapes: the query captures
+            # the outer statement once; walk it for every require() it
+            # contains (a hub like Object.assign(module.exports,
+            # require('./a'), require('./b')) is several imports) and mark
+            # module.exports/exports shapes as re-exports so barrel logic
+            # treats CJS hubs like ESM barrels.
+            if file_info.language in ("javascript", "typescript") and stmt_node.type in (
+                "assignment_expression",
+                "call_expression",
+            ):
+                from .extractors.bindings.ts_js import (
+                    cjs_statement_is_reexport,
+                    collect_cjs_requires,
+                )
+
+                cjs_reexport = cjs_statement_is_reexport(stmt_node, src)
+                for cjs_module in collect_cjs_requires(stmt_node, src):
+                    imports.append(
+                        Import(
+                            raw_statement=raw,
+                            module_path=cjs_module,
+                            imported_names=["*"] if cjs_reexport else [],
+                            is_relative=cjs_module.startswith("."),
+                            resolved_file=None,
+                            bindings=[],
+                            is_reexport=cjs_reexport,
+                        )
+                    )
                 continue
 
             # Rust #[path = "..."] attribute overrides module file location.
@@ -635,10 +731,21 @@ class ASTParser:
                                 k -= 1
                             break
 
+            # JVM wildcard imports: the grammar query captures the scoped
+            # identifier only — the trailing ``*`` is a sibling node, so
+            # ``import com.foo.*`` arrives as ``com.foo`` and the resolvers'
+            # package fan-out branch can never fire. Restore it from the
+            # raw statement text.
+            if file_info.language in ("java", "kotlin") and not module_text.endswith("*"):
+                stmt_text = raw.rstrip().rstrip(";").rstrip()
+                if stmt_text.endswith(".*"):
+                    module_text += ".*"
+
             # Language-specific import name + binding extraction
             imported_names, bindings = extract_import_bindings(stmt_node, src, file_info.language)
             is_relative = (
-                module_text.startswith(".") or module_text.startswith("./")
+                module_text.startswith(".")
+                or module_text.startswith("./")
                 or module_text.startswith(("self::", "super::", "crate::"))
             )
 
@@ -648,6 +755,10 @@ class ASTParser:
                     if child.type == "visibility_modifier":
                         is_reexport = True
                         break
+            # Swift: ``@_exported import FooKit`` re-exports the module —
+            # importers of THIS module see FooKit's symbols too.
+            elif file_info.language == "swift" and raw.startswith("@_exported"):
+                is_reexport = True
 
             imports.append(
                 Import(
@@ -672,17 +783,13 @@ class ASTParser:
 
     def _extract_calls(
         self,
-        tree: object,
-        query: object,
+        matches: list[dict],
         config: LanguageConfig,
         file_info: FileInfo,
         src: str,
         symbols: list[Symbol],
     ) -> list[CallSite]:
         """Extract function/method call sites from the AST."""
-        if query is None:
-            return []
-
         from .language_data import get_builtin_calls
 
         _call_builtins = get_builtin_calls(file_info.language)
@@ -695,7 +802,7 @@ class ASTParser:
         calls: list[CallSite] = []
         seen: set[tuple[int, str, str | None]] = set()
 
-        for capture_dict in _run_query(query, tree.root_node):  # type: ignore[attr-defined]
+        for capture_dict in matches:
             site_nodes = capture_dict.get("call.site", [])
             target_nodes = capture_dict.get("call.target", [])
             arg_nodes = capture_dict.get("call.arguments", [])
@@ -760,8 +867,7 @@ class ASTParser:
 
     def _extract_type_refs(
         self,
-        tree: object,
-        query: object,
+        matches: list[dict],
         src: str,
         lang: str = "",
     ) -> list[TypeReference]:
@@ -781,15 +887,12 @@ class ASTParser:
         ``field_declaration`` → ``field_type``, ``composite_literal`` →
         ``composite_literal`` (Go).
         """
-        if query is None:
-            return []
-
         head_of = TYPE_HEAD_EXTRACTORS.get(lang, _head_type_identifier)
 
         refs: list[TypeReference] = []
         seen: set[tuple[str, int]] = set()
 
-        for capture_dict in _run_query(query, tree.root_node):  # type: ignore[attr-defined]
+        for capture_dict in matches:
             type_nodes = capture_dict.get("param.type", [])
             if not type_nodes:
                 continue

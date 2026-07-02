@@ -187,10 +187,23 @@ def _query_health_line(repo_path: Path) -> str | None:
     worst_path = data["worst_performer_path"] or "n/a"
     worst_score = data["worst_performer_score"]
     worst_repr = f"{worst_score:.1f}" if worst_score is not None else "—"
+    from repowise.core.analysis.health.grading import BAND_LABEL, band_for
+
+    band = band_for(float(data["average_health"]))
+    band_color = {"healthy": "green", "warning": "yellow", "alert": "red"}[band]
+    # Maintainability and performance are co-surfaced pillars; show each when the
+    # split has populated it (None on indexes that predate the relevant work).
+    maint = data.get("maintainability_average")
+    maint_part = f" · {maint:.1f} (maintainability)" if maint is not None else ""
+    perf = data.get("performance_average")
+    perf_part = f" · {perf:.1f} (performance)" if perf is not None else ""
     return (
-        f"[bold]Health:[/bold] {data['average_health']:.1f} (avg) · "
+        f"[bold]Health:[/bold] {data['average_health']:.1f} (avg) "
+        f"[[{band_color}]{BAND_LABEL[band]}[/{band_color}]] · "
         f"{data['hotspot_health']:.1f} (hotspots) · "
         f"{worst_repr} (worst: {worst_path})"
+        f"{maint_part}"
+        f"{perf_part}"
     )
 
 

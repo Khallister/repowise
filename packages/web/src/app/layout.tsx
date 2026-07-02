@@ -2,18 +2,24 @@ import type { Metadata } from "next";
 import { Suspense } from "react";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
+import { Lora } from "next/font/google";
 import { NuqsAdapter } from "nuqs/adapters/next/app";
-import { Toaster } from "sonner";
 import { TooltipProvider } from "@repowise-dev/ui/ui/tooltip";
+import { ThemeProvider } from "@/components/layout/theme-provider";
+import { ThemedToaster } from "@/components/layout/themed-toaster";
 import { Sidebar } from "@/components/layout/sidebar";
 import { MobileNav } from "@/components/layout/mobile-nav";
 import { CommandPalette } from "@/components/search/command-palette";
 import { ContextDrawerShell } from "@/components/layout/context-drawer-provider";
 import { SWRProvider } from "@/components/layout/swr-provider";
+import { UpgradeBanner } from "@/components/layout/upgrade-banner";
 import { listRepos } from "@/lib/api/repos";
 import { getWorkspace } from "@/lib/api/workspace";
 import type { WorkspaceResponse } from "@/lib/api/types";
 import "@/styles/globals.css";
+
+// Serif display face for the docs/wiki reading surfaces (--font-serif token).
+const lora = Lora({ subsets: ["latin"], variable: "--font-lora", display: "swap" });
 
 export const metadata: Metadata = {
   title: {
@@ -46,9 +52,11 @@ export default async function RootLayout({
   return (
     <html
       lang="en"
-      className={`${GeistSans.variable} ${GeistMono.variable} dark`}
+      suppressHydrationWarning
+      className={`${GeistSans.variable} ${GeistMono.variable} ${lora.variable}`}
     >
       <body className="bg-[var(--color-bg-root)] text-[var(--color-text-primary)] antialiased">
+        <ThemeProvider>
         <a
           href="#main-content"
           className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-md focus:bg-[var(--color-bg-elevated)] focus:px-3 focus:py-2 focus:text-sm focus:text-[var(--color-text-primary)] focus:outline focus:outline-2 focus:outline-[var(--color-accent-primary)]"
@@ -60,13 +68,16 @@ export default async function RootLayout({
         <TooltipProvider delayDuration={300}>
           <Suspense fallback={null}>
             <ContextDrawerShell>
-              <div className="flex h-screen overflow-hidden">
+              <div className="flex h-screen flex-col overflow-hidden">
+                <UpgradeBanner />
+                <div className="flex flex-1 overflow-hidden">
                 <Sidebar repos={repos} workspace={workspace} />
                 <div className="flex flex-1 flex-col min-w-0 overflow-hidden">
                   <MobileNav repos={repos} workspace={workspace} />
                   <main id="main-content" className="flex-1 overflow-auto min-w-0">
                     {children}
                   </main>
+                </div>
                 </div>
               </div>
               <CommandPalette repos={repos} workspace={workspace} />
@@ -75,17 +86,8 @@ export default async function RootLayout({
         </TooltipProvider>
         </SWRProvider>
         </NuqsAdapter>
-        <Toaster
-          theme="dark"
-          position="bottom-right"
-          toastOptions={{
-            style: {
-              background: "var(--color-bg-elevated)",
-              border: "1px solid var(--color-border-default)",
-              color: "var(--color-text-primary)",
-            },
-          }}
-        />
+        <ThemedToaster />
+        </ThemeProvider>
       </body>
     </html>
   );

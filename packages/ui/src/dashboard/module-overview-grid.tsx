@@ -52,7 +52,7 @@ export function ModuleOverviewGrid({ nodes, edges, repoId, linkPrefix, initialVi
             </span>
           </span>
           <a
-            href={`${prefix}/graph`}
+            href={`${prefix}/architecture?view=graph`}
             className="text-[10px] text-[var(--color-accent-primary)] hover:underline font-normal"
           >
             Full graph →
@@ -64,15 +64,15 @@ export function ModuleOverviewGrid({ nodes, edges, repoId, linkPrefix, initialVi
           {visibleModules.map((m) => {
             const coverageColor =
               m.doc_coverage_pct >= 70
-                ? "bg-green-500"
+                ? "bg-[var(--color-success)]"
                 : m.doc_coverage_pct >= 30
-                  ? "bg-yellow-500"
-                  : "bg-red-500";
+                  ? "bg-[var(--color-warning)]"
+                  : "bg-[var(--color-text-tertiary)]/50";
 
             return (
               <a
                 key={m.module_id}
-                href={`${prefix}/graph?node=${encodeURIComponent(m.module_id)}`}
+                href={`${prefix}/architecture?view=graph&node=${encodeURIComponent(m.module_id)}`}
                 className="group rounded-lg border border-[var(--color-border-default)] p-3 hover:border-[var(--color-border-hover)] hover:bg-[var(--color-bg-elevated)] transition-colors"
               >
                 <p className="text-xs font-medium text-[var(--color-text-primary)] truncate mb-2" title={m.module_id}>
@@ -92,10 +92,10 @@ export function ModuleOverviewGrid({ nodes, edges, repoId, linkPrefix, initialVi
                   <div className="flex items-center justify-between text-[10px]">
                     <span className={cn(
                       m.doc_coverage_pct >= 70
-                        ? "text-green-500"
+                        ? "text-[var(--color-success)]"
                         : m.doc_coverage_pct >= 30
-                          ? "text-yellow-500"
-                          : "text-red-500",
+                          ? "text-[var(--color-warning)]"
+                          : "text-[var(--color-text-tertiary)]",
                     )}>
                       {Math.round(m.doc_coverage_pct)}% docs
                     </span>
@@ -114,7 +114,7 @@ export function ModuleOverviewGrid({ nodes, edges, repoId, linkPrefix, initialVi
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="mt-2 w-full flex items-center justify-center gap-1 rounded-md border border-[var(--color-border-default)] py-1.5 text-[11px] text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-elevated)] transition-colors"
+            className="mt-2 w-full flex items-center justify-center gap-1 rounded-md border border-[var(--color-border-default)] py-1.5 text-xs text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-elevated)] transition-colors"
           >
             {expanded ? (
               <>

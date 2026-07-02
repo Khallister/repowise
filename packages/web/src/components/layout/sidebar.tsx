@@ -3,71 +3,29 @@
 import * as React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import Image from "next/image";
+import { BrandLogo } from "./brand-logo";
 import {
-  LayoutDashboard,
-  Activity,
-  BookOpen,
-  GitBranch,
-  Lightbulb,
-  MessageSquare,
-  Code2,
-  ShieldAlert,
-  DollarSign,
-  Settings,
   ChevronDown,
   ChevronRight,
   Circle,
   PanelLeft,
-  Layers,
-  Link2,
-  GitMerge,
-  Users,
-  Boxes,
-  HeartPulse,
+  Search,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
+import {
+  GLOBAL_NAV,
+  WORKSPACE_NAV,
+  repoNavGroups,
+  isNavItemActive,
+  type NavItem,
+} from "./nav-items";
 import { ScrollArea } from "@repowise-dev/ui/ui/scroll-area";
 import { Separator } from "@repowise-dev/ui/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@repowise-dev/ui/ui/tooltip";
+import { ThemeToggle } from "@repowise-dev/ui/shared/theme-toggle";
 import { AddRepoDialog } from "@/components/repos/add-repo-dialog";
+import { VersionFooter } from "./version-footer";
 import type { RepoResponse, WorkspaceResponse } from "@/lib/api/types";
-
-interface NavItem {
-  label: string;
-  href: string;
-  icon: React.ComponentType<{ className?: string }>;
-  exact?: boolean;
-}
-
-const GLOBAL_NAV: NavItem[] = [
-  { label: "Dashboard", href: "/", icon: LayoutDashboard },
-  { label: "Settings", href: "/settings", icon: Settings },
-];
-
-const WORKSPACE_NAV: NavItem[] = [
-  { label: "Overview", href: "/workspace", icon: Layers, exact: true },
-  { label: "Contracts", href: "/workspace/contracts", icon: Link2 },
-  { label: "Co-Changes", href: "/workspace/co-changes", icon: GitMerge },
-];
-
-
-function repoNavItems(repoId: string): NavItem[] {
-  return [
-    { label: "Overview", href: `/repos/${repoId}/overview`, icon: Activity },
-    { label: "Chat", href: `/repos/${repoId}`, icon: MessageSquare, exact: true },
-    { label: "Wiki", href: `/repos/${repoId}/docs`, icon: BookOpen },
-    { label: "Risk", href: `/repos/${repoId}/risk`, icon: ShieldAlert },
-    { label: "Health", href: `/repos/${repoId}/health`, icon: HeartPulse, exact: true },
-    { label: "Graph", href: `/repos/${repoId}/graph`, icon: GitBranch },
-    { label: "Knowledge Graph", href: `/repos/${repoId}/c4`, icon: Boxes },
-    { label: "Symbols", href: `/repos/${repoId}/symbols`, icon: Code2 },
-    { label: "Contributors", href: `/repos/${repoId}/owners`, icon: Users },
-    { label: "Decisions", href: `/repos/${repoId}/decisions`, icon: Lightbulb },
-    { label: "Costs", href: `/repos/${repoId}/costs`, icon: DollarSign },
-    { label: "Settings", href: `/repos/${repoId}/settings`, icon: Settings },
-  ];
-}
 
 interface SidebarProps {
   repos?: RepoResponse[];
@@ -96,7 +54,25 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
       });
     }
   }, [derivedActiveRepoId]);
-  const [collapsed, setCollapsed] = React.useState(false);
+  // Docs is a reading surface — auto-collapse the sidebar on entering it so
+  // the page gets the width, and restore the previous state on leaving.
+  // Manual toggles always win while the route type is unchanged.
+  const isDocsRoute = /^\/repos\/[^/]+\/docs(\/|$)/.test(pathname ?? "");
+  const [collapsed, setCollapsed] = React.useState(isDocsRoute);
+  const preDocsCollapsed = React.useRef(false);
+  const wasDocsRoute = React.useRef(isDocsRoute);
+  React.useEffect(() => {
+    if (isDocsRoute === wasDocsRoute.current) return;
+    wasDocsRoute.current = isDocsRoute;
+    if (isDocsRoute) {
+      setCollapsed((c) => {
+        preDocsCollapsed.current = c;
+        return true;
+      });
+    } else {
+      setCollapsed(preDocsCollapsed.current);
+    }
+  }, [isDocsRoute]);
 
   const toggleRepo = (id: string) => {
     setExpandedRepos((prev) => {
@@ -116,15 +92,15 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
         isIconOnly ? "w-[56px]" : "w-[260px]",
       )}
     >
-      {/* Logo */}
-      <div className="flex h-14 items-center gap-3 px-4">
-        <Image
-          src="/repowise-logo.png"
-          alt="repowise"
-          width={28}
-          height={28}
-          className="shrink-0 drop-shadow-[0_0_8px_rgba(245,149,32,0.3)]"
-        />
+      {/* Logo. Collapsed (56px) can't fit logo + toggle on one row — the
+          button used to spill out over the breadcrumb — so stack them. */}
+      <div
+        className={cn(
+          "flex items-center gap-3",
+          isIconOnly ? "flex-col gap-1.5 px-0 pt-3 pb-1" : "h-14 px-4",
+        )}
+      >
+        <BrandLogo size={28} />
         {!isIconOnly && (
           <span className="text-base font-semibold text-[var(--color-text-primary)] tracking-tight flex-1 truncate">
             repowise
@@ -132,7 +108,10 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
         )}
         <button
           onClick={() => setCollapsed((c) => !c)}
-          className="ml-auto shrink-0 rounded-md p-2.5 text-[var(--color-text-tertiary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-secondary)] transition-colors"
+          className={cn(
+            "shrink-0 rounded-md p-2.5 text-[var(--color-text-tertiary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-secondary)] transition-colors",
+            !isIconOnly && "ml-auto",
+          )}
           aria-label={isIconOnly ? "Expand sidebar" : "Collapse sidebar"}
           aria-expanded={!isIconOnly}
           aria-controls="sidebar-nav"
@@ -153,6 +132,7 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                 iconOnly={isIconOnly}
               />
             ))}
+            <SidebarSearchButton iconOnly={isIconOnly} />
           </nav>
 
           {/* Workspace nav — only shown in workspace mode */}
@@ -195,7 +175,7 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                 {repos.map((repo) => {
                   const isExpanded = expandedRepos.has(repo.id);
                   const isActive = derivedActiveRepoId === repo.id;
-                  const navItems = repoNavItems(repo.id);
+                  const navGroups = repoNavGroups(repo.id);
                   const needsIndex =
                     repo.workspace_status === "needs_index" ||
                     repo.id.startsWith("ws:");
@@ -247,19 +227,50 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                   }
 
                   if (isIconOnly) {
+                    // Collapsed: the active repo still exposes its full nav as
+                    // icons (so the repository-view options stay reachable, e.g.
+                    // on Docs where the sidebar auto-collapses); inactive repos
+                    // stay a single dot that jumps to their overview.
+                    if (isActive) {
+                      return (
+                        <div key={repo.id} className="space-y-0.5">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <div
+                                className="flex w-full items-center justify-center rounded-md p-2 text-[var(--color-accent-primary)]"
+                                aria-label={repo.name}
+                              >
+                                <Circle className="h-2.5 w-2.5 fill-[var(--color-accent-primary)]" />
+                              </div>
+                            </TooltipTrigger>
+                            <TooltipContent side="right">{repo.name}</TooltipContent>
+                          </Tooltip>
+                          {navGroups.map((group, gi) => (
+                            <React.Fragment key={group.label ?? gi}>
+                              {gi > 0 && <Separator className="my-1.5" />}
+                              {group.items.map((item) => (
+                                <SidebarNavItem
+                                  key={item.href}
+                                  item={item}
+                                  isActive={isNavItemActive(item, pathname)}
+                                  iconOnly
+                                />
+                              ))}
+                            </React.Fragment>
+                          ))}
+                        </div>
+                      );
+                    }
                     return (
                       <Tooltip key={repo.id}>
                         <TooltipTrigger asChild>
-                          <button
-                            onClick={() => toggleRepo(repo.id)}
-                            className={cn(
-                              "flex w-full items-center justify-center rounded-md p-2 transition-colors hover:bg-[var(--color-bg-elevated)]",
-                              isActive ? "text-[var(--color-accent-primary)]" : "text-[var(--color-text-tertiary)]",
-                            )}
+                          <Link
+                            href={`/repos/${repo.id}/overview`}
+                            className="flex w-full items-center justify-center rounded-md p-2 text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-secondary)]"
                             aria-label={repo.name}
                           >
-                            <Circle className={cn("h-2.5 w-2.5", isActive ? "fill-[var(--color-accent-primary)]" : "fill-current")} />
-                          </button>
+                            <Circle className="h-2.5 w-2.5 fill-current" />
+                          </Link>
                         </TooltipTrigger>
                         <TooltipContent side="right">{repo.name}</TooltipContent>
                       </Tooltip>
@@ -293,14 +304,25 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                       </button>
                       {isExpanded && (
                         <div id={`sidebar-repo-${repo.id}`} className="ml-3.5 mt-0.5 space-y-0.5 border-l border-[var(--color-border-default)] pl-3">
-                          {navItems.map((item) => (
-                            <SidebarNavItem
-                              key={item.href}
-                              item={item}
-                              isActive={item.exact ? pathname === item.href : (pathname === item.href || pathname.startsWith(`${item.href}/`))}
-                              size="sm"
-                              iconOnly={false}
-                            />
+                          {navGroups.map((group, gi) => (
+                            <React.Fragment key={group.label ?? gi}>
+                              {group.label ? (
+                                <p className="px-2 pt-2 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-[var(--color-text-tertiary)]">
+                                  {group.label}
+                                </p>
+                              ) : gi > 0 ? (
+                                <div className="pt-1.5" />
+                              ) : null}
+                              {group.items.map((item) => (
+                                <SidebarNavItem
+                                  key={item.href}
+                                  item={item}
+                                  isActive={isNavItemActive(item, pathname)}
+                                  size="sm"
+                                  iconOnly={false}
+                                />
+                              ))}
+                            </React.Fragment>
                           ))}
                         </div>
                       )}
@@ -330,13 +352,47 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
 
       {/* Footer */}
       {!isIconOnly && (
-        <div className="border-t border-[var(--color-border-default)] px-4 py-3">
-          <p className="text-xs text-[var(--color-text-tertiary)]">
-            repowise v0.14.0
-          </p>
+        <div className="flex flex-col gap-3 border-t border-[var(--color-border-default)] px-4 py-3">
+          <ThemeToggle className="w-full justify-between" />
+          <VersionFooter />
         </div>
       )}
     </aside>
+  );
+}
+
+function SidebarSearchButton({ iconOnly }: { iconOnly: boolean }) {
+  const openPalette = () =>
+    window.dispatchEvent(new CustomEvent("repowise:open-command-palette"));
+
+  if (iconOnly) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={openPalette}
+            aria-label="Search"
+            className="flex w-full items-center justify-center rounded-lg p-2.5 text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-primary)]"
+          >
+            <Search className="h-[18px] w-[18px] shrink-0" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="right">Search</TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  return (
+    <button
+      onClick={openPalette}
+      className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-primary)]"
+    >
+      <Search className="h-[18px] w-[18px] shrink-0" />
+      <span className="flex-1 truncate text-left">Search</span>
+      <kbd className="rounded border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-tertiary)]">
+        ⌘K
+      </kbd>
+    </button>
   );
 }
 

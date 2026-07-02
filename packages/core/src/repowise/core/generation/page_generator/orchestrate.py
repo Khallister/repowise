@@ -59,6 +59,9 @@ class _GenerationRun:
         dead_code_report: Any | None,
         decision_report: Any | None,
         external_systems: list[dict] | None,
+        on_page_ready: Callable[[GeneratedPage], None] | None = None,
+        kg_modules: list[dict] | None = None,
+        kg_data: dict | None = None,
     ) -> None:
         self.gen = gen
         self.config = gen._config
@@ -70,12 +73,23 @@ class _GenerationRun:
         self.repo_name = repo_name
         self.job_system = job_system
         self.on_page_done = on_page_done
+        # Fired with the full GeneratedPage the instant it completes (in
+        # addition to on_page_done, which only gets the page_type). Lets a
+        # caller persist/stream pages incrementally — e.g. the hosted indexer
+        # flushing pages.json per page so a budget cutoff yields partial docs
+        # instead of nothing. Optional + best-effort; never blocks generation.
+        self.on_page_ready = on_page_ready
         self.on_total_known = on_total_known
         self.on_subphase = on_subphase
         self.git_meta_map = git_meta_map
         self.resume = resume
         self.repo_path = repo_path
         self.external_systems = external_systems or []
+        # Curated wiki modules from the IN-MEMORY pipeline result. The kg_ctx
+        # file fallback below is one run stale on update and absent on a
+        # fresh init (the artifact is written AFTER generation) — the live
+        # repowise run shipped community-grouped module pages because of it.
+        self.kg_modules = kg_modules or []
 
         # ---- Graph metrics ----
         self.graph = graph_builder.graph()
@@ -91,17 +105,27 @@ class _GenerationRun:
         # ---- KG context (per-file knowledge graph lookups) ----
         from repowise.core.generation.kg_context import KnowledgeGraphContext
 
-        kg_path = None
+        # Prefer the in-memory KG (the pipeline result's export dict): the
+        # artifact file is only written during persistence — AFTER this
+        # generation pass — so on a fresh init the file path below finds
+        # nothing and every kg_ctx-derived page (layer pages, tour context,
+        # file layers) silently vanished from first-run wikis.
+        rp = None
         if repo_path:
             rp = Path(repo_path) if not isinstance(repo_path, Path) else repo_path
-            for candidate in [
-                rp / ".repowise" / "knowledge-graph.json",
-                rp / ".understand-anything" / "knowledge-graph.json",
-            ]:
-                if candidate.exists():
-                    kg_path = candidate
-                    break
-        self.kg_ctx = KnowledgeGraphContext(kg_path)
+        if kg_data is not None:
+            self.kg_ctx = KnowledgeGraphContext(None, rp, data=kg_data)
+        else:
+            kg_path = None
+            if rp:
+                for candidate in [
+                    rp / ".repowise" / "knowledge-graph.json",
+                    rp / ".understand-anything" / "knowledge-graph.json",
+                ]:
+                    if candidate.exists():
+                        kg_path = candidate
+                        break
+            self.kg_ctx = KnowledgeGraphContext(kg_path)
 
         # ---- Run bookkeeping ----
         self.semaphore = asyncio.Semaphore(self.config.max_concurrency)
@@ -207,6 +231,11 @@ class _GenerationRun:
                 git_meta_map=self.git_meta_map,
                 config=self.config,
                 kg_file_scores=kg_scores or None,
+                # Curated wiki modules: prefer the in-memory pipeline
+                # result (fresh); the artifact file is absent on first init
+                # and one run stale on update. Inert unless
+                # module_grouping == "curated".
+                kg_modules=self.kg_modules or self.kg_ctx.get_modules() or None,
             )
         )
 
@@ -286,24 +315,40 @@ class _GenerationRun:
 
         import_edges = self._file_import_edges()
 
-        # Tour: ordered stops over the selected file/infra pages + overview.
-        stops = build_tour(
-            self.parsed_files,
-            self.pagerank,
-            import_edges,
-            file_page_paths=self.sel_file_paths,
-            infra_paths=self.sel_infra_paths,
-            repo_name=self.repo_name,
-        )
-        self.tour_stops = [s.as_dict() for s in stops]
+        # When the indexed KG carries the curated tour (project.graph_mode is
+        # written only by the curation pass), adopt it wholesale instead of
+        # re-deriving a second, divergent tour from the raw graph: the curated
+        # tour knows the repo's honesty mode (flow/sparse/structural), walks
+        # imports-type edges only, and excludes support paths — and the wiki's
+        # file cards already cite its steps. One tour, every surface.
+        if self.kg_ctx.available and self.kg_ctx.get_graph_mode():
+            self.tour_stops = [dict(s) for s in self.kg_ctx.get_tour()]
+        if not self.tour_stops:
+            # Tour: ordered stops over the selected file/infra pages + overview.
+            stops = build_tour(
+                self.parsed_files,
+                self.pagerank,
+                import_edges,
+                file_page_paths=self.sel_file_paths,
+                infra_paths=self.sel_infra_paths,
+                repo_name=self.repo_name,
+            )
+            self.tour_stops = [s.as_dict() for s in stops]
 
         # Layer spine: every documented file gets a layer (KG when present,
         # path-based inference otherwise), then layers are ordered top→bottom
         # by inter-layer dependency direction.
+        lang_by_path = {
+            p.file_info.path: (getattr(p.file_info, "language", "") or "").lower()
+            for p in self.parsed_files
+            if getattr(p, "file_info", None)
+        }
         file_layers: dict[str, str] = {}
         for path in self.sel_file_paths:
             kg_fc = self.kg_ctx.get_file_context(path) if self.kg_ctx.available else None
-            file_layers[path] = (kg_fc.layer_name if kg_fc and kg_fc.layer_name else "") or infer_layer(path)
+            file_layers[path] = (kg_fc.layer_name if kg_fc and kg_fc.layer_name else "") or infer_layer(
+                path, lang_by_path.get(path)
+            )
         self.layer_order = compute_layer_order(file_layers, import_edges)
 
     # ------------------------------------------------------------------
@@ -337,6 +382,14 @@ class _GenerationRun:
                     # Progress tick fires the moment the page is ready.
                     if self.on_page_done is not None:
                         self.on_page_done(result.page_type)
+                    # Hand the full page to a streaming sink (incremental
+                    # persistence). Best-effort: a sink error must not drop the
+                    # page or abort the level.
+                    if self.on_page_ready is not None:
+                        try:
+                            self.on_page_ready(result)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("on_page_ready.failed", error=str(exc))
                     if self.vector_store is not None:
                         embed_items.append(_embed_item(result))
                 return result
@@ -350,18 +403,36 @@ class _GenerationRun:
                     error=str(exc),
                 )
                 return exc  # return as value so gather works
+            except BaseException:
+                # Cancellation (Ctrl+C teardown): CancelledError is a
+                # BaseException, so it skips the handler above. If the cancel
+                # landed while this page was still queued on the semaphore,
+                # ``coro`` was never started — close it so interpreter
+                # shutdown doesn't spray one "coroutine ... was never
+                # awaited" RuntimeWarning per pending page (issue #358).
+                # close() is a no-op on a coroutine that already ran.
+                coro.close()
+                raise
 
         tasks = [guarded_named(pid, c) for pid, c in named_coros]
         results = await asyncio.gather(*tasks)
         # Embed the whole level in one batch before declaring it done — the
         # next level's RAG search depends on these landing in the store.
-        # Embedding is a RAG enhancement, not load-bearing, so failures are
-        # swallowed at debug level.
+        # Embedding is a RAG enhancement, not load-bearing, so a failure must
+        # not abort generation — but it MUST be visible: a debug-level
+        # swallow here hid a 300k-token request rejection that silently lost
+        # every file-page embedding on init (`repowise reindex` repairs).
         if embed_items and self.vector_store is not None:
             try:
                 await self.vector_store.embed_batch(embed_items)
             except Exception as e:
-                log.debug("rag.embed_batch_failed", count=len(embed_items), error=str(e))
+                log.warning(
+                    "rag.embed_batch_failed",
+                    level=level,
+                    count=len(embed_items),
+                    error=str(e),
+                    hint="semantic search will miss these pages; run `repowise reindex` to repair",
+                )
         pages = [r for r in results if isinstance(r, GeneratedPage)]
         if self.job_system is not None and self.job_id is not None:
             for r in pages:

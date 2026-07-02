@@ -34,6 +34,7 @@ from ..models import (
     compute_page_id,
     compute_source_hash,
 )
+from ..styles import ONBOARDING_PAGE_TYPE, resolve_style
 from .decision_harvest import (
     HARVEST_DIRECTIVE,
     HARVESTABLE_PAGE_TYPES,
@@ -60,15 +61,23 @@ def _attach_file_provenance(page: GeneratedPage, ctx: FilePageContext) -> None:
     """
     if ctx.kg_layer_name:
         page.metadata["layer_name"] = ctx.kg_layer_name
+        # Stable slug id of the layer page this file links to. The layer page
+        # is keyed by slug (``layer:<slug>``) so the join survives the LLM
+        # layer-name enrichment that mutates ``layer_name`` after generation.
+        if ctx.kg_layer_id:
+            page.metadata["layer_id"] = ctx.kg_layer_id
         if ctx.kg_layer_role:
             page.metadata["layer_role"] = ctx.kg_layer_role
     else:
         # Guarantee every file page carries a layer so the Architecture tree
         # can group it. When the knowledge graph has no layer, fall back to
         # path-based inference.
+        from ...analysis.knowledge_graph import _slugify
         from ..layers import infer_layer
 
-        page.metadata["layer_name"] = infer_layer(ctx.file_path)
+        inferred = infer_layer(ctx.file_path, getattr(ctx, "language", None))
+        page.metadata["layer_name"] = inferred
+        page.metadata["layer_id"] = f"layer:{_slugify(inferred)}"
 
     sources: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -124,12 +133,17 @@ class PageGenerator(PerTypeGenerationMixin):
         vector_store: Any | None = None,
         language: str = "en",
         prior_pages: dict[str, PriorPage] | None = None,
+        repo_path: Path | str | None = None,
     ) -> None:
         self._provider = provider
         self._assembler = assembler
         self._config = config
         self._vector_store = vector_store
         self._language = language
+        # Resolve the wiki style once. "comprehensive" (default) is inert, so this
+        # is a no-op for repos that never opt in. ``repo_path`` lets a user-defined
+        # ``.repowise/styles/<name>`` style resolve (Phase 5).
+        self._style = resolve_style(getattr(config, "wiki_style", None), repo_path=repo_path)
         self._cache: dict[str, GeneratedResponse] = {}
         # Map of page_id → PriorPage from previous generation runs. When the
         # rendered prompt's source_hash matches the prior page's hash AND the
@@ -141,7 +155,18 @@ class PageGenerator(PerTypeGenerationMixin):
 
         if jinja_env is None:
             templates_dir = Path(__file__).parent.parent / "templates"
-            loader = jinja2.FileSystemLoader(str(templates_dir))
+            # A custom style may ship its own templates/ dir (Layer 2). Resolve it
+            # first via ChoiceLoader, falling back to the built-in templates for any
+            # page type the style does not override.
+            if self._style.template_dir is not None:
+                loader: jinja2.BaseLoader = jinja2.ChoiceLoader(
+                    [
+                        jinja2.FileSystemLoader(str(self._style.template_dir)),
+                        jinja2.FileSystemLoader(str(templates_dir)),
+                    ]
+                )
+            else:
+                loader = jinja2.FileSystemLoader(str(templates_dir))
             jinja_env = jinja2.Environment(
                 loader=loader,
                 undefined=jinja2.StrictUndefined,
@@ -170,6 +195,9 @@ class PageGenerator(PerTypeGenerationMixin):
         dead_code_report: Any | None = None,
         decision_report: Any | None = None,
         external_systems: list[dict] | None = None,
+        on_page_ready: Callable[[GeneratedPage], None] | None = None,
+        kg_modules: list[dict] | None = None,
+        kg_data: dict | None = None,
     ) -> list[GeneratedPage]:
         """Generate all wiki pages for a repository.
 
@@ -196,6 +224,9 @@ class PageGenerator(PerTypeGenerationMixin):
             dead_code_report=dead_code_report,
             decision_report=decision_report,
             external_systems=external_systems,
+            on_page_ready=on_page_ready,
+            kg_modules=kg_modules,
+            kg_data=kg_data,
         )
 
     # ------------------------------------------------------------------
@@ -206,15 +237,26 @@ class PageGenerator(PerTypeGenerationMixin):
         self,
         parsed: ParsedFile,
         ctx: FilePageContext,
+        rag_prefetched: bool = False,
     ) -> GeneratedPage:
-        """Generate a file_page from a pre-assembled context (avoids double-assembly)."""
+        """Generate a file_page from a pre-assembled context (avoids double-assembly).
+
+        *rag_prefetched* is set by the level-2 builder when RAG context was
+        already resolved for the whole level in one batched search (see
+        ``levels._prefetch_rag_context``) — the per-page search below would
+        re-fetch identical results inside the LLM semaphore, so it is skipped.
+        """
         # RAG context: query vector store for related pages (B1).
         # Gated by two short-circuits so we don't burn an embedder
         # round-trip on every page when the result wouldn't help:
         #   1. ``enable_rag_context`` config flag (off → fully skip).
         #   2. ``rag_min_store_size`` — early pages run against an empty
         #      or near-empty store and the search returns nothing useful.
-        if self._vector_store is not None and getattr(self._config, "enable_rag_context", True):
+        if (
+            not rag_prefetched
+            and self._vector_store is not None
+            and getattr(self._config, "enable_rag_context", True)
+        ):
             min_store_size = max(0, int(getattr(self._config, "rag_min_store_size", 10) or 0))
             store_ok = True
             if min_store_size > 0:
@@ -294,7 +336,7 @@ class PageGenerator(PerTypeGenerationMixin):
         search by the level runner like any other page. No provider call and
         no hallucination check (the content is factual by construction).
         """
-        content = self._render("file_page_tier2.j2", ctx=ctx)
+        content = self._render("file_page_tier2.j2", style_prefix=False, ctx=ctx)
         now = _now_iso()
         page = GeneratedPage(
             page_id=compute_page_id("file_page", parsed.file_info.path),
@@ -388,6 +430,11 @@ class PageGenerator(PerTypeGenerationMixin):
         # The directive is constant per run, so prefix caching still holds.
         if self._config.harvest_decisions and page_type in HARVESTABLE_PAGE_TYPES:
             base_system = base_system + HARVEST_DIRECTIVE
+        # Wiki style: append the style's framing note. Constant per run (per page
+        # type), so prefix caching still holds. Inert for the default style.
+        base_system = base_system + self._style.system_prompt_suffix(
+            is_onboarding=page_type == ONBOARDING_PAGE_TYPE
+        )
         # Sanitize the configured language code: lower, strip, drop anything that isn't
         # alphanumeric or underscore. Prevents user-supplied config from injecting
         # newlines or extra instructions into the system prompt.
@@ -408,8 +455,17 @@ class PageGenerator(PerTypeGenerationMixin):
         return instruction + base_system
 
     def _compute_cache_key(self, page_type: str, user_prompt: str) -> str:
-        """Return SHA256(model + language + page_type + user_prompt) as cache key."""
-        raw = f"{self._provider.model_name}:{self._language}:{page_type}:{user_prompt}"
+        """Return SHA256(model + language + style + page_type + user_prompt) as cache key.
+
+        The style fingerprint is already embedded in ``user_prompt`` for active
+        styles, but include it explicitly so the in-memory cache never collides
+        across styles even if a future change moves the directive out of the prompt
+        body. Empty for the default style → key is unchanged from before.
+        """
+        raw = (
+            f"{self._provider.model_name}:{self._language}:"
+            f"{self._style.fingerprint}:{page_type}:{user_prompt}"
+        )
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def _build_generated_page(
@@ -423,7 +479,7 @@ class PageGenerator(PerTypeGenerationMixin):
     ) -> GeneratedPage:
         """Wrap a GeneratedResponse in a GeneratedPage."""
         now = _now_iso()
-        return GeneratedPage(
+        page = GeneratedPage(
             page_id=compute_page_id(page_type, target_path),
             page_type=page_type,
             title=title,
@@ -440,8 +496,28 @@ class PageGenerator(PerTypeGenerationMixin):
             created_at=now,
             updated_at=now,
         )
+        # Record the effective style as page provenance (D10). Only for active
+        # styles, so default ("comprehensive") pages keep byte-identical metadata.
+        if self._style.is_active:
+            page.metadata["style"] = self._style.name
+        return page
 
-    def _render(self, template_name: str, **kwargs: Any) -> str:
-        """Render a Jinja2 template with the given kwargs."""
+    def _render(self, template_name: str, *, style_prefix: bool = True, **kwargs: Any) -> str:
+        """Render a Jinja2 template with the given kwargs.
+
+        For LLM *prompts* (the default), the active wiki style's directive is
+        prepended so the model adjusts its voice and — critically — the directive
+        becomes part of the rendered text that ``source_hash`` is computed over, so
+        a style change invalidates the cache and regenerates the page on update.
+
+        ``style_prefix=False`` is for deterministic templates whose render output is
+        the page *content* itself (tier-2 file pages), not a prompt — those must not
+        carry a style directive.
+        """
         template = self._jinja_env.get_template(template_name)
-        return template.render(**kwargs)
+        body = template.render(**kwargs)
+        if not style_prefix:
+            return body
+        is_onboarding = template_name.startswith("onboarding/")
+        prefix = self._style.user_prompt_prefix(is_onboarding=is_onboarding)
+        return prefix + body if prefix else body

@@ -8,6 +8,65 @@ from ...models import NamedBinding
 from ..helpers import node_text
 
 
+def _extract_require_bindings(
+    stmt_node: Node, src: str
+) -> tuple[list[str], list[NamedBinding]] | None:
+    """Bindings for a ``variable_declarator`` initialized by ``require(...)``.
+
+    Handles ``const svc = require('./svc')`` (whole-module alias) and
+    ``const { a, b: c } = require('./svc')`` (destructured). Returns None when
+    the node is not a require() declarator so the caller falls through to the
+    existing import/export handling.
+    """
+    if stmt_node.type != "variable_declarator":
+        return None
+    value = stmt_node.child_by_field_name("value")
+    if value is None or value.type != "call_expression":
+        return None
+    fn = value.child_by_field_name("function")
+    if fn is None or node_text(fn, src) != "require":
+        return None
+
+    name_node = stmt_node.child_by_field_name("name")
+    if name_node is None:
+        return [], []
+
+    names: list[str] = []
+    bindings: list[NamedBinding] = []
+
+    if name_node.type == "identifier":
+        local = node_text(name_node, src)
+        names.append(local)
+        bindings.append(
+            NamedBinding(
+                local_name=local,
+                exported_name=None,
+                source_file=None,
+                is_module_alias=True,
+            )
+        )
+    elif name_node.type == "object_pattern":
+        for el in name_node.children:
+            if el.type == "shorthand_property_identifier_pattern":
+                local = node_text(el, src)
+                names.append(local)
+                bindings.append(
+                    NamedBinding(local_name=local, exported_name=local, source_file=None)
+                )
+            elif el.type == "pair_pattern":
+                key = el.child_by_field_name("key")
+                val = el.child_by_field_name("value")
+                if key is not None and val is not None:
+                    exported = node_text(key, src)
+                    local = node_text(val, src)
+                    names.append(local)
+                    bindings.append(
+                        NamedBinding(local_name=local, exported_name=exported, source_file=None)
+                    )
+
+    return names, bindings
+
+
 def extract_ts_js_bindings(stmt_node: Node, src: str) -> tuple[list[str], list[NamedBinding]]:
     """Extract bindings from TypeScript/JavaScript import and re-export statements.
 
@@ -19,6 +78,10 @@ def extract_ts_js_bindings(stmt_node: Node, src: str) -> tuple[list[str], list[N
     analyzer can match it to the re-exported symbol and an ``index.ts`` barrel
     no longer hides every component it forwards.
     """
+    require_result = _extract_require_bindings(stmt_node, src)
+    if require_result is not None:
+        return require_result
+
     names: list[str] = []
     bindings: list[NamedBinding] = []
 
@@ -107,3 +170,53 @@ def extract_ts_js_bindings(stmt_node: Node, src: str) -> tuple[list[str], list[N
         bindings.append(NamedBinding(local_name="*", exported_name=None, source_file=None))
 
     return names, bindings
+
+
+def collect_cjs_requires(stmt_node: Node, src: str) -> list[str]:
+    """Collect every ``require('<literal>')`` module string inside *stmt_node*.
+
+    Used for the CommonJS assignment / ``Object.assign`` shapes
+    (``module.exports = require('./x')``,
+    ``Object.assign(module.exports, require('./a'), require('./b'))``)
+    where the query captures the outer statement once — the parser then
+    walks it for ALL contained requires so multi-require hubs survive
+    raw-statement dedup.
+    """
+    out: list[str] = []
+
+    def _walk(node: Node) -> None:
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type == "identifier" and node_text(fn, src) == "require":
+                args = node.child_by_field_name("arguments")
+                if args is not None:
+                    for child in args.named_children:
+                        if child.type == "string":
+                            module = node_text(child, src).strip("\"'`")
+                            if module:
+                                out.append(module)
+                        break  # first argument only
+        for child in node.children:
+            _walk(child)
+
+    _walk(stmt_node)
+    return out
+
+
+def cjs_statement_is_reexport(stmt_node: Node, src: str) -> bool:
+    """True when a CJS require statement re-exports through ``module.exports``.
+
+    Climbs to the enclosing statement and inspects the text *before* the
+    first ``require`` — ``module.exports = require(...)``,
+    ``exports.foo = require(...)`` and
+    ``Object.assign(module.exports, require(...))`` all qualify;
+    ``app.use(require('./mw'))`` does not.
+    """
+    ctx = stmt_node
+    parent = stmt_node.parent
+    while parent is not None and parent.type not in ("program", "statement_block"):
+        ctx = parent
+        parent = parent.parent
+    head = node_text(ctx, src).split("require", 1)[0]
+    stripped = head.lstrip()
+    return "module.exports" in head or stripped.startswith("exports.")

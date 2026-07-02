@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import datetime, date
+import sqlite3
+from datetime import date, datetime
+from pathlib import Path
 
 import sqlalchemy as sa
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from fastapi import APIRouter, Depends, Query
+from repowise.core.persistence import crud
 from repowise.core.persistence.models import LlmCost
 from repowise.server.deps import get_db_session, verify_api_key
-from repowise.server.schemas import CostGroupResponse, CostSummaryResponse
+from repowise.server.schemas import (
+    CostGroupResponse,
+    CostSummaryResponse,
+    DistillSavingsGroup,
+    DistillSavingsResponse,
+    McpDropGroup,
+)
 
 router = APIRouter(
     prefix="/api/repos",
@@ -109,3 +117,100 @@ async def list_costs(
         )
         for row in rows
     ]
+
+
+@router.get("/{repo_id}/distill-savings", response_model=DistillSavingsResponse)
+async def get_distill_savings(
+    repo_id: str,
+    since: str | None = Query(None, description="ISO date filter, e.g. 2025-01-01"),
+    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+) -> DistillSavingsResponse:
+    """Savings rollup from the repo's omission store sidecar.
+
+    Combines the ``repowise distill`` ledger with the MCP truncation drops
+    already on disk (``source='mcp:*'``), priced at the coding agent's detected
+    model. Returns ``available=False`` when the repo has no omission store.
+    """
+    repo = await crud.get_repository(session, repo_id)
+    if repo is None:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if not repo.local_path:
+        return DistillSavingsResponse(available=False)
+
+    db_path = Path(repo.local_path) / ".repowise" / "omissions" / "omissions.db"
+    if not db_path.is_file():
+        return DistillSavingsResponse(available=False)
+
+    since_dt = _parse_since(since)
+    since_ts = since_dt.timestamp() if since_dt is not None else None
+
+    from repowise.core.distill import tracking
+    from repowise.core.distill.session_model import resolve_session_model
+    from repowise.core.generation.cost_tracker import get_model_pricing
+
+    # Read-only stdlib sqlite3 on the sidecar: tiny aggregate queries, and a
+    # ro handle never contends with hook/CLI writers.
+    try:
+        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+        return DistillSavingsResponse(available=False)
+    try:
+        # Distill figures exclude the ``mcp:*`` counterfactual rows Phase 2 now
+        # writes into the same ledger; the MCP block reports those separately.
+        summary = tracking.distill_summary(conn, since=since_ts)
+        per_day = tracking.savings_rollup(conn, by="day", since=since_ts)
+        # Unified MCP view: counterfactual ledger merged with truncation drops,
+        # counterfactual taking precedence per tool (no double counting).
+        mcp = tracking.mcp_savings_summary(conn, since=since_ts)
+    except sqlite3.Error:
+        return DistillSavingsResponse(available=False)
+    finally:
+        conn.close()
+
+    per_filter = [
+        {"group": name, **stats} for name, stats in summary["per_filter"].items()
+    ]
+
+    # Missed savings: best-effort scan of local agent transcripts; the module
+    # degrades to an empty report on any failure, never raises.
+    from repowise.core.distill.missed import scan_missed_savings
+    from repowise.core.distill.missed_mcp import scan_missed_mcp_savings
+
+    missed = scan_missed_savings(Path(repo.local_path))
+    reread = scan_missed_mcp_savings(Path(repo.local_path))
+
+    # Price at the coding agent's actual model — saved tokens are input tokens
+    # that agent never had to read. Detection is best-effort (sonnet default).
+    resolved = resolve_session_model(Path(repo.local_path))
+    rate = get_model_pricing(resolved.model)["input"]
+    total_saved = summary["saved_tokens"] + mcp["tokens"]
+    return DistillSavingsResponse(
+        available=True,
+        events=summary["events"],
+        raw_tokens=summary["raw_tokens"],
+        distilled_tokens=summary["distilled_tokens"],
+        saved_tokens=summary["saved_tokens"],
+        estimated_usd_saved=total_saved * rate / 1_000_000,
+        pricing_model=resolved.model,
+        pricing_agent=resolved.agent,
+        pricing_source=resolved.source,
+        per_filter=[DistillSavingsGroup(**row) for row in per_filter],
+        per_day=[DistillSavingsGroup(**row) for row in per_day],
+        mcp_events=mcp["events"],
+        mcp_tokens=mcp["tokens"],
+        mcp_queries=mcp["queries"],
+        mcp_per_tool=[
+            McpDropGroup(
+                tool=row["tool"],
+                events=row["events"],
+                tokens=row["tokens"],
+                kind=row["kind"],
+            )
+            for row in mcp["per_tool"]
+        ],
+        missed_events=missed["events"],
+        missed_tokens_est=missed["est_saved_tokens"],
+        missed_window_days=missed["window_days"],
+        reread_events=reread["events"],
+        reread_tokens_est=reread["est_saved_tokens"],
+    )

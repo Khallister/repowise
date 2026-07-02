@@ -18,12 +18,26 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _PRICING: dict[str, dict[str, float]] = {
-    # Anthropic
+    # Anthropic — Opus tier $15/$75, Sonnet $3/$15, Haiku $0.8/$4 per 1M.
+    # 4-7/4-8 added for savings pricing: these are the models the session
+    # detector surfaces from current Claude Code transcripts.
+    "claude-opus-4-8": {"input": 15.0, "output": 75.0},
+    "claude-opus-4-7": {"input": 15.0, "output": 75.0},
     "claude-opus-4-6": {"input": 15.0, "output": 75.0},
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5": {"input": 0.8, "output": 4.0},
     "claude-3-5-sonnet-20241022": {"input": 3.0, "output": 15.0},
-    # OpenAI
+    # OpenAI — GPT-5 family (the models Codex sessions report). Rates per 1M
+    # input/output; verify against current OpenAI pricing before relying on
+    # the dollar figure for billing.
+    "gpt-5": {"input": 1.25, "output": 10.0},
+    "gpt-5-codex": {"input": 1.25, "output": 10.0},
+    "gpt-5-mini": {"input": 0.25, "output": 2.0},
+    # Nano tier — $0.05/$0.40 per 1M. Without these keys the model name falls
+    # through to ``_FALLBACK_PRICING`` (Sonnet $3/$15) and overstates a nano
+    # indexing run ~40×.
+    "gpt-5-nano": {"input": 0.05, "output": 0.40},
+    "gpt-5.4-nano": {"input": 0.05, "output": 0.40},
     "gpt-4o": {"input": 2.5, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.6},
     # Google Gemini
@@ -49,12 +63,26 @@ _warned_models: set[str] = set()
 
 def _get_pricing(model: str) -> dict[str, float]:
     """Return pricing for *model*, falling back and warning if unknown."""
+    if model.startswith("codex_cli/"):
+        return {"input": 0.0, "output": 0.0}
+    if model.startswith("opencode/"):
+        return {"input": 0.0, "output": 0.0}
     if model in _PRICING:
         return _PRICING[model]
     if model not in _warned_models:
         log.warning("cost_tracker.unknown_model", model=model, fallback=_FALLBACK_PRICING)
         _warned_models.add(model)
     return _FALLBACK_PRICING
+
+
+def get_model_pricing(model: str) -> dict[str, float]:
+    """Public pricing lookup — USD per 1M tokens, ``{"input": ..., "output": ...}``.
+
+    Unknown models fall back to the default tier (with a one-time warning).
+    Used outside generation (e.g. ``repowise saved``) to turn token counts
+    into dollar estimates with the same table the cost ledger uses.
+    """
+    return _get_pricing(model)
 
 
 # ---------------------------------------------------------------------------
@@ -75,17 +103,31 @@ class CostTracker:
         tracking is performed.
     repo_id:
         Repository primary key to associate with persisted rows.
+    buffered:
+        When ``True``, ``record()`` accumulates rows in memory instead of
+        writing each one immediately; the caller persists them in a single
+        transaction via :meth:`flush` once heavy DB work is done. This keeps
+        cost writes out of the doc-generation window, where a per-call
+        ``INSERT`` opened on a *second* engine loses WAL's single-writer race
+        against the generation writer and stalls for the full ``busy_timeout``
+        (issue #326). Defaults to ``False`` so existing callers that rely on
+        immediate persistence are unaffected; the CLI opts in.
     """
 
     def __init__(
         self,
         session_factory: Any | None = None,
         repo_id: str | None = None,
+        *,
+        buffered: bool = False,
     ) -> None:
         self._session_factory = session_factory
         self._repo_id = repo_id
         self._session_cost: float = 0.0
         self._session_tokens: int = 0
+        self._buffered = buffered
+        # Pending rows when buffered; flushed in one transaction by ``flush``.
+        self._pending: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Properties
@@ -151,46 +193,70 @@ class CostTracker:
         )
 
         if self._session_factory is not None and self._repo_id is not None:
-            await self._persist(
-                model=model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost_usd=cost,
-                operation=operation,
-                file_path=file_path,
-            )
+            row = {
+                "model": model,
+                "operation": operation,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost,
+                "file_path": file_path,
+            }
+            if self._buffered:
+                # Defer the write — flushed in one transaction later, outside the
+                # contended generation window (issue #326).
+                self._pending.append(row)
+            else:
+                await self._persist_rows([row])
 
         return cost
 
-    async def _persist(
-        self,
-        *,
-        model: str,
-        input_tokens: int,
-        output_tokens: int,
-        cost_usd: float,
-        operation: str,
-        file_path: str | None,
-    ) -> None:
-        """Write a row to the ``llm_costs`` table."""
+    async def flush(self) -> int:
+        """Persist any buffered cost rows in a single transaction.
+
+        Best-effort: a contended or failed flush drops the buffered rows (cost
+        telemetry is non-critical) rather than raising into the caller. Safe to
+        call on an in-memory or non-buffered tracker — it is then a no-op.
+        Returns the number of rows persisted.
+        """
+        if not self._pending:
+            return 0
+        rows = self._pending
+        self._pending = []
+        return await self._persist_rows(rows)
+
+    async def _persist_rows(self, rows: list[dict[str, Any]]) -> int:
+        """Write *rows* to the ``llm_costs`` table. Best-effort.
+
+        Returns the number of rows written (0 if the write was dropped on
+        contention or error). A single transaction is used so a buffered flush
+        of hundreds of rows takes one write-lock acquisition, not one per row.
+        """
+        if self._session_factory is None or self._repo_id is None or not rows:
+            return 0
         try:
-            from repowise.core.persistence.models import LlmCost
             from repowise.core.persistence import get_session
+            from repowise.core.persistence.models import LlmCost
 
             async with get_session(self._session_factory) as session:
-                row = LlmCost(
-                    repository_id=self._repo_id,
-                    model=model,
-                    operation=operation,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cost_usd=cost_usd,
-                    file_path=file_path,
+                session.add_all(
+                    [
+                        LlmCost(
+                            repository_id=self._repo_id,
+                            model=r["model"],
+                            operation=r["operation"],
+                            input_tokens=r["input_tokens"],
+                            output_tokens=r["output_tokens"],
+                            cost_usd=r["cost_usd"],
+                            file_path=r["file_path"],
+                        )
+                        for r in rows
+                    ]
                 )
-                session.add(row)
                 await session.commit()
+            return len(rows)
         except Exception as exc:
-            log.warning("cost_tracker.persist_failed", error=str(exc))
+            log.warning("cost_tracker.persist_failed", error=str(exc), dropped=len(rows))
+            return 0
 
     # ------------------------------------------------------------------
     # Querying
@@ -221,8 +287,9 @@ class CostTracker:
 
         try:
             import sqlalchemy as sa
-            from repowise.core.persistence.models import LlmCost
+
             from repowise.core.persistence import get_session
+            from repowise.core.persistence.models import LlmCost
 
             async with get_session(self._session_factory) as session:
                 if group_by == "model":

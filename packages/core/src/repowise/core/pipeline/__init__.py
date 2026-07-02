@@ -11,7 +11,16 @@ Usage::
 """
 
 from .orchestrator import PipelineResult, run_generation, run_pipeline
-from .persist import persist_pipeline_result
+from .persist import (
+    _sweep_stale_generated_pages as sweep_stale_generated_pages,
+)
+from .persist import (
+    persist_analysis,
+    persist_generation,
+    persist_git,
+    persist_ingestion,
+    persist_pipeline_result,
+)
 from .phase_timing import PhaseTimingRecorder
 from .progress import LoggingProgressCallback, ProgressCallback
 from .upgrade import rehydrate_graph_builder
@@ -21,8 +30,13 @@ __all__ = [
     "PhaseTimingRecorder",
     "PipelineResult",
     "ProgressCallback",
+    "persist_analysis",
+    "persist_generation",
+    "persist_git",
+    "persist_ingestion",
     "persist_pipeline_result",
     "rehydrate_graph_builder",
     "run_generation",
     "run_pipeline",
+    "sweep_stale_generated_pages",
 ]

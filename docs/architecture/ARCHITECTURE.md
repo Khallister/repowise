@@ -856,7 +856,8 @@ tracked file, it computes:
   the code evolved this way and are included in generation prompts.
 - **Co-change partners** — files that changed in the same commit >= 3 times, even
   without an import relationship. Reveals hidden structural coupling.
-- **Derived signals** — `is_hotspot` (top 25% churn AND complexity), `is_stable`
+- **Derived signals** — `is_hotspot` (top-quartile decayed churn AND absolute
+  activity floors: >= 3 commits in 90d with real line movement), `is_stable`
   (>10 commits, 0 in 90 days), `churn_percentile` (0.0–1.0)
 
 **Performance targets:**
@@ -1047,7 +1048,7 @@ and supports two transports:
 - **stdio** — for Claude Code, Cursor, Cline (add to their MCP config)
 - **SSE** — for web-based MCP clients (served on port 7338)
 
-### Tools (11 total)
+### Tools (9 total)
 
 | Tool | What it answers | When to call |
 |------|----------------|-------------|
@@ -1055,14 +1056,11 @@ and supports two transports:
 | `get_context(targets, include?)` | Docs, ownership, history, decisions, freshness for files/modules/symbols. Pass multiple targets in one call. | When you need to understand specific code before reading or modifying it. |
 | `get_risk(targets)` | Hotspot score, dependents, co-change partners, risk summary per target. Also returns top 5 global hotspots. | Before modifying files — assess what could break. |
 | `get_why(query?)` | Three modes: NL search over decisions, path-based decisions for a file, no-arg health dashboard. | Before making architectural changes — understand existing intent. |
-| `update_decision_records(action, ...)` | Full CRUD on decision records: create, update, update_status, delete, list, get. | After every coding task — record new decisions and keep existing ones current. |
 | `search_codebase(query)` | Semantic search over the full wiki. Natural language. | When you don't know where something lives. |
 | `get_dependency_path(from, to)` | Connection path between two files/modules in the dependency graph. | When you need to understand how two things are connected. |
 | `get_dead_code` | Dead/unused code findings sorted by confidence and cleanup impact. | Before cleanup tasks. |
-| `get_architecture_diagram` | Mermaid diagram for repo or specific module. | For documentation or presentation. |
 | `get_answer` | One-call RAG: confidence-gated synthesis with cited answers and question cache. | First call on any code question — collapses search → read → reason. |
 | `get_symbol` | Resolve a qualified symbol id to source body, signature, and docstring. | When the question names a specific class, function, or method. |
-| `annotate_file` | Attach human-authored notes to a wiki page — survives re-indexing. | Adding rationale, known issues, or context the LLM shouldn't overwrite. |
 
 ### Auto-generated Config
 
@@ -1205,7 +1203,7 @@ GraphBuilder
 GitIndexer (if git.enabled)
   mines git history → git_metadata table
   computes co-change partners → adds co_changes edges to graph
-  classifies hotspots (top 25% churn + complexity)
+  classifies hotspots (top-quartile decayed churn + absolute activity floors)
   classifies stable files (>10 commits, 0 in 90 days)
        │
        ▼
@@ -1617,7 +1615,7 @@ Key files:
 Full configuration with defaults (`.repowise/config.yaml`):
 
 ```yaml
-provider: anthropic          # anthropic | openai | openrouter | gemini | deepseek | ollama | litellm | mock
+provider: anthropic          # anthropic | openai | openrouter | gemini | deepseek | ollama | litellm | codex_cli | opencode | mock
 model: claude-sonnet-4-5    # passed through to the provider
 embedding_provider: anthropic
 embedding_model: voyage-3

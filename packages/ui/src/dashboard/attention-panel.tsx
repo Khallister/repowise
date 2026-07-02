@@ -10,6 +10,11 @@ import {
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { Badge } from "../ui/badge";
+import { stripMarkdown } from "../lib/format";
+import { fileEntityPath } from "../shared/entity/routes";
+import { AiPromptButton } from "../health/ai-prompt-button";
+import { AiPromptModal } from "../health/ai-prompt-modal";
+import { buildWorkQueueAiPrompt } from "../health/ai-prompt-builder";
 
 export type AttentionItemType =
   | "stale_decision"
@@ -24,6 +29,9 @@ export interface AttentionItem {
   title: string;
   description: string;
   severity: "high" | "medium" | "low";
+  /** What the item points at — a decision id, file path, owner, … Used to
+   *  deep-link straight to the offending entity. */
+  target_id?: string;
   href?: string;
 }
 
@@ -55,19 +63,30 @@ interface AttentionPanelProps {
   linkPrefix?: string;
   /** Initial preview window; expanding the panel reveals all items. */
   previewCount?: number;
+  /** Shown next to the title of the generated work-queue prompt. */
+  repoName?: string;
 }
 
 function getDefaultHref(item: AttentionItem, prefix: string): string {
+  const target = item.target_id;
   switch (item.type) {
     case "stale_decision":
     case "proposed_decision":
-      return `${prefix}/decisions`;
+      // Deep-link to the specific decision when we know which one.
+      return target
+        ? `${prefix}/decisions/${encodeURIComponent(target)}`
+        : `${prefix}/decisions`;
     case "knowledge_silo":
-      return `${prefix}/ownership`;
+      // The silo target is the owning module/path — surface it on the owners
+      // view so the offending area is preselected.
+      return target
+        ? `${prefix}/owners?path=${encodeURIComponent(target)}`
+        : `${prefix}/owners`;
     case "ungoverned_hotspot":
-      return `${prefix}/hotspots`;
+      // Target is the hotspot's file path → open its file entity page.
+      return target ? fileEntityPath(prefix, target) : `${prefix}/code-health?tab=hotspots`;
     case "dead_code":
-      return `${prefix}/dead-code`;
+      return `${prefix}/code-health?tab=dead-code`;
     default:
       return prefix;
   }
@@ -78,9 +97,11 @@ export function AttentionPanel({
   repoId,
   linkPrefix,
   previewCount = 8,
+  repoName,
 }: AttentionPanelProps) {
   const prefix = linkPrefix ?? `/repos/${repoId}`;
   const [expanded, setExpanded] = useState(false);
+  const [promptOpen, setPromptOpen] = useState(false);
   const visible = expanded ? items : items.slice(0, previewCount);
   if (items.length === 0) {
     return (
@@ -95,16 +116,23 @@ export function AttentionPanel({
   }
 
   return (
+    <>
     <Card>
       <CardHeader className="pb-2">
-        <CardTitle className="text-sm flex items-center justify-between">
+        <CardTitle className="text-sm flex items-center justify-between gap-2">
           <span className="flex items-center gap-2">
             <AlertTriangle className="h-4 w-4 text-[var(--color-warning)]" />
             Attention Needed
           </span>
-          <Badge variant="outline" className="text-[10px] h-5 tabular-nums">
-            {items.length}
-          </Badge>
+          <span className="flex items-center gap-2">
+            <AiPromptButton
+              label="Hand queue to AI"
+              onClick={() => setPromptOpen(true)}
+            />
+            <Badge variant="outline" className="text-[10px] h-5 tabular-nums">
+              {items.length}
+            </Badge>
+          </span>
         </CardTitle>
       </CardHeader>
       <CardContent className="pt-0">
@@ -124,13 +152,13 @@ export function AttentionPanel({
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-medium text-[var(--color-text-primary)] truncate group-hover:text-[var(--color-accent-primary)] transition-colors">
-                      {item.title}
+                      {stripMarkdown(item.title)}
                     </span>
                     <span className="text-[10px] text-[var(--color-text-tertiary)] shrink-0">
                       {TYPE_LABELS[item.type]}
                     </span>
                   </div>
-                  <p className="text-[11px] text-[var(--color-text-tertiary)] truncate">
+                  <p className="text-xs text-[var(--color-text-tertiary)] truncate">
                     {item.description}
                   </p>
                 </div>
@@ -141,7 +169,7 @@ export function AttentionPanel({
             <button
               type="button"
               onClick={() => setExpanded((v) => !v)}
-              className="block w-full text-[11px] text-[var(--color-accent-primary)] hover:underline text-center pt-1"
+              className="block w-full text-xs text-[var(--color-accent-primary)] hover:underline text-center pt-1"
             >
               {expanded
                 ? "Show fewer"
@@ -151,5 +179,25 @@ export function AttentionPanel({
         </div>
       </CardContent>
     </Card>
+    <AiPromptModal
+      open={promptOpen}
+      onOpenChange={setPromptOpen}
+      getPrompt={(flavor) =>
+        buildWorkQueueAiPrompt({
+          items: items.map((it) => ({
+            type: it.type,
+            title: it.title,
+            description: it.description,
+            severity: it.severity,
+            target_id: it.target_id ?? null,
+          })),
+          flavor,
+          ...(repoName ? { repoName } : {}),
+        })
+      }
+      title="AI work queue"
+      description="A ready-to-paste prompt that hands your AI agent this repo's Attention Needed backlog as a prioritized worklist."
+    />
+    </>
   );
 }

@@ -5,23 +5,13 @@ import type { OwnerListEntry } from "@repowise-dev/types/owners";
 import { Card } from "../ui/card";
 import { Badge } from "../ui/badge";
 import { cn } from "../lib/cn";
+import { formatRelativeTimeOrNull } from "../lib/format";
 import { OwnerAvatar } from "./owner-avatar";
 
 interface OwnerCardProps {
   owner: OwnerListEntry;
   onSelect?: (owner: OwnerListEntry) => void;
   highlight?: boolean;
-}
-
-function timeAgo(iso: string | null): string {
-  if (!iso) return "—";
-  const ms = Date.now() - new Date(iso).getTime();
-  if (Number.isNaN(ms) || ms < 0) return "—";
-  const d = Math.floor(ms / 86_400_000);
-  if (d < 1) return "today";
-  if (d < 30) return `${d}d ago`;
-  if (d < 365) return `${Math.floor(d / 30)}mo ago`;
-  return `${Math.floor(d / 365)}y ago`;
 }
 
 /**
@@ -52,7 +42,7 @@ export function OwnerCard({ owner, onSelect, highlight }: OwnerCardProps) {
             )}
           </div>
           {owner.email && (
-            <div className="truncate text-[11px] text-[var(--color-text-tertiary)]">
+            <div className="truncate text-xs text-[var(--color-text-tertiary)]">
               {owner.email}
             </div>
           )}
@@ -61,28 +51,28 @@ export function OwnerCard({ owner, onSelect, highlight }: OwnerCardProps) {
             <Stat
               label="Hotspots"
               value={owner.hotspots_owned}
-              icon={<Flame className="h-3 w-3 text-orange-400" />}
+              icon={<Flame className="h-3 w-3 text-[var(--color-warning)]" />}
               tone={owner.hotspots_owned > 0 ? "warn" : undefined}
             />
             <Stat
               label="Bus≤1"
               value={owner.bus_factor_risk_files}
-              icon={<ShieldAlert className="h-3 w-3 text-red-400" />}
+              icon={<ShieldAlert className="h-3 w-3 text-[var(--color-error)]" />}
               tone={owner.bus_factor_risk_files > 0 ? "danger" : undefined}
             />
             <Stat
               label="Dead lines"
               value={owner.dead_code_lines_owned}
-              icon={<Trash2 className="h-3 w-3 text-rose-400" />}
+              icon={<Trash2 className="h-3 w-3 text-[var(--color-text-tertiary)]" />}
               tone={owner.dead_code_lines_owned > 0 ? "muted" : undefined}
             />
           </div>
-          <div className="mt-3 flex items-center justify-between text-[11px] text-[var(--color-text-tertiary)]">
+          <div className="mt-3 flex items-center justify-between text-xs text-[var(--color-text-tertiary)]">
             <span className="flex items-center gap-1">
               <GitCommit className="h-3 w-3" />
               {owner.commit_count_90d} commits / 90d
             </span>
-            <span>last touched {timeAgo(owner.last_commit_at)}</span>
+            <span>last touched {formatRelativeTimeOrNull(owner.last_commit_at)}</span>
           </div>
         </div>
       </div>
@@ -103,11 +93,11 @@ function Stat({
 }) {
   const toneCls =
     tone === "danger"
-      ? "text-red-400"
+      ? "text-[var(--color-error)]"
       : tone === "warn"
-        ? "text-orange-300"
+        ? "text-[var(--color-warning)]"
         : tone === "muted"
-          ? "text-rose-300/70"
+          ? "text-[var(--color-text-tertiary)]"
           : "text-[var(--color-text-primary)]";
   return (
     <div>

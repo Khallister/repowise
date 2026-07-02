@@ -31,8 +31,15 @@ import structlog
 log = structlog.get_logger(__name__)
 
 # Extensions probed in TypeScript module resolution order.
-_TS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
-_INDEX_FILES = ("index.ts", "index.tsx", "index.js", "index.jsx")
+_TS_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx")
+_INDEX_FILES = (
+    "index.ts",
+    "index.tsx",
+    "index.mts",
+    "index.cts",
+    "index.js",
+    "index.jsx",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +80,16 @@ class TsconfigResolver:
     Args:
         repo_path: Absolute path to the repository root.
         path_set: Set of POSIX-relative file paths known to the graph builder.
+        prune_nested_git: Skip nested git repos during config discovery
+            (set False when the pipeline runs with ``--include-submodules``).
     """
 
-    def __init__(self, repo_path: Path, path_set: set[str]) -> None:
+    def __init__(
+        self, repo_path: Path, path_set: set[str], *, prune_nested_git: bool = True
+    ) -> None:
         self._repo_path = repo_path.resolve()
         self._path_set = path_set
+        self._prune_nested_git = prune_nested_git
 
         # directory (absolute) -> ResolvedConfig
         self._dir_to_config: dict[Path, ResolvedConfig] = {}
@@ -143,9 +155,13 @@ class TsconfigResolver:
         # Group candidates by directory, assign priority (lower = higher).
         dir_candidates: dict[Path, list[tuple[int, Path]]] = {}
 
-        for config_file in self._repo_path.rglob("*.json"):
-            if "node_modules" in config_file.parts:
-                continue
+        from repowise.core.fs_walk import iter_glob
+
+        for config_file in iter_glob(
+            self._repo_path,
+            ("tsconfig*.json", "jsconfig.json"),
+            prune_nested_git=self._prune_nested_git,
+        ):
             name = config_file.name
             if name == "tsconfig.json":
                 priority = 0

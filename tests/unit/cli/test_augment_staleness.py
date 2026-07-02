@@ -23,8 +23,18 @@ def repo(tmp_path):
     """A minimal git repo with a `.repowise/state.json`."""
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
-         "commit", "--allow-empty", "-m", "init", "-q"],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+            "-q",
+        ],
         cwd=tmp_path,
         check=True,
     )
@@ -39,16 +49,24 @@ def repo(tmp_path):
 
 
 def _state(repo_path: Path, **fields) -> None:
-    (repo_path / ".repowise" / "state.json").write_text(
-        json.dumps(fields), encoding="utf-8"
-    )
+    (repo_path / ".repowise" / "state.json").write_text(json.dumps(fields), encoding="utf-8")
 
 
 def _commit(repo_path: Path) -> str:
     """Make an empty commit and return the new HEAD."""
     subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
-         "commit", "--allow-empty", "-m", "next", "-q"],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "next",
+            "-q",
+        ],
         cwd=repo_path,
         check=True,
     )
@@ -102,14 +120,19 @@ class TestUpdateLockSuppression:
         _state(repo_path, last_sync_commit=head, docs_enabled=True)
         new_head = _commit(repo_path)
 
+        import os
         import time
 
+        # A live PID: read_update_lock now probes liveness, so a fabricated
+        # dead PID would (correctly) be treated as a crashed update.
         (repo_path / ".repowise" / ".update.lock").write_text(
-            json.dumps({
-                "pid": 999999,
-                "target_commit": new_head,
-                "started_at": time.time(),
-            }),
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "target_commit": new_head,
+                    "started_at": time.time(),
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -117,6 +140,35 @@ class TestUpdateLockSuppression:
         assert msg is not None
         assert "update in background" in msg
         assert "stale" not in msg.lower()
+
+    def test_lock_from_dead_pid_does_not_suppress(self, repo):
+        # A crashed update's leftover lock must NOT suppress the stale
+        # warning for the rest of the 30-min window — the dead owner makes
+        # it stale immediately.
+        import subprocess
+        import sys
+        import time
+
+        repo_path, head = repo
+        _state(repo_path, last_sync_commit=head, docs_enabled=True)
+        _commit(repo_path)
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=30)
+        (repo_path / ".repowise" / ".update.lock").write_text(
+            json.dumps(
+                {
+                    "pid": proc.pid,
+                    "target_commit": "x",
+                    "started_at": time.time(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        msg = _post(repo_path)
+        assert msg is not None
+        assert "stale" in msg.lower()
 
     def test_stale_lock_does_not_suppress(self, repo):
         repo_path, head = repo
@@ -141,14 +193,17 @@ class TestUpdateLockSuppression:
         _state(repo_path, last_sync_commit=head, docs_enabled=True)
         _commit(repo_path)
 
+        import os
         import time
 
         (repo_path / ".repowise" / ".update.lock").write_text(
-            json.dumps({
-                "pid": 1,
-                "target_commit": head,  # old HEAD, not the current one
-                "started_at": time.time(),
-            }),
+            json.dumps(
+                {
+                    "pid": os.getpid(),  # live owner — see liveness probe note above
+                    "target_commit": head,  # old HEAD, not the current one
+                    "started_at": time.time(),
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -218,6 +273,52 @@ class TestPerHeadDedupe:
         _commit(repo_path)  # New HEAD invalidates marker
         msg = _post(repo_path)
         assert msg is not None
+
+
+class TestPowerShellDispatch:
+    """The PowerShell tool surfaces the same stdout/stderr response shape as
+    Bash (captured from real PostToolUse payloads) and must take the same
+    staleness path."""
+
+    def test_powershell_git_commit_warns(self, repo):
+        from repowise.cli.commands.augment_cmd import _handle_post_tool_use
+
+        repo_path, head = repo
+        _state(repo_path, last_sync_commit=head, docs_enabled=True)
+        new_head = _commit(repo_path)
+
+        msg = _handle_post_tool_use(
+            "PowerShell",
+            {"command": "git commit -m 'x'"},
+            # Captured PowerShell tool_response shape — same keys as Bash.
+            {"stdout": "[main 1234abcd] x", "stderr": "", "interrupted": False, "isImage": False},
+            str(repo_path),
+            session_id="s",
+        )
+        assert msg is not None
+        assert "Wiki is stale" in msg
+        assert new_head[:8] in msg
+
+    def test_powershell_failed_command_is_silent(self, repo):
+        from repowise.cli.commands.augment_cmd import _handle_post_tool_use
+
+        repo_path, head = repo
+        _state(repo_path, last_sync_commit=head, docs_enabled=True)
+        _commit(repo_path)
+
+        msg = _handle_post_tool_use(
+            "PowerShell",
+            {"command": "git commit -m 'x'"},
+            {
+                "stdout": "",
+                "stderr": "fatal: nothing to commit",
+                "interrupted": False,
+                "isImage": False,
+            },
+            str(repo_path),
+            session_id="s",
+        )
+        assert msg is None
 
 
 class TestDocsEnabledWording:

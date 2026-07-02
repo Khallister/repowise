@@ -5,7 +5,9 @@ from ..spec import LanguageSpec
 SPEC = LanguageSpec(
     tag="typescript",
     display_name="TypeScript",
-    extensions=frozenset({".ts", ".tsx"}),
+    import_support="full",
+    test_infixes=(".test.", ".spec."),
+    extensions=frozenset({".ts", ".tsx", ".mts", ".cts"}),
     grammar_package="tree_sitter_typescript",
     grammar_loader="language_typescript",
     scm_file="typescript.scm",

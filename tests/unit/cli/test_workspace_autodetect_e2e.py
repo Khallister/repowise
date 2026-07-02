@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 
 from repowise.cli.commands.status_cmd import status_command
@@ -52,12 +51,13 @@ def test_update_from_workspace_root_does_not_create_stray_repowise(
     # spawn a real pipeline, so we intercept _workspace_update.
     called = {}
 
-    def _fake_workspace_update(target, *, dry_run):
+    def _fake_workspace_update(target, *, dry_run, agents_md=None, verbose=False):
         called["target"] = target
         called["dry_run"] = dry_run
+        called["agents_md"] = agents_md
 
     monkeypatch.setattr(
-        "repowise.cli.commands.update_cmd._workspace_update",
+        "repowise.cli.commands.update_cmd.command._workspace_update",
         _fake_workspace_update,
     )
 
@@ -81,7 +81,7 @@ def test_update_from_child_repo_stays_single(tmp_path: Path, monkeypatch):
         called["workspace"] = True
 
     monkeypatch.setattr(
-        "repowise.cli.commands.update_cmd._workspace_update",
+        "repowise.cli.commands.update_cmd.command._workspace_update",
         _fake_workspace_update,
     )
 
@@ -90,7 +90,7 @@ def test_update_from_child_repo_stays_single(tmp_path: Path, monkeypatch):
     # the heavy imports by making get_head_commit return the same SHA so
     # the "Already up to date" branch fires.
     monkeypatch.setattr(
-        "repowise.cli.commands.update_cmd.get_head_commit",
+        "repowise.cli.commands.update_cmd.command.get_head_commit",
         lambda _p: "abc123",
     )
 

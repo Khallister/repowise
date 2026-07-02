@@ -1,25 +1,32 @@
-"""Community-level views: architecture super-graph and community summaries."""
+"""Community-level views: architecture super-graph and community summaries.
+
+The architecture and slice endpoints are thin wrappers over
+:mod:`repowise.server.services.graph_views` so non-HTTP consumers can build
+the same payloads without FastAPI.
+"""
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.persistence import crud
-from repowise.core.persistence.models import GraphEdge, GraphNode
+from repowise.core.persistence.models import GraphNode
 from repowise.server.deps import get_db_session
 from repowise.server.mcp_server._graph_utils import community_cohesion, community_label
 from repowise.server.routers.graph._common import with_repo
-from repowise.server.routers.graph.signals import _EMPTY_SIGNALS, _collect_node_signals
 from repowise.server.schemas import (
-    ArchitectureEdgeResponse,
     ArchitectureGraphResponse,
-    ArchitectureNodeResponse,
     CommunityDetailResponse,
     CommunityMember,
+    CommunitySliceResponse,
     CommunitySummaryItem,
     NeighboringCommunity,
+)
+from repowise.server.services.graph_views import (
+    SLICE_MEMBER_CAP,
+    build_architecture_graph,
+    build_community_slice,
 )
 
 router = APIRouter()
@@ -34,92 +41,25 @@ async def architecture_graph(
     session: AsyncSession = Depends(get_db_session),  # noqa: B008
     _repo: object = Depends(with_repo),
 ) -> ArchitectureGraphResponse:
-    """High-level architecture view: one node per detected community.
+    """High-level architecture view: one node per detected community."""
+    return await build_architecture_graph(session, repo_id, min_members=min_members)
 
-    Edges between communities are weighted by the number of underlying file
-    edges that cross the boundary. Each super-node also carries signal counts
-    (hotspots, dead files, decisions, doc coverage) so the architecture view
-    surfaces health at a glance.
-    """
-    all_nodes = await crud.get_all_file_metrics(session, repo_id)
-    if not all_nodes:
-        return ArchitectureGraphResponse(nodes=[], edges=[])
 
-    # Group file nodes by community
-    buckets: dict[int, list[GraphNode]] = {}
-    node_to_community: dict[str, int] = {}
-    for n in all_nodes:
-        cid = n.community_id if n.community_id is not None else 0
-        buckets.setdefault(cid, []).append(n)
-        node_to_community[n.node_id] = cid
-
-    # Pull cross-link signals once for the whole repo so super-nodes can
-    # aggregate hotspot/dead/decision counts without N round-trips.
-    signals = await _collect_node_signals(session, repo_id, [n.node_id for n in all_nodes])
-
-    arch_nodes: list[ArchitectureNodeResponse] = []
-    for cid, members in buckets.items():
-        if len(members) < min_members:
-            continue
-        top = max(members, key=lambda m: m.pagerank or 0.0)
-        hotspot_count = 0
-        dead_count = 0
-        has_decision = False
-        doc_hits = 0
-        langs: dict[str, int] = {}
-        for m in members:
-            sig = signals.get(m.node_id, _EMPTY_SIGNALS)
-            if sig.is_hotspot:
-                hotspot_count += 1
-            if sig.is_dead:
-                dead_count += 1
-            if sig.has_decision:
-                has_decision = True
-            if sig.has_doc:
-                doc_hits += 1
-            if m.language:
-                langs[m.language] = langs.get(m.language, 0) + 1
-        top_langs = [lang for lang, _ in sorted(langs.items(), key=lambda kv: -kv[1])[:3]]
-        avg_pr = sum(m.pagerank or 0.0 for m in members) / max(len(members), 1)
-
-        arch_nodes.append(
-            ArchitectureNodeResponse(
-                community_id=cid,
-                label=community_label(top),
-                cohesion=community_cohesion(top),
-                member_count=len(members),
-                top_file=top.node_id,
-                avg_pagerank=avg_pr,
-                hotspot_count=hotspot_count,
-                dead_count=dead_count,
-                has_decision=has_decision,
-                doc_coverage_pct=doc_hits / max(len(members), 1),
-                languages=top_langs,
-            )
-        )
-
-    arch_nodes.sort(key=lambda a: -a.member_count)
-    kept_communities = {a.community_id for a in arch_nodes}
-
-    # Collapse cross-community edges
-    edge_result = await session.execute(select(GraphEdge).where(GraphEdge.repository_id == repo_id))
-    edge_counts: dict[tuple[int, int], int] = {}
-    for e in edge_result.scalars():
-        src_c = node_to_community.get(e.source_node_id)
-        tgt_c = node_to_community.get(e.target_node_id)
-        if src_c is None or tgt_c is None or src_c == tgt_c:
-            continue
-        if src_c not in kept_communities or tgt_c not in kept_communities:
-            continue
-        key = (src_c, tgt_c)
-        edge_counts[key] = edge_counts.get(key, 0) + 1
-
-    arch_edges = [
-        ArchitectureEdgeResponse(source=s, target=t, edge_count=c)
-        for (s, t), c in edge_counts.items()
-    ]
-
-    return ArchitectureGraphResponse(nodes=arch_nodes, edges=arch_edges)
+@router.get(
+    "/{repo_id}/communities/{community_id}/slice",
+    response_model=CommunitySliceResponse,
+)
+async def community_slice(
+    repo_id: str,
+    community_id: int,
+    member_limit: int = Query(SLICE_MEMBER_CAP, ge=1, le=600),
+    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+    _repo: object = Depends(with_repo),
+) -> CommunitySliceResponse:
+    """Return a single community's sub-graph for the constellation blossom."""
+    return await build_community_slice(
+        session, repo_id, community_id, member_limit=member_limit
+    )
 
 
 @router.get("/{repo_id}/communities", response_model=list[CommunitySummaryItem])

@@ -12,46 +12,44 @@ work happens here, so this works on hosted backends without a checkout.
 
 from __future__ import annotations
 
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from fastapi import APIRouter, Depends, HTTPException, Query
 from repowise.server.deps import get_db_session, verify_api_key
 from repowise.server.schemas import (
-    ArchEdgeResponse,
     ArchitectureViewResponse,
-    ArchLayerResponse,
-    ArchNodeResponse,
-    ArchTourStepResponse,
     C4ComponentResponse,
     C4ContainerResponse,
-    C4ExternalSystemResponse,
     C4L1Response,
     C4L2Response,
     C4L3Response,
     C4PersonResponse,
     C4RelationResponse,
     C4SystemResponse,
+    ZoomMapResponse,
+    ZoomMetricsResponse,
+    ZoomNodeResponse,
+    ZoomRectResponse,
+    ZoomRelationResponse,
 )
 from repowise.server.services import c4_builder
-from repowise.server.services.c4_builder.architecture import build_architecture_view
+from repowise.server.services.zoom_builder import ZoomMap, build_zoom_map
 from repowise.server.services.c4_builder.mermaid import (
     to_mermaid_l1,
     to_mermaid_l2,
     to_mermaid_l3,
 )
 from repowise.server.services.c4_builder.models import (
-    ArchEdge,
-    ArchitectureView,
-    ArchLayer,
-    ArchNode,
-    ArchTourStep,
     Component,
     Container,
-    ExternalSystemView,
     Person,
     Relation,
     System,
+)
+from repowise.server.services.c4_builder.serialize import (
+    build_architecture_view_response,
+    external_system_response,
 )
 
 router = APIRouter(
@@ -70,7 +68,7 @@ async def get_c4_l1(
     return C4L1Response(
         system=_system(view.system),
         people=[_person(p) for p in view.people],
-        external_systems=[_external(e) for e in view.external_systems],
+        external_systems=[external_system_response(e) for e in view.external_systems],
         relations=[_relation(r) for r in view.relations],
     )
 
@@ -83,7 +81,7 @@ async def get_c4_l2(
     view = await c4_builder.build_l2(session, repo_id)
     return C4L2Response(
         containers=[_container(c) for c in view.containers],
-        external_systems=[_external(e) for e in view.external_systems],
+        external_systems=[external_system_response(e) for e in view.external_systems],
         relations=[_relation(r) for r in view.relations],
     )
 
@@ -100,7 +98,7 @@ async def get_c4_l3(
     return C4L3Response(
         container=_container(view.container),
         components=[_component(c) for c in view.components],
-        external_systems=[_external(e) for e in view.external_systems],
+        external_systems=[external_system_response(e) for e in view.external_systems],
         relations=[_relation(r) for r in view.relations],
     )
 
@@ -150,18 +148,7 @@ def _system(s: System) -> C4SystemResponse:
 
 
 def _person(p: Person) -> C4PersonResponse:
-    return C4PersonResponse(id=p.id, name=p.name, description=p.description)
-
-
-def _external(e: ExternalSystemView) -> C4ExternalSystemResponse:
-    return C4ExternalSystemResponse(
-        id=e.id,
-        name=e.name,
-        display_name=e.display_name,
-        category=e.category,
-        ecosystem=e.ecosystem,
-        version=e.version,
-    )
+    return C4PersonResponse(id=p.id, name=p.name, description=p.description, kind=p.kind)
 
 
 def _container(c: Container) -> C4ContainerResponse:
@@ -195,11 +182,12 @@ def _relation(r: Relation) -> C4RelationResponse:
         label=r.label,
         edge_count=r.edge_count,
         edge_types=list(r.edge_types),
+        coupling=r.coupling,
     )
 
 
 # ---------------------------------------------------------------------------
-# Architecture view endpoint + adapters
+# Architecture view endpoint — thin wrapper over services.c4_builder.serialize
 # ---------------------------------------------------------------------------
 
 
@@ -209,82 +197,88 @@ async def get_architecture_view(
     include_symbols: bool = Query(False, description="Include symbol-level nodes"),
     session: AsyncSession = Depends(get_db_session),
 ) -> ArchitectureViewResponse:
-    view = await build_architecture_view(session, repo_id, include_symbols=include_symbols)
-    return _architecture_view_response(view)
-
-
-def _arch_layer(layer: ArchLayer) -> ArchLayerResponse:
-    return ArchLayerResponse(
-        id=layer.id,
-        name=layer.name,
-        description=layer.description,
-        node_ids=layer.node_ids,
-        file_count=layer.file_count,
-        complexity_distribution=layer.complexity_distribution,
-        health_score=layer.health_score,
+    return await build_architecture_view_response(
+        session, repo_id, include_symbols=include_symbols
     )
 
 
-def _arch_node(n: ArchNode) -> ArchNodeResponse:
-    return ArchNodeResponse(
-        id=n.id,
-        node_type=n.node_type,
-        name=n.name,
-        file_path=n.file_path,
-        line_range=list(n.line_range) if n.line_range else None,
-        summary=n.summary,
-        complexity=n.complexity,
-        tags=n.tags,
-        language=n.language,
-        pagerank=n.pagerank,
-        pagerank_percentile=n.pagerank_percentile,
-        betweenness=n.betweenness,
-        in_degree=n.in_degree,
-        out_degree=n.out_degree,
-        community_id=n.community_id,
-        is_entry_point=n.is_entry_point,
-        is_test=n.is_test,
-        is_hotspot=n.is_hotspot,
-        is_dead=n.is_dead,
-        has_doc=n.has_doc,
-        primary_owner=n.primary_owner,
-        primary_owner_pct=n.primary_owner_pct,
-        bus_factor=n.bus_factor,
-    )
+@router.get("/{repo_id}/zoom-map", response_model=ZoomMapResponse)
+async def get_zoom_map(
+    repo_id: str,
+    max_depth: int | None = Query(
+        None, ge=1, description="Cap levels served below the (focus) root; omit for full"
+    ),
+    focus: str | None = Query(
+        None, description="Node id to scope the served subtree to (lazy drill-down)"
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> ZoomMapResponse:
+    """The continuous-zoom containment tree (system -> layer -> ... -> file).
+
+    Derived on demand from the persisted graph, like the C4 views. ``focus`` +
+    ``max_depth`` let the canvas fetch deeper subtrees lazily for large repos.
+    """
+    zoom = await build_zoom_map(session, repo_id, max_depth=max_depth, focus=focus)
+    return _zoom_response(zoom)
 
 
-def _arch_edge(e: ArchEdge) -> ArchEdgeResponse:
-    return ArchEdgeResponse(
-        source=e.source,
-        target=e.target,
-        edge_type=e.edge_type,
-        direction=e.direction,
-        weight=e.weight,
-        confidence=e.confidence,
-    )
-
-
-def _arch_tour_step(s: ArchTourStep) -> ArchTourStepResponse:
-    return ArchTourStepResponse(
-        order=s.order,
-        title=s.title,
-        description=s.description,
-        node_ids=s.node_ids,
-    )
-
-
-def _architecture_view_response(view: ArchitectureView) -> ArchitectureViewResponse:
-    return ArchitectureViewResponse(
-        project_name=view.project_name,
-        project_description=view.project_description,
-        layers=[_arch_layer(la) for la in view.layers],
-        nodes=[_arch_node(n) for n in view.nodes],
-        edges=[_arch_edge(e) for e in view.edges],
-        tour=[_arch_tour_step(s) for s in view.tour],
-        total_files=view.total_files,
-        total_symbols=view.total_symbols,
-        total_edges=view.total_edges,
-        languages=view.languages,
-        frameworks=view.frameworks,
-        external_systems=[_external(e) for e in view.external_systems],
+def _zoom_response(zoom: ZoomMap) -> ZoomMapResponse:
+    return ZoomMapResponse(
+        root_id=zoom.root_id,
+        project_name=zoom.project_name,
+        total_files=zoom.total_files,
+        max_depth=zoom.max_depth,
+        truncated=zoom.truncated,
+        nodes=[
+            ZoomNodeResponse(
+                id=n.id,
+                parent_id=n.parent_id,
+                level=n.level,
+                kind=n.kind,
+                name=n.name,
+                path=n.path,
+                children=list(n.children),
+                importance=round(n.importance, 4),
+                sibling_rank=n.sibling_rank,
+                metrics=ZoomMetricsResponse(
+                    file_count=n.metrics.file_count,
+                    descendant_count=n.metrics.descendant_count,
+                    hotspot_count=n.metrics.hotspot_count,
+                    dead_count=n.metrics.dead_count,
+                    entry_point_count=n.metrics.entry_point_count,
+                    on_flow_count=n.metrics.on_flow_count,
+                ),
+                layout=(
+                    ZoomRectResponse(
+                        x=round(n.layout.x, 6),
+                        y=round(n.layout.y, 6),
+                        w=round(n.layout.w, 6),
+                        h=round(n.layout.h, 6),
+                    )
+                    if n.layout is not None
+                    else None
+                ),
+                summary=n.summary,
+                language=n.language,
+                is_entry_point=n.is_entry_point,
+                is_hotspot=n.is_hotspot,
+                is_dead=n.is_dead,
+                is_test=n.is_test,
+                on_flow=n.on_flow,
+            )
+            # Stable order so the response is deterministic regardless of the
+            # builder's internal insertion order.
+            for n in sorted(zoom.nodes.values(), key=lambda node: node.id)
+        ],
+        relations=[
+            ZoomRelationResponse(
+                parent_id=r.parent_id,
+                source_id=r.source_id,
+                target_id=r.target_id,
+                label=r.label,
+                edge_count=r.edge_count,
+                coupling=r.coupling,
+            )
+            for r in zoom.relations
+        ],
     )

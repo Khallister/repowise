@@ -61,8 +61,8 @@ describe("TableSection", () => {
 describe("DirectRisksTable", () => {
   it("scales risk_score 0–1 → 0–10", () => {
     render(<DirectRisksTable rows={fixture.direct_risks} />);
-    expect(screen.getByText("8.20")).toBeTruthy();
-    expect(screen.getByText("7.40")).toBeTruthy();
+    expect(screen.getByText("8.2")).toBeTruthy();
+    expect(screen.getByText("7.4")).toBeTruthy();
   });
 });
 
@@ -106,19 +106,22 @@ describe("BlastRadiusSummary", () => {
 });
 
 describe("BlastRadiusResults", () => {
-  it("composes the full results stack", () => {
-    render(<BlastRadiusResults result={fixture} />);
-    expect(screen.getByText("High Risk")).toBeTruthy();
-    // "Direct Risks" / "Co-change Warnings" / "Test Gaps" appear twice
-    // (summary stat label + TableSection title) — use getAllByText.
-    expect(screen.getAllByText("Direct Risks").length).toBe(2);
-    expect(screen.getByText("Transitive Affected Files")).toBeTruthy();
-    expect(screen.getAllByText("Co-change Warnings").length).toBe(2);
-    expect(screen.getByText("Recommended Reviewers")).toBeTruthy();
-    expect(screen.getAllByText("Test Gaps").length).toBe(2);
+  it("composes the risk header, impact map, and collapsible sections", () => {
+    render(<BlastRadiusResults result={fixture} changedFiles={["src/auth/login.py"]} />);
+    // Header band label + gauge score.
+    expect(screen.getByText("High risk")).toBeTruthy();
+    expect(screen.getByText("7.6")).toBeTruthy();
+    // The header tile and the collapsible toggle share the "Direct risks" /
+    // "Test gaps" copy, so each appears more than once.
+    expect(screen.getAllByText("Direct risks").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("Transitive affected files")).toBeTruthy();
+    expect(screen.getByText("Co-change warnings")).toBeTruthy();
+    expect(screen.getByText("Recommended reviewers")).toBeTruthy();
+    expect(screen.getAllByText("Test gaps").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("Impact map")).toBeTruthy();
   });
 
-  it("shows 'None' for empty sections", () => {
+  it("shows an empty impact map when nothing is affected", () => {
     const empty: BlastRadiusResponse = {
       direct_risks: [],
       transitive_affected: [],
@@ -128,7 +131,7 @@ describe("BlastRadiusResults", () => {
       overall_risk_score: 1.5,
     };
     render(<BlastRadiusResults result={empty} />);
-    expect(screen.getAllByText("None").length).toBe(5);
-    expect(screen.getByText("Low Risk")).toBeTruthy();
+    expect(screen.getByText("No downstream impact found")).toBeTruthy();
+    expect(screen.getByText("Low risk")).toBeTruthy();
   });
 });

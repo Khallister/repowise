@@ -16,6 +16,7 @@ Optional ``include`` parameter widens the response:
   - include=["metrics"]   → PageRank, betweenness, percentile ranks
   - include=["community"] → community membership + neighbors
   - include=["decisions"] → full decision records (default returns titles only)
+  - include=["skeleton"]  → body-elided file rendering (signatures + top-PageRank bodies)
 
 This module is the orchestrator; single-target resolution lives in
 ``targets`` and the budget cap in ``truncation``.
@@ -24,12 +25,15 @@ This module is the orchestrator; single-target resolution lives in
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from repowise.core.persistence.database import get_session
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server import _state
+from repowise.server.mcp_server._budget import OmissionCollector, truncate_to_budget
 from repowise.server.mcp_server._helpers import (
+    _get_exclude_spec,
     _get_repo,
     _resolve_repo_context,
     _unsupported_repo_all,
@@ -37,7 +41,8 @@ from repowise.server.mcp_server._helpers import (
 from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._meta import context_hint as _context_hint
 from repowise.server.mcp_server.tool_context.targets import _resolve_one_target
-from repowise.server.mcp_server.tool_context.truncation import _truncate_to_budget
+
+_log = logging.getLogger("repowise.mcp.context")
 
 
 @mcp.tool()
@@ -49,44 +54,35 @@ async def get_context(
 ) -> dict:
     """Triage card for files / modules / symbols — relationships, not source bytes.
 
-    Returns a compact card the agent can use to decide its next move: title,
-    summary, signatures, hotspot bit, top callers, and pointers (decision_record
-    titles, symbol_ids) into the deeper tools. For the actual source body of a
-    symbol, call ``get_symbol("path/to/file.py::Name")`` — it is cheaper than
-    Read and returns bounded bytes with exact line numbers.
-
-    Batch multiple targets in one call. In workspace mode responses are
-    auto-enriched with cross-repo co-change partners and API contract links.
-
-    Include options (everything outside defaults is opt-in):
-      - "full_doc":   full wiki markdown content for the target
-      - "ownership":  primary owner, bus factor, contributor count
-      - "last_change":last commit date and author
-      - "callers":    who calls this symbol (symbol targets only)
-      - "callees":    what this symbol calls (symbol targets only)
-      - "metrics":    PageRank, betweenness centrality, percentile ranks
-      - "community":  architectural community membership + neighbors
-      - "decisions":  full decision records (default returns titles only)
-
-    Example: get_context(["src/auth/service.py", "src/auth/middleware.py"])
-    Example: get_context(["src/auth/service.py::verify_token"], include=["callers"])
+    Returns title, summary, signatures, hotspot bit, decision_record titles,
+    and symbol_ids to pipe into get_symbol (cheaper than Read for bodies).
+    Batch targets in one call. File targets above ~80 lines default to a
+    skeleton (every signature + top-PageRank bodies, with a verified flag —
+    a fraction of Read cost); ``mostly_full`` marks files where a direct
+    Read costs little more.
 
     Args:
-        targets: file paths, module paths, or qualified symbol IDs.
-        include: list of optional data blocks (defaults are always returned).
-        compact: default True (signatures only). False adds structure+imports+docstrings.
+        targets: file paths, module paths, or "path::Symbol" ids.
+        include: opt-in blocks: full_doc | ownership | last_change | callers
+            | callees | metrics | community | decisions | skeleton.
+        compact: default True; False adds structure+imports+docstrings.
         repo: usually omitted.
     """
     if repo == "all":
         return _unsupported_repo_all("get_context")
     ctx = await _resolve_repo_context(repo)
 
-    # Default to docs + freshness when include is omitted. Freshness is
-    # critical for the agent to detect stale index data.  The other blocks
-    # (ownership/last_change/decisions) are 200–500 bytes each and bloat
-    # every subsequent agent turn via cache replay. Callers that want them
-    # must pass include explicitly.
-    include_set = set(include) if include else {"docs", "freshness"}
+    # docs + freshness are ALWAYS returned (the tool contract says
+    # "defaults are always returned"); ``include`` only adds blocks on top.
+    # Freshness is critical for the agent to detect stale index data. The
+    # other blocks (ownership/last_change/decisions) are 200-500 bytes each
+    # and bloat every subsequent agent turn via cache replay. Callers that
+    # want them must pass include explicitly. Building the set this way
+    # also fixes include=["skeleton"] silently dropping the file summary
+    # and freshness card that every other call shape carries.
+    include_set = {"docs", "freshness"} | (set(include) if include else set())
+
+    exclude_spec = _get_exclude_spec(ctx.path)
 
     import time as _time
 
@@ -94,7 +90,12 @@ async def get_context(
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
 
-        results = await asyncio.gather(
+        # return_exceptions=True isolates a single target's failure: one
+        # target raising (e.g. a malformed lookup) must not sink the whole
+        # batch. Any exception is converted below into a per-target error
+        # entry that carries "target", so the comprehension keyed on target
+        # below never KeyErrors.
+        raw_results = await asyncio.gather(
             *[
                 _resolve_one_target(
                     session,
@@ -102,10 +103,31 @@ async def get_context(
                     t,
                     include_set,
                     compact,
+                    exclude_spec=exclude_spec,
+                    repo_root=ctx.path,
                 )
                 for t in targets
-            ]
+            ],
+            return_exceptions=True,
         )
+
+    results: list[dict[str, Any]] = []
+    for t, r in zip(targets, raw_results, strict=True):
+        if isinstance(r, BaseException) and not isinstance(r, Exception):
+            # CancelledError / KeyboardInterrupt / SystemExit must propagate:
+            # converting them to per-target errors would break cooperative
+            # cancellation (a cancelled request would run to completion).
+            raise r
+        if isinstance(r, BaseException):
+            _log.exception("get_context: resolving target %r failed", t, exc_info=r)
+            results.append(
+                {
+                    "target": t,
+                    "error": f"Internal error resolving '{t}': {type(r).__name__}",
+                }
+            )
+        else:
+            results.append(r)
 
     response: dict[str, Any] = {
         "targets": {r["target"]: r for r in results},
@@ -160,5 +182,8 @@ async def get_context(
             if cross_repo:
                 target_data["cross_repo"] = cross_repo
 
-    # Enforce the global token cap. See ``_truncate_to_budget`` for strategy.
-    return _truncate_to_budget(response)
+    # Enforce the global token cap. Anything dropped is persisted via the
+    # collector so a truncated response always carries expandable
+    # ``[repowise#<ref>]`` markers instead of silently losing content.
+    collector = OmissionCollector("get_context", repo_root=ctx.path)
+    return truncate_to_budget(response, collector=collector)

@@ -11,15 +11,20 @@ interface Props {
 }
 
 const STATUS_BADGE: Record<CoordinatorHealth["status"], string> = {
-  ok: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
-  warning: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400",
-  critical: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400",
+  ok: "bg-[var(--color-success)]/10 text-[var(--color-success)]",
+  warning: "bg-[var(--color-warning)]/10 text-[var(--color-warning)]",
+  critical: "bg-[var(--color-error)]/10 text-[var(--color-error)]",
 };
 
-function StatRow({ label, value }: { label: string; value: string }) {
+function StatRow({ label, value, help }: { label: string; value: string; help?: string }) {
   return (
     <div className="flex items-center justify-between py-1.5 border-b border-[var(--color-border)] last:border-0">
-      <span className="text-xs text-[var(--color-text-secondary)]">{label}</span>
+      <span
+        className={`text-xs text-[var(--color-text-secondary)] ${help ? "cursor-help underline decoration-dotted decoration-[var(--color-border-default)] underline-offset-2" : ""}`}
+        title={help}
+      >
+        {label}
+      </span>
       <span className="text-xs font-medium text-[var(--color-text-primary)]">{value}</span>
     </div>
   );
@@ -58,10 +63,30 @@ export function CoordinatorHealthPanel({ repoId, initial }: Props) {
               {data.status}
             </span>
           </div>
-          <StatRow label="SQL Pages" value={fmt(data.sql_pages)} />
-          <StatRow label="Vector Count" value={fmt(data.vector_count)} />
+          <StatRow
+            label="Wiki Pages"
+            value={`${fmt(data.sql_pages)} SQL / ${fmt(data.vector_page_count)} vectors`}
+            help="Generated wiki pages in SQL vs the matching page vectors in the vector store."
+          />
+          <StatRow
+            label="Page Drift"
+            value={fmtPct(data.page_drift_pct)}
+            help="How far the wiki-page count disagrees with the page-vector count. 0% means every page is embedded; high drift usually means an interrupted index — run a sync to reconcile."
+          />
+          <StatRow
+            label="Decisions"
+            value={`${fmt(data.sql_decisions)} SQL / ${fmt(data.vector_decision_count)} vectors`}
+            help="Decision records in SQL vs the matching decision vectors. Decision vectors are counted separately from page vectors."
+          />
+          <StatRow
+            label="Decision Drift"
+            value={fmtPct(data.decision_drift_pct)}
+            help="How far the decision-record count disagrees with the decision-vector count."
+          />
           <StatRow label="Graph Nodes" value={fmt(data.graph_nodes)} />
-          <StatRow label="Drift" value={fmtPct(data.drift_pct)} />
+          {data.detail && (
+            <p className="text-xs text-[var(--color-text-secondary)] pt-1.5">{data.detail}</p>
+          )}
         </>
       ) : (
         <p className="text-xs text-[var(--color-text-secondary)]">
@@ -69,7 +94,7 @@ export function CoordinatorHealthPanel({ repoId, initial }: Props) {
         </p>
       )}
       {error && (
-        <p className="text-xs text-red-500">{error}</p>
+        <p className="text-xs text-[var(--color-error)]">{error}</p>
       )}
       <Button
         variant="outline"

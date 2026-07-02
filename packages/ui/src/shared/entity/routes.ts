@@ -1,5 +1,20 @@
 import type { EntityKind, EntityRef } from "./types";
 
+/** Encode a repo-relative file path for use inside a route, keeping slashes. */
+export function encodeFilePath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/** Canonical file entity page path (relative to the repo link prefix). */
+export function fileEntityPath(prefix: string, filePath: string): string {
+  return `${prefix}/files/${encodeFilePath(filePath)}`;
+}
+
+/** Canonical symbol entity page path (relative to the repo link prefix). */
+export function symbolEntityPath(prefix: string, symbolId: string): string {
+  return `${prefix}/symbols/${encodeURIComponent(symbolId)}`;
+}
+
 /**
  * Resolve the canonical href for an entity. Centralizing this here keeps every
  * link consistent and makes the route map auditable in one place.
@@ -16,19 +31,18 @@ export function resolveEntityHref(ref: EntityRef): string {
 
   switch (kind) {
     case "file":
-      return `/repos/${repoId}/wiki/${encodeURI(id)}`;
+      return fileEntityPath(`/repos/${repoId}`, id);
     case "symbol":
-      return `/repos/${repoId}/symbols?symbol=${encodeURIComponent(id)}`;
+      return symbolEntityPath(`/repos/${repoId}`, id);
     case "decision":
       return `/repos/${repoId}/decisions/${encodeURIComponent(id)}`;
     case "owner":
-      // No dedicated owner page yet — deep-link into the Risk page heatmap.
       return repoId
-        ? `/repos/${repoId}/risk?owner=${encodeURIComponent(id)}`
+        ? `/repos/${repoId}/owners/${encodeURIComponent(id)}`
         : `#owner:${encodeURIComponent(id)}`;
     case "commit":
       return repoId
-        ? `/repos/${repoId}/risk?commit=${encodeURIComponent(id)}`
+        ? `/repos/${repoId}/commits?commit=${encodeURIComponent(id)}`
         : `#commit:${encodeURIComponent(id)}`;
   }
 }

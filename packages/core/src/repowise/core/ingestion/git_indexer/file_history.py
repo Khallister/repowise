@@ -30,8 +30,12 @@ from ._constants import (
     _PR_NUMBER_RE,
     HOTSPOT_HALFLIFE_DAYS,
 )
-from .enrich import detect_original_path, get_blame_ownership, is_significant_commit
-from .function_blame import build_blame_index, ownership_from_blame
+from .enrich import detect_original_path, is_significant_commit
+from .function_blame import (
+    _MIN_COMMITS_FOR_BLAME,
+    build_blame_index,
+    ownership_from_blame,
+)
 from .records import (
     _LOG_FORMAT,
     _RECORD_SEP,
@@ -104,8 +108,25 @@ def new_meta(file_path: str) -> dict[str, Any]:
         # Phase 3 fields
         "original_path": None,
         "merge_commit_count_90d": 0,
+        # Prior-defect history: count of bug-fix commits touching this file in
+        # the trailing PRIOR_DEFECT_WINDOW_DAYS window (anchored to as_of_ts when
+        # set, so T0 benchmark scoring stays leakage-free). Consumed by the
+        # ``prior_defect`` health biomarker; mirrors the benchmark's
+        # prior-defects baseline definition (product == benchmark).
+        "prior_defect_count": 0,
+        # Agent provenance rollup: how much of this file's indexed history is
+        # agent-attributed (local channels only — see agent_provenance module).
+        # agent_authored_pct stays None when the file has no commits at all.
+        "agent_commit_count": 0,
+        "agent_authored_pct": None,
+        "agent_tier_counts_json": "{}",
         # Temporal hotspot score (exponentially decayed churn)
         "temporal_hotspot_score": 0.0,
+        # Change entropy (Hassan HCM) — populated repo-wide by the co-change
+        # walk, percentile by enrich.compute_percentiles. Default 0.0 leaves
+        # the signal silent on the ESSENTIAL tier / files that never co-changed.
+        "change_entropy": 0.0,
+        "change_entropy_pct": 0.0,
     }
 
 
@@ -115,6 +136,7 @@ def _parse_per_file_log(
     *,
     commit_limit: int,
     follow_renames: bool,
+    provenance_classifier: Any | None = None,
 ) -> tuple[list[_CommitRec], str | None]:
     """Run a per-file ``git log --numstat`` and parse it into commit records.
 
@@ -165,6 +187,16 @@ def _parse_per_file_log(
             subject=header["subject"],
             body=header["body"],
         )
+        if provenance_classifier is not None:
+            prov = provenance_classifier.classify(
+                header["author_name"],
+                header["author_email"],
+                header["committer_name"],
+                header["committer_email"],
+                f"{header['subject']}\n{header['body']}",
+            )
+            current.agent = prov.agent
+            current.agent_tier = prov.autonomy_tier
         commits.append(current)
         for line in numstat_lines:
             numstat_parts = line.split("\t")
@@ -193,6 +225,8 @@ def index_file(
     follow_renames: bool,
     include_blame: bool = True,
     precomputed_commits: list[_CommitRec] | None = None,
+    as_of_ts: float | None = None,
+    provenance_classifier: Any | None = None,
 ) -> dict:
     """Index a single file's git history. Runs in executor.
 
@@ -202,8 +236,17 @@ def index_file(
 
     *include_blame* gates the FULL-tier ``git blame`` ownership pass; the
     ESSENTIAL tier sets it False and falls back to commit-author ownership.
+
+    *as_of_ts* anchors the recency windows (90d/30d, age, temporal decay) to a
+    fixed reference time — the timestamp of the repo's most recent commit,
+    supplied by the orchestrator. Anchoring to the repo's own HEAD rather than
+    wall-clock ``now()`` makes indexing **deterministic** (re-indexing the same
+    commit later yields identical windows) and **correct for historical
+    checkouts** (scoring a worktree at an old commit measures the 90 days before
+    *that* commit, not an empty window 6 months in its future). Falls back to
+    ``now()`` when not supplied.
     """
-    now = datetime.now(UTC)
+    now = datetime.fromtimestamp(as_of_ts, tz=UTC) if as_of_ts is not None else datetime.now(UTC)
     ninety_days_ago_ts = (now - timedelta(days=90)).timestamp()
     thirty_days_ago_ts = (now - timedelta(days=30)).timestamp()
 
@@ -218,6 +261,7 @@ def index_file(
             file_path,
             commit_limit=commit_limit,
             follow_renames=follow_renames,
+            provenance_classifier=provenance_classifier,
         )
 
     if not commits:
@@ -238,6 +282,12 @@ def index_file(
         author_counts: Counter[str] = Counter()
         author_emails: dict[str, str] = {}
         recent_author_counts: Counter[str] = Counter()
+        # Per-author commit timestamps so a contributor's "last touched" reflects
+        # *their own* last commit to this file — not the file's last commit by
+        # anyone (which would credit you whenever a co-owner touches a shared
+        # file). Consumed downstream by the owner-profile aggregator.
+        author_last_ts: dict[str, int] = {}
+        author_first_ts: dict[str, int] = {}
 
         for c in commits:
             if c.ts >= ninety_days_ago_ts:
@@ -252,10 +302,29 @@ def index_file(
             author_counts[c.author_name] += 1
             if c.author_name not in author_emails and c.author_email:
                 author_emails[c.author_name] = c.author_email
+            if c.ts > 0:
+                prev_last = author_last_ts.get(c.author_name)
+                if prev_last is None or c.ts > prev_last:
+                    author_last_ts[c.author_name] = c.ts
+                prev_first = author_first_ts.get(c.author_name)
+                if prev_first is None or c.ts < prev_first:
+                    author_first_ts[c.author_name] = c.ts
 
         c90 = meta["commit_count_90d"]
         total_churn = meta["lines_added_90d"] + meta["lines_deleted_90d"]
         meta["avg_commit_size"] = total_churn / c90 if c90 > 0 else 0.0
+
+        # Agent-provenance rollup: share of this file's indexed commits that
+        # are agent-attributed, plus the per-autonomy-tier breakdown. The
+        # per-commit labels were classified once during the walk; this is a
+        # pure count over the already-carried records.
+        agent_commits = [c for c in commits if getattr(c, "agent", None)]
+        meta["agent_commit_count"] = len(agent_commits)
+        meta["agent_authored_pct"] = len(agent_commits) / len(commits)
+        tier_counts: Counter[str] = Counter(
+            str(c.agent_tier) for c in agent_commits if c.agent_tier
+        )
+        meta["agent_tier_counts_json"] = json.dumps(dict(tier_counts))
 
         # Temporal hotspot score: exponentially decayed per-commit churn.
         _ln2 = math.log(2)
@@ -285,13 +354,16 @@ def index_file(
         # full contributor surface for a file.
         top_authors = []
         for name, count in author_counts.most_common(_MAX_TOP_AUTHORS):
-            top_authors.append(
-                {
-                    "name": name,
-                    "email": author_emails.get(name, ""),
-                    "commit_count": count,
-                }
-            )
+            entry: dict[str, Any] = {
+                "name": name,
+                "email": author_emails.get(name, ""),
+                "commit_count": count,
+            }
+            if name in author_last_ts:
+                entry["last_commit_ts"] = author_last_ts[name]
+            if name in author_first_ts:
+                entry["first_commit_ts"] = author_first_ts[name]
+            top_authors.append(entry)
         meta["top_authors_json"] = json.dumps(top_authors)
 
         if top_authors:
@@ -316,6 +388,14 @@ def index_file(
         # primary-owner signal and the in-memory ``BlameIndex`` consumed by
         # ``function_hotspot`` / ``code_age_volatility``. Skipped for large
         # files — git blame is O(lines) and can block the executor thread.
+        #
+        # Files below the function-blame commit floor used to take a second
+        # blame pass through gitpython's ``repo.blame`` just for ownership.
+        # That object-building parse is pure Python, holds the GIL across the
+        # 20-way thread fan-out, and on a large repo MOST files sit below the
+        # floor, so it dominated the FULL git phase. The porcelain parse now
+        # serves ownership for every file; the floor only gates whether the
+        # BlameIndex is retained for the function biomarkers, as before.
         if include_blame:
             try:
                 file_size = (repo_path / file_path).stat().st_size
@@ -324,21 +404,11 @@ def index_file(
                         repo,
                         file_path,
                         repo_path=repo_path,
-                        commit_count_total=meta["commit_count_total"],
                     )
                     if blame_idx.lines:
-                        meta["blame_index"] = blame_idx
+                        if meta["commit_count_total"] >= _MIN_COMMITS_FOR_BLAME:
+                            meta["blame_index"] = blame_idx
                         blame_name, blame_email, blame_pct = ownership_from_blame(blame_idx)
-                        if blame_name:
-                            meta["primary_owner_name"] = blame_name
-                            meta["primary_owner_email"] = blame_email
-                            meta["primary_owner_commit_pct"] = blame_pct
-                    else:
-                        # Below the in-blame commit-count floor — fall back
-                        # to the legacy gitpython ownership computation so we
-                        # don't lose owner data on small files that the
-                        # function biomarkers don't need anyway.
-                        blame_name, blame_email, blame_pct = get_blame_ownership(repo, file_path)
                         if blame_name:
                             meta["primary_owner_name"] = blame_name
                             meta["primary_owner_email"] = blame_email

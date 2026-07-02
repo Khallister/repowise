@@ -10,6 +10,7 @@ from repowise.cli.mcp_config import (
     generate_mcp_config,
     load_existing_config,
     merge_mcp_entry,
+    resolve_repowise_command,
 )
 from repowise.core.workspace.config import find_workspace_root
 
@@ -71,7 +72,11 @@ def register_with_claude_desktop(repo_path: Path) -> Path | None:
         # Claude Desktop not installed
         return None
     target = _resolve_mcp_target(repo_path)
-    entry = generate_mcp_config(target)["mcpServers"]
+    # Per-user config: pin the absolute path of the running install so a
+    # PATH shadow install (conda, old pip, pipx) can't hijack the server.
+    # Refreshed on every re-registration, so a moved venv self-heals on the
+    # next `repowise init`/`update`.
+    entry = generate_mcp_config(target, command=resolve_repowise_command())["mcpServers"]
     return config_path if merge_mcp_entry(config_path, entry) else None
 
 
@@ -86,20 +91,67 @@ def register_with_claude_code(repo_path: Path) -> Path | None:
     """
     settings_path = _claude_code_settings_path()
     target = _resolve_mcp_target(repo_path)
-    entry = generate_mcp_config(target)["mcpServers"]
+    # Per-user config: absolute command, see register_with_claude_desktop.
+    entry = generate_mcp_config(target, command=resolve_repowise_command())["mcpServers"]
     return settings_path if merge_mcp_entry(settings_path, entry) else None
+
+
+def enable_tool_search_in_claude_code() -> Path | None:
+    """Set ``env.ENABLE_TOOL_SEARCH=true`` in ~/.claude/settings.json.
+
+    Claude Code defers MCP tool schemas (loads them on demand via tool search)
+    when this is on, so repowise's tools don't sit in every session's standing
+    context. The behavior is client-default in newer builds but flips off in
+    some configs, so we pin it explicitly. Idempotent and non-destructive: an
+    existing ``ENABLE_TOOL_SEARCH`` value the user set (including a deliberate
+    ``false``) is left untouched, and other ``env`` keys are preserved.
+
+    Returns the settings path when it newly sets the key, else None (already
+    set, or a write failure — both non-fatal to ``init``).
+    """
+    settings_path = _claude_code_settings_path()
+    try:
+        if settings_path.exists():
+            existing = load_existing_config(settings_path)
+        else:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = {}
+        env = existing.get("env")
+        if not isinstance(env, dict):
+            env = {}
+        if "ENABLE_TOOL_SEARCH" in env:
+            return None
+        env["ENABLE_TOOL_SEARCH"] = "true"
+        existing["env"] = env
+        settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        return settings_path
+    except (OSError, ValueError):
+        return None
+
+
+# Current augment PostToolUse matcher. Read/Edit/Write power the distill
+# read-intelligence layer (skeleton nudges + per-file stale-read notices);
+# PowerShell is the Windows Claude Code shell tool (same payload shape as
+# Bash); legacy installs with the narrower matchers below are widened in
+# place.
+_AUGMENT_MATCHER = "Bash|PowerShell|Grep|Glob|Read|Edit|Write"
+_LEGACY_AUGMENT_MATCHERS = (
+    "Bash",
+    "Bash|Grep|Glob",
+    "Bash|Grep|Glob|Read|Edit|Write",
+)
 
 
 def install_claude_code_hooks() -> Path | None:
     """Register PostToolUse hooks in ~/.claude/settings.json.
 
-    PostToolUse detects git staleness and can enrich Grep/Glob results when
-    the hook output has useful extra context. Existing user hooks are preserved.
+    PostToolUse detects git staleness, enriches Grep/Glob results, and emits
+    Read-intelligence notices. Existing user hooks are preserved.
     """
     settings_path = _claude_code_settings_path()
 
     post_hook_entry = {
-        "matcher": "Bash|Grep|Glob",
+        "matcher": _AUGMENT_MATCHER,
         "hooks": [
             {
                 "type": "command",
@@ -119,8 +171,10 @@ def install_claude_code_hooks() -> Path | None:
 
         hooks = existing.setdefault("hooks", {})
 
-        # Drop any pre-existing repowise PreToolUse entry; the current design
-        # routes everything through PostToolUse.
+        # Drop any pre-existing legacy *augment* PreToolUse entry; augment
+        # routes everything through PostToolUse. The distill rewrite hook
+        # (`repowise-rewrite`) is a separate, opt-in PreToolUse entry managed
+        # by install/uninstall_claude_code_rewrite_hook and must be preserved.
         pre_hooks = hooks.setdefault("PreToolUse", [])
         _strip_repowise_pretool(pre_hooks)
         if not pre_hooks:
@@ -136,6 +190,177 @@ def install_claude_code_hooks() -> Path | None:
         return settings_path
     except OSError:
         return None
+
+
+_REWRITE_HOOK_COMMAND = "repowise-rewrite"
+
+# Current rewrite PreToolUse matcher; PowerShell is the Windows Claude Code
+# shell tool. Legacy Bash-only installs are widened in place.
+_REWRITE_MATCHER = "Bash|PowerShell"
+_LEGACY_REWRITE_MATCHERS = ("Bash",)
+
+
+def install_claude_code_rewrite_hook() -> Path | None:
+    """Register the opt-in distill PreToolUse rewrite hook (shell matcher).
+
+    Idempotent; preserves user hooks and the augment PostToolUse entry.
+    Returns the settings path on success, None on failure.
+    """
+    settings_path = _claude_code_settings_path()
+    pre_hook_entry = {
+        "matcher": _REWRITE_MATCHER,
+        "hooks": [
+            {
+                "type": "command",
+                "command": _REWRITE_HOOK_COMMAND,
+                "timeout": 5,
+                "statusMessage": "Distilling command output...",
+            }
+        ],
+    }
+
+    try:
+        if settings_path.exists():
+            existing = load_existing_config(settings_path)
+        else:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = {}
+
+        hooks = existing.setdefault("hooks", {})
+        pre_hooks = hooks.setdefault("PreToolUse", [])
+        changed = _migrate_legacy_rewrite_matcher(pre_hooks)
+        if not _has_rewrite_hook(pre_hooks):
+            pre_hooks.append(pre_hook_entry)
+            changed = True
+        if changed:
+            settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        return settings_path
+    except OSError:
+        return None
+
+
+# Permission allow rules for rewritten commands. A rewrite changes the
+# command string, so the user's existing allowlist entries (e.g.
+# ``Bash(git diff:*)``) stop matching the rewritten ``repowise distill …``
+# and every approved family starts prompting again. One rule per shell tool
+# covers the distill prefix; `repowise distill` runs the wrapped command
+# unchanged, so the rule never widens what a command can do.
+DISTILL_ALLOW_RULES = (
+    "Bash(repowise distill:*)",
+    "PowerShell(repowise distill:*)",
+)
+
+
+def add_claude_code_distill_allow_rules() -> Path | None:
+    """Append the distill allow rules to ``permissions.allow`` (idempotent).
+
+    Returns the settings path on success, None when settings.json exists but
+    can't be read or written. Strictly additive — user rules are untouched.
+    """
+    settings_path = _claude_code_settings_path()
+    try:
+        if settings_path.exists():
+            existing = load_existing_config(settings_path)
+        else:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = {}
+    except Exception:
+        return None
+
+    permissions = existing.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        return None
+    allow = permissions.setdefault("allow", [])
+    if not isinstance(allow, list):
+        return None
+
+    missing = [rule for rule in DISTILL_ALLOW_RULES if rule not in allow]
+    if missing:
+        allow.extend(missing)
+        try:
+            settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            return None
+    return settings_path
+
+
+def _migrate_legacy_rewrite_matcher(hook_list: list) -> bool:
+    """Widen legacy rewrite-hook matchers in place (``Bash`` → current)."""
+    changed = False
+    for entry in hook_list:
+        only_rewrite = entry.get("hooks") and all(_is_rewrite_hook(h) for h in entry["hooks"])
+        if only_rewrite and entry.get("matcher", "") in _LEGACY_REWRITE_MATCHERS:
+            entry["matcher"] = _REWRITE_MATCHER
+            changed = True
+    return changed
+
+
+def uninstall_claude_code_rewrite_hook() -> bool:
+    """Remove the distill rewrite hook; True when something was removed."""
+    settings_path = _claude_code_settings_path()
+    if not settings_path.exists():
+        return False
+    try:
+        existing = load_existing_config(settings_path)
+    except Exception:
+        return False
+
+    hooks = existing.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    pre_hooks = hooks.get("PreToolUse")
+    if not isinstance(pre_hooks, list):
+        return False
+
+    changed = _strip_hooks(pre_hooks, _is_rewrite_hook)
+    if not changed:
+        return False
+    if not pre_hooks:
+        hooks.pop("PreToolUse", None)
+
+    try:
+        settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def claude_code_rewrite_hook_installed() -> bool:
+    """True when the distill rewrite hook is registered in settings.json."""
+    settings_path = _claude_code_settings_path()
+    if not settings_path.exists():
+        return False
+    try:
+        existing = load_existing_config(settings_path)
+    except Exception:
+        return False
+    hooks = existing.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    pre_hooks = hooks.get("PreToolUse")
+    return isinstance(pre_hooks, list) and _has_rewrite_hook(pre_hooks)
+
+
+def _is_rewrite_hook(hook: dict) -> bool:
+    return _REWRITE_HOOK_COMMAND in hook.get("command", "")
+
+
+def _has_rewrite_hook(hook_list: list) -> bool:
+    return any(_is_rewrite_hook(h) for entry in hook_list for h in entry.get("hooks", []))
+
+
+def _strip_hooks(hook_list: list, predicate) -> bool:
+    """Remove hooks matching *predicate* from a hook bucket in place."""
+    changed = False
+    for entry in list(hook_list):
+        kept = [h for h in entry.get("hooks", []) if not predicate(h)]
+        if len(kept) != len(entry.get("hooks", [])):
+            changed = True
+            if kept:
+                entry["hooks"] = kept
+            else:
+                hook_list.remove(entry)
+    return changed
 
 
 def _has_repowise_hook(hook_list: list) -> bool:
@@ -154,17 +379,12 @@ def _is_repowise_hook(hook: dict) -> bool:
 
 
 def _strip_repowise_pretool(hook_list: list) -> bool:
-    """Remove repowise's PreToolUse entry from a hook bucket in place."""
-    changed = False
-    for entry in list(hook_list):
-        kept = [h for h in entry.get("hooks", []) if not _is_repowise_hook(h)]
-        if len(kept) != len(entry.get("hooks", [])):
-            changed = True
-            if kept:
-                entry["hooks"] = kept
-            else:
-                hook_list.remove(entry)
-    return changed
+    """Remove legacy *augment* PreToolUse entries from a hook bucket in place.
+
+    Matches only the augment command names — the opt-in ``repowise-rewrite``
+    PreToolUse hook is intentionally untouched.
+    """
+    return _strip_hooks(hook_list, _is_repowise_hook)
 
 
 def _migrate_legacy_hook(hook_list: list) -> bool:
@@ -178,8 +398,8 @@ def _migrate_legacy_hook(hook_list: list) -> bool:
                 changed = True
         matcher = entry.get("matcher", "")
         only_repowise = entry.get("hooks") and all(_is_repowise_hook(h) for h in entry["hooks"])
-        if only_repowise and matcher == "Bash":
-            entry["matcher"] = "Bash|Grep|Glob"
+        if only_repowise and matcher in _LEGACY_AUGMENT_MATCHERS:
+            entry["matcher"] = _AUGMENT_MATCHER
             changed = True
     return changed
 
@@ -202,10 +422,13 @@ def migrate_claude_code_hooks() -> bool:
     changed = False
 
     pre = hooks.get("PreToolUse")
-    if isinstance(pre, list) and _strip_repowise_pretool(pre):
-        changed = True
-        if not pre:
-            hooks.pop("PreToolUse", None)
+    if isinstance(pre, list):
+        if _strip_repowise_pretool(pre):
+            changed = True
+            if not pre:
+                hooks.pop("PreToolUse", None)
+        if _migrate_legacy_rewrite_matcher(pre):
+            changed = True
 
     post = hooks.get("PostToolUse")
     if isinstance(post, list) and _migrate_legacy_hook(post):

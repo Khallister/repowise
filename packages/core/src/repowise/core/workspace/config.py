@@ -35,6 +35,10 @@ class RepoEntry:
     is_primary: bool = False
     indexed_at: str | None = None  # ISO 8601 timestamp of last index
     last_commit_at_index: str | None = None  # Git SHA at last index
+    # Free-form labels (e.g. "frontend", "tier:edge", "legacy") that group repos
+    # for architecture conformance rules. A rule like ``frontend !-> db`` matches
+    # by tag via ``tag:<name>``; every service node in this repo inherits these.
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"path": self.path, "alias": self.alias}
@@ -44,6 +48,8 @@ class RepoEntry:
             d["indexed_at"] = self.indexed_at
         if self.last_commit_at_index is not None:
             d["last_commit_at_index"] = self.last_commit_at_index
+        if self.tags:
+            d["tags"] = list(self.tags)
         return d
 
     @classmethod
@@ -56,6 +62,7 @@ class RepoEntry:
             is_primary=bool(data.get("is_primary", False)),
             indexed_at=data.get("indexed_at"),
             last_commit_at_index=data.get("last_commit_at_index"),
+            tags=[str(t) for t in data.get("tags", [])],
         )
 
 
@@ -97,6 +104,14 @@ class ContractConfig:
     detect_grpc: bool = True
     detect_topics: bool = True
     manual_links: list[ManualContractLink] = field(default_factory=list)
+    # Map a consumer base token or absolute host to the repo alias it targets,
+    # so a ``fetch(`${API_BASE}/users`)`` whose base resolves to ``backend`` links
+    # to that service as an exact match. Keys are env-var identifiers
+    # (``API_BASE``, ``VITE_API_URL``) or hosts (``api.example.com``).
+    service_bases: dict[str, str] = field(default_factory=dict)
+    # Extra glob patterns (added to the built-in test/spec defaults) whose files
+    # are skipped during contract extraction.
+    exclude_globs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -106,20 +121,83 @@ class ContractConfig:
         }
         if self.manual_links:
             d["manual_links"] = [ml.to_dict() for ml in self.manual_links]
+        if self.service_bases:
+            d["service_bases"] = dict(self.service_bases)
+        if self.exclude_globs:
+            d["exclude_globs"] = list(self.exclude_globs)
         return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ContractConfig:
-        manual = [
-            ManualContractLink.from_dict(ml)
-            for ml in data.get("manual_links", [])
-        ]
+        manual = [ManualContractLink.from_dict(ml) for ml in data.get("manual_links", [])]
         return cls(
             detect_http=bool(data.get("detect_http", True)),
             detect_grpc=bool(data.get("detect_grpc", True)),
             detect_topics=bool(data.get("detect_topics", True)),
             manual_links=manual,
+            service_bases={str(k): str(v) for k, v in data.get("service_bases", {}).items()},
+            exclude_globs=[str(g) for g in data.get("exclude_globs", [])],
         )
+
+
+@dataclass
+class ConformanceRule:
+    """One architecture conformance rule: a dependency *source* may or may not
+    depend on a *target*.
+
+    ``source`` and ``target`` are **matchers** resolved against system-graph
+    service nodes (see :mod:`repowise.core.workspace.conformance`):
+
+    * ``"*"`` — any service
+    * ``"tag:<name>"`` — every service whose repo carries that tag
+    * any other string — a glob matched against the node id, repo alias, and
+      display name (so ``"frontend"`` matches a repo and ``"api::*"`` a service)
+
+    ``allow=False`` (the default) is a *deny* rule: a structural dependency from
+    a matching source to a matching target is a violation. ``allow=True`` is an
+    *exception* that whitelists an otherwise-denied edge (e.g. deny ``* !-> db``
+    but allow ``migrations -> db``).
+    """
+
+    source: str
+    target: str
+    allow: bool = False
+    description: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"source": self.source, "target": self.target}
+        if self.allow:
+            d["allow"] = True
+        if self.description:
+            d["description"] = self.description
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ConformanceRule:
+        if "source" not in data or "target" not in data:
+            raise ValueError(
+                f"ConformanceRule requires 'source' and 'target', got: {sorted(data.keys())}"
+            )
+        return cls(
+            source=str(data["source"]),
+            target=str(data["target"]),
+            allow=bool(data.get("allow", False)),
+            description=str(data.get("description", "")),
+        )
+
+
+@dataclass
+class ConformanceConfig:
+    """Architecture conformance rules for the workspace (Phase 5)."""
+
+    rules: list[ConformanceRule] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"rules": [r.to_dict() for r in self.rules]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ConformanceConfig:
+        return cls(rules=[ConformanceRule.from_dict(r) for r in data.get("rules", [])])
 
 
 @dataclass
@@ -130,6 +208,7 @@ class WorkspaceConfig:
     repos: list[RepoEntry] = field(default_factory=list)
     default_repo: str | None = None
     contracts: ContractConfig = field(default_factory=ContractConfig)
+    conformance: ConformanceConfig = field(default_factory=ConformanceConfig)
 
     # ------------------------------------------------------------------
     # Serialization
@@ -144,12 +223,22 @@ class WorkspaceConfig:
         }
         # Only include contracts section if non-default
         contracts_d = self.contracts.to_dict()
-        if self.contracts.manual_links or not all([
-            self.contracts.detect_http,
-            self.contracts.detect_grpc,
-            self.contracts.detect_topics,
-        ]):
+        if (
+            self.contracts.manual_links
+            or self.contracts.service_bases
+            or self.contracts.exclude_globs
+            or not all(
+                [
+                    self.contracts.detect_http,
+                    self.contracts.detect_grpc,
+                    self.contracts.detect_topics,
+                ]
+            )
+        ):
             d["contracts"] = contracts_d
+        # Only include conformance section when rules are declared.
+        if self.conformance.rules:
+            d["conformance"] = self.conformance.to_dict()
         return d
 
     @classmethod
@@ -163,12 +252,14 @@ class WorkspaceConfig:
             repos.append(RepoEntry.from_dict(entry))
 
         contracts = ContractConfig.from_dict(data.get("contracts", {}))
+        conformance = ConformanceConfig.from_dict(data.get("conformance", {}))
 
         return cls(
             version=version,
             repos=repos,
             default_repo=str(default_repo) if default_repo else None,
             contracts=contracts,
+            conformance=conformance,
         )
 
     def save(self, workspace_root: Path) -> Path:

@@ -11,29 +11,45 @@ export interface WorkspaceGraphNodeData {
   fileCount: number;
   coveragePct: number;
   healthScore: number;
+  healthScoreSource: "canonical" | "derived";
   topLanguage: string;
 }
 
-function healthColor(score: number): string {
-  if (score >= 70) return "#22c55e";
-  if (score >= 40) return "#f59e0b";
-  return "#ef4444";
+export function healthColor(score: number): string {
+  if (score >= 70) return "var(--color-risk-low)";
+  if (score >= 40) return "var(--color-risk-medium)";
+  return "var(--color-risk-high)";
 }
 
-function HealthRing({ score, size = 36 }: { score: number; size?: number }) {
+export function HealthRing({
+  score,
+  source,
+  size = 36,
+}: {
+  score: number;
+  source: "canonical" | "derived";
+  size?: number;
+}) {
   const r = (size - 4) / 2;
   const circ = 2 * Math.PI * r;
   const offset = circ * (1 - score / 100);
   const color = healthColor(score);
+  const label = source === "derived" ? "Estimated health score" : "Health score";
 
   return (
-    <svg width={size} height={size} className="shrink-0">
+    <svg
+      width={size}
+      height={size}
+      className="shrink-0"
+      aria-label={`${label}: ${Math.round(score)}`}
+    >
+      <title>{label}</title>
       <circle
         cx={size / 2}
         cy={size / 2}
         r={r}
         fill="none"
-        stroke="rgba(255,255,255,0.1)"
+        stroke="color-mix(in srgb, var(--color-border-default) 10%, transparent)"
         strokeWidth={3}
       />
       <circle
@@ -57,7 +73,7 @@ function HealthRing({ score, size = 36 }: { score: number; size?: number }) {
         fontSize={10}
         fontWeight={700}
       >
-        {score}
+        {Math.round(score)}
       </text>
     </svg>
   );
@@ -73,7 +89,7 @@ function WorkspaceGraphNodeInner({ data }: NodeProps) {
       style={{
         width: 160,
         minHeight: 100,
-        background: `linear-gradient(135deg, ${langColor}25 0%, rgba(30,41,59,0.95) 60%)`,
+        background: `linear-gradient(135deg, ${langColor}25 0%, color-mix(in srgb, var(--color-bg-surface) 95%, transparent) 60%)`,
         border: `2px solid ${langColor}60`,
         boxShadow: `0 2px 12px rgba(0,0,0,0.3), 0 0 0 1px ${langColor}20`,
         padding: "10px 12px",
@@ -90,7 +106,12 @@ function WorkspaceGraphNodeInner({ data }: NodeProps) {
       </div>
 
       <div className="flex items-center gap-2.5">
-        <HealthRing score={d.healthScore} />
+        <div className="flex flex-col items-center gap-0.5">
+          <HealthRing score={d.healthScore} source={d.healthScoreSource} />
+          <span className="text-[8px] font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">
+            {d.healthScoreSource === "derived" ? "est." : "health"}
+          </span>
+        </div>
         <div className="flex-1 min-w-0 space-y-1">
           <div className="flex items-center gap-1 text-[10px] text-[var(--color-text-secondary)]">
             <FileText className="w-3 h-3 shrink-0" />
@@ -104,7 +125,7 @@ function WorkspaceGraphNodeInner({ data }: NodeProps) {
       </div>
 
       <div
-        className="mt-2 text-[9px] font-medium px-1.5 py-0.5 rounded-full text-center"
+        className="mt-2 text-[10px] font-medium px-1.5 py-0.5 rounded-full text-center"
         style={{
           background: `${langColor}30`,
           color: langColor,

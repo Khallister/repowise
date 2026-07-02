@@ -79,13 +79,13 @@ export function SafeToDeletePile({
   return (
     <div
       className={cn(
-        "rounded-xl border border-rose-500/30 bg-gradient-to-br from-rose-500/10 via-[var(--color-bg-elevated)] to-[var(--color-bg-elevated)]",
-        "p-5 shadow-sm",
+        "rounded-xl border border-[var(--color-error)]/30 bg-gradient-to-br from-[var(--color-error)]/10 via-[var(--color-bg-elevated)] to-[var(--color-bg-elevated)]",
+        "p-5",
         className,
       )}
     >
       <div className="flex items-start gap-4">
-        <div className="rounded-lg bg-rose-500/15 p-2.5 text-rose-400 shrink-0">
+        <div className="rounded-lg bg-[var(--color-error)]/15 p-2.5 text-[var(--color-error)] shrink-0">
           <Trash2 className="h-5 w-5" />
         </div>
         <div className="flex-1 min-w-0">
@@ -93,11 +93,12 @@ export function SafeToDeletePile({
             <span className="text-3xl font-semibold tabular-nums text-[var(--color-text-primary)]">
               {lines.toLocaleString()}
             </span>
-            <span className="text-sm text-[var(--color-text-secondary)]">lines safe to delete</span>
+            <span className="text-sm text-[var(--color-text-secondary)]">lines in cleanup candidates</span>
           </div>
           <p className="mt-1 text-xs text-[var(--color-text-tertiary)]">
-            High-confidence findings across <span className="font-medium">{files}</span> file
-            {files === 1 ? "" : "s"} ({findings.length} finding{findings.length === 1 ? "" : "s"}).
+            High-confidence candidates across <span className="font-medium">{files}</span> file
+            {files === 1 ? "" : "s"} ({findings.length} finding{findings.length === 1 ? "" : "s"}) —
+            {" "}review before deleting.
           </p>
         </div>
         {onPropose && findings.length > 0 && (
@@ -105,8 +106,8 @@ export function SafeToDeletePile({
             type="button"
             onClick={() => onPropose(findings.map((f) => f.id))}
             className={cn(
-              "inline-flex items-center gap-1.5 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-1.5",
-              "text-xs font-medium text-rose-300 transition hover:bg-rose-500/20",
+              "inline-flex items-center gap-1.5 rounded-md border border-[var(--color-error)]/40 bg-[var(--color-error)]/10 px-3 py-1.5",
+              "text-xs font-medium text-[var(--color-error)] transition hover:bg-[var(--color-error)]/20",
             )}
           >
             <Sparkles className="h-3.5 w-3.5" />
@@ -131,7 +132,7 @@ export function SafeToDeletePile({
                   )}
                 >
                   <span
-                    className="font-mono text-[11px] text-[var(--color-text-secondary)] truncate"
+                    className="font-mono text-xs text-[var(--color-text-secondary)] truncate"
                     title={g.file_path}
                   >
                     {g.file_path}
@@ -150,7 +151,7 @@ export function SafeToDeletePile({
             );
           })}
           {moreFiles > 0 && (
-            <li className="px-2 pt-0.5 text-[11px] text-[var(--color-text-tertiary)]">
+            <li className="px-2 pt-0.5 text-xs text-[var(--color-text-tertiary)]">
               +{moreFiles.toLocaleString()} more file{moreFiles === 1 ? "" : "s"} —
               {" "}see findings table below.
             </li>

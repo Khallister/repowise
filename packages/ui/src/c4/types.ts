@@ -8,10 +8,17 @@ export type C4Level = 1 | 2 | 3;
 
 export type C4Category = "framework" | "service" | "tool" | "library";
 
+/** I/O-boundary type of an external dependency (mirrors backend `io_kind`). */
+export type C4IoKind = "db" | "network" | "filesystem" | "subprocess" | "lock";
+
+/** How an L1 actor enters the system (mirrors backend `Person.kind`). */
+export type C4ActorKind = "cli" | "api" | "scheduler" | "developer" | "user";
+
 export interface C4Person {
   id: string;
   name: string;
   description: string;
+  kind: C4ActorKind | string;
 }
 
 export interface C4System {
@@ -27,6 +34,8 @@ export interface C4ExternalSystem {
   category: C4Category | string;
   ecosystem: string;
   version: string | null;
+  /** Boundary type, or null when the dependency isn't in the io_kind table. */
+  io_kind?: C4IoKind | string | null;
 }
 
 export interface C4Container {
@@ -49,12 +58,17 @@ export interface C4Component {
   symbol_count: number;
 }
 
+/** Qualitative coupling strength of a relation (mirrors backend `coupling`). */
+export type C4Coupling = "loose" | "moderate" | "tight";
+
 export interface C4Relation {
   source_id: string;
   target_id: string;
   label: string;
   edge_count: number;
   edge_types: string[];
+  /** loose | moderate | tight; empty on synthetic edges (L1 actor->system). */
+  coupling?: C4Coupling | string;
 }
 
 export interface C4L1 {
@@ -133,6 +147,12 @@ export interface ArchEdge {
   confidence: number;
 }
 
+export interface ArchSubGroup {
+  id: string;
+  name: string;
+  node_ids: string[];
+}
+
 export interface ArchLayer {
   id: string;
   name: string;
@@ -141,13 +161,26 @@ export interface ArchLayer {
   file_count: number;
   complexity_distribution: Record<string, number>;
   health_score: number | null;
+  /** Curated drill-down groups within the layer (empty when uncurated). */
+  sub_groups: ArchSubGroup[];
+  /** Dependency-ordered stacking position (0 = top of the stack). */
+  display_order: number;
 }
+
+export type ArchTourStepKind = "overview" | "code" | "infra" | "";
 
 export interface ArchTourStep {
   order: number;
   title: string;
   description: string;
   node_ids: string[];
+  /** Curated, layer-aware fields (null/empty for legacy LLM tours). */
+  target_path: string | null;
+  layer_id: string | null;
+  reason: string;
+  depth: number | null;
+  kind: ArchTourStepKind;
+  page_type: string | null;
 }
 
 export interface ArchitectureView {
@@ -163,13 +196,16 @@ export interface ArchitectureView {
   languages: string[];
   frameworks: string[];
   external_systems: C4ExternalSystem[];
+  /** Curated, ranked entry points (repo-relative paths; empty when uncurated). */
+  entry_points: string[];
+  entry_candidates: string[];
 }
 
 // ---------------------------------------------------------------------------
 // Architecture store types
 // ---------------------------------------------------------------------------
 
-export type NavigationLevel = "overview" | "layer-detail";
+export type NavigationLevel = "overview" | "layer-groups" | "layer-detail";
 export type Persona = "overview" | "learn" | "deep-dive";
 export type DetailLevel = "file" | "class" | "symbol";
 export type SearchMode = "fuzzy" | "semantic";

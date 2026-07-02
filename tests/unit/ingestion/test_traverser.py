@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from repowise.core.ingestion import traverser as traverser_mod
 from repowise.core.ingestion.traverser import FileTraverser, _detect_language
 
 # ---------------------------------------------------------------------------
@@ -27,6 +28,16 @@ class TestLanguageDetection:
     def test_tsx_extension(self, tmp_path: Path) -> None:
         f = tmp_path / "Comp.tsx"
         f.write_text("<div />")
+        assert _detect_language(f) == "typescript"
+
+    def test_mts_extension(self, tmp_path: Path) -> None:
+        f = tmp_path / "module.mts"
+        f.write_text("export const x = 1;")
+        assert _detect_language(f) == "typescript"
+
+    def test_cts_extension(self, tmp_path: Path) -> None:
+        f = tmp_path / "module.cts"
+        f.write_text("export const x = 1;")
         assert _detect_language(f) == "typescript"
 
     def test_go_extension(self, tmp_path: Path) -> None:
@@ -92,6 +103,40 @@ class TestFileTraverser:
         paths = [f.path for f in traverser.traverse()]
         assert not any("__pycache__" in p for p in paths)
 
+    def test_skips_unity_generated_dirs(self, tmp_path: Path) -> None:
+        (tmp_path / "Assets" / "Scripts").mkdir(parents=True)
+        (tmp_path / "Assets" / "Scripts" / "Game.cs").write_text("class Game {}")
+        (tmp_path / "Library" / "PackageCache").mkdir(parents=True)
+        (tmp_path / "Library" / "PackageCache" / "Fake.cs").write_text("class Fake {}")
+        (tmp_path / "Temp" / "StagingArea").mkdir(parents=True)
+        (tmp_path / "Temp" / "StagingArea" / "Temp.cs").write_text("class TempFile {}")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert "Assets/Scripts/Game.cs" in paths
+        assert not any(p.startswith("Library/") for p in paths)
+        assert not any(p.startswith("Temp/") for p in paths)
+
+    def test_skips_unity_asset_extensions_before_binary_detection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "Assets").mkdir()
+        (tmp_path / "Assets" / "Scene.unity").write_text("%YAML 1.1\n")
+        (tmp_path / "Assets" / "Main.cs").write_text("class Main {}")
+
+        def _fail_binary(_path: Path) -> bool:
+            raise AssertionError("Unity asset hit binary detection")
+
+        def _fail_shebang(_path: Path) -> str:
+            raise AssertionError("Unity asset hit shebang detection")
+
+        monkeypatch.setattr(traverser_mod, "_is_binary", _fail_binary)
+        monkeypatch.setattr(traverser_mod, "_detect_by_shebang", _fail_shebang)
+
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert "Assets/Main.cs" in paths
+        assert "Assets/Scene.unity" not in paths
+
     def test_skips_binary_files(self, tmp_path: Path) -> None:
         binary = tmp_path / "binary.so"
         binary.write_bytes(b"\x00\x01\x02\x03" * 100)
@@ -110,6 +155,23 @@ class TestFileTraverser:
         assert any("app.py" in p for p in paths)
         assert not any("debug.log" in p for p in paths)
         assert not any("secret" in p for p in paths)
+
+    def test_respects_git_info_exclude(self, tmp_path: Path) -> None:
+        # .git/info/exclude is git's local-only ignore file — scratch dirs
+        # excluded there are invisible to git status and must be equally
+        # invisible to the index (they leaked into blast-radius lists).
+        info = tmp_path / ".git" / "info"
+        info.mkdir(parents=True)
+        (info / "exclude").write_text("local-stash/\n*.scratch\n")
+        (tmp_path / "app.py").write_text("pass")
+        (tmp_path / "notes.scratch").write_text("pass")
+        (tmp_path / "local-stash").mkdir()
+        (tmp_path / "local-stash" / "probe.py").write_text("pass")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert any("app.py" in p for p in paths)
+        assert not any("local-stash" in p for p in paths)
+        assert not any("notes.scratch" in p for p in paths)
 
     def test_skips_oversized_files(self, tmp_path: Path) -> None:
         big = tmp_path / "big.py"
@@ -257,6 +319,72 @@ class TestPerDirectoryrepowiseIgnore:
 
 
 # ---------------------------------------------------------------------------
+# Nested (per-directory) .gitignore
+# ---------------------------------------------------------------------------
+
+
+class TestNestedGitignore:
+    """Git reads a ``.gitignore`` in every directory, not just the repo root.
+    A workspace/monorepo package with its own ``.gitignore`` must be honoured.
+    """
+
+    def test_nested_gitignore_excludes_dir(self, tmp_path: Path) -> None:
+        # Mirrors the #341 case: a yarn-workspace `frontend/` with its own
+        # .gitignore excluding generated bundle output.
+        frontend = tmp_path / "frontend"
+        frontend.mkdir()
+        (frontend / ".gitignore").write_text("storybook-static/\n")
+        (frontend / "storybook-static").mkdir()
+        (frontend / "storybook-static" / "bundle.js").write_text("/* minified */")
+        (frontend / "app.ts").write_text("const x = 1;")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert any("app.ts" in p for p in paths)
+        assert not any("storybook-static" in p for p in paths)
+
+    def test_nested_gitignore_excludes_files(self, tmp_path: Path) -> None:
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / ".gitignore").write_text("*.generated.ts\n")
+        (pkg / "real.ts").write_text("const x = 1;")
+        (pkg / "types.generated.ts").write_text("export type T = string;")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert any("real.ts" in p for p in paths)
+        assert not any("types.generated.ts" in p for p in paths)
+
+    def test_nested_gitignore_does_not_affect_sibling_dirs(self, tmp_path: Path) -> None:
+        a = tmp_path / "a"
+        a.mkdir()
+        (a / ".gitignore").write_text("artifacts/\n")
+        (a / "artifacts").mkdir()
+        (a / "artifacts" / "out.py").write_text("pass")
+        b = tmp_path / "b"
+        (b / "artifacts").mkdir(parents=True)
+        (b / "artifacts" / "keep.py").write_text("pass")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert not any("a/artifacts" in p for p in paths)
+        # b/artifacts is not excluded — different directory, no .gitignore there
+        assert any("keep.py" in p for p in paths)
+
+    def test_nested_gitignore_and_repowise_ignore_merge(self, tmp_path: Path) -> None:
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / ".gitignore").write_text("bundles/\n")
+        (pkg / ".repowiseIgnore").write_text("*.snap\n")
+        (pkg / "bundles").mkdir()
+        (pkg / "bundles" / "bundle.js").write_text("// built")
+        (pkg / "comp.tsx").write_text("<div />")
+        (pkg / "comp.snap").write_text("snapshot")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert any("comp.tsx" in p for p in paths)
+        assert not any("bundles" in p for p in paths)
+        assert not any("comp.snap" in p for p in paths)
+
+
+# ---------------------------------------------------------------------------
 # Monorepo detection
 # ---------------------------------------------------------------------------
 
@@ -397,6 +525,60 @@ class TestSubmoduleHandling:
         paths = [f.path for f in traverser.traverse()]
         assert any("libs/foo" in p for p in paths)
 
+    def test_include_submodules_with_initialized_submodule(self, tmp_path: Path) -> None:
+        """An *initialized* submodule carries a `.git` file — the nested-git
+        boundary check must not override the explicit opt-in.
+
+        Regression: ``include_submodules=True`` previously skipped parsing
+        ``.gitmodules`` entirely, so initialized submodules fell through to
+        the nested-git skip and were silently dropped anyway.
+        """
+        (tmp_path / ".gitmodules").write_text(
+            '[submodule "libs/foo"]\n'
+            "    path = libs/foo\n"
+            "    url = https://github.com/example/foo.git\n"
+        )
+        (tmp_path / "libs" / "foo").mkdir(parents=True)
+        (tmp_path / "libs" / "foo" / ".git").write_text("gitdir: ../../.git/modules/libs/foo\n")
+        (tmp_path / "libs" / "foo" / "main.py").write_text("pass")
+        traverser = FileTraverser(tmp_path, include_submodules=True)
+        paths = [f.path for f in traverser.traverse()]
+        assert any("libs/foo/main.py" in p for p in paths)
+        assert traverser.stats.skipped_nested_repo == 0
+
+    def test_initialized_submodule_skipped_by_default(self, tmp_path: Path) -> None:
+        (tmp_path / ".gitmodules").write_text(
+            '[submodule "libs/foo"]\n'
+            "    path = libs/foo\n"
+            "    url = https://github.com/example/foo.git\n"
+        )
+        (tmp_path / "libs" / "foo").mkdir(parents=True)
+        (tmp_path / "libs" / "foo" / ".git").write_text("gitdir: ../../.git/modules/libs/foo\n")
+        (tmp_path / "libs" / "foo" / "main.py").write_text("pass")
+        traverser = FileTraverser(tmp_path)
+        paths = [f.path for f in traverser.traverse()]
+        assert not any("libs/foo" in p for p in paths)
+        assert traverser.stats.skipped_submodule >= 1
+
+    def test_include_submodules_keeps_other_nested_repos_skipped(self, tmp_path: Path) -> None:
+        """The submodule opt-in must not widen to arbitrary nested repos."""
+        (tmp_path / ".gitmodules").write_text(
+            '[submodule "libs/foo"]\n'
+            "    path = libs/foo\n"
+            "    url = https://github.com/example/foo.git\n"
+        )
+        (tmp_path / "libs" / "foo").mkdir(parents=True)
+        (tmp_path / "libs" / "foo" / ".git").write_text("gitdir: ../../.git/modules/libs/foo\n")
+        (tmp_path / "libs" / "foo" / "main.py").write_text("pass")
+        (tmp_path / "sibling_repo").mkdir()
+        (tmp_path / "sibling_repo" / ".git").mkdir()
+        (tmp_path / "sibling_repo" / "inner.py").write_text("pass")
+        traverser = FileTraverser(tmp_path, include_submodules=True)
+        paths = [f.path for f in traverser.traverse()]
+        assert any("libs/foo/main.py" in p for p in paths)
+        assert not any("sibling_repo" in p for p in paths)
+        assert traverser.stats.skipped_nested_repo >= 1
+
     def test_no_gitmodules_file(self, tmp_path: Path) -> None:
         (tmp_path / "app.py").write_text("pass")
         traverser = FileTraverser(tmp_path)
@@ -519,3 +701,47 @@ class TestNestedGitRepoHandling:
 
         assert any("ok.py" in p for p in paths)
         assert not any("vendored" in p for p in paths)
+
+
+# ---------------------------------------------------------------------------
+# Entry-point flag (registry-derived conventions)
+# ---------------------------------------------------------------------------
+
+
+class TestEntryPointFlag:
+    def _flagged(self, tmp_path: Path) -> set[str]:
+        return {f.path for f in FileTraverser(tmp_path).traverse() if f.is_entry_point}
+
+    def test_new_language_conventions_flag_entry_points(self, tmp_path: Path) -> None:
+        files = {
+            "src/Application.kt": "fun main() {}",
+            "config.ru": "run App",
+            "myapp/src/myapp_app.erl": "-module(myapp_app).",
+            "lib/shop/application.ex": "defmodule Shop.Application do\nend",
+            "shop/core.clj": "(defn -main [])",
+            "cli/Program.fs": "[<EntryPoint>]\nlet main argv = 0",
+            "artisan": "#!/usr/bin/env php\n<?php",
+        }
+        for rel, content in files.items():
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        flagged = self._flagged(tmp_path)
+        assert flagged == set(files), flagged
+
+    def test_historical_stem_parity_and_non_entries(self, tmp_path: Path) -> None:
+        files = {
+            "run.py": "print('x')",  # covered by the run stem (dropped pattern)
+            "server.py": "print('x')",
+            "pkg/helper.py": "x = 1",
+            "latest_app.py": "x = 1",  # _app suffix is Erlang-only (*_app.erl)
+        }
+        for rel, content in files.items():
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        flagged = self._flagged(tmp_path)
+        assert "run.py" in flagged
+        assert "server.py" in flagged
+        assert "pkg/helper.py" not in flagged
+        assert "latest_app.py" not in flagged

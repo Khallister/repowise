@@ -109,7 +109,7 @@ export function ChurnVsBusFactorScatter({
 
   return (
     <div className={cn("w-full space-y-2", className)}>
-      <div className="flex items-center justify-between text-[11px] text-[var(--color-text-tertiary)]">
+      <div className="flex items-center justify-between text-xs text-[var(--color-text-tertiary)]">
         <span>
           {points.length} files plotted
         </span>
@@ -117,8 +117,8 @@ export function ChurnVsBusFactorScatter({
           className={cn(
             "inline-flex items-center gap-1 rounded px-1.5 py-0.5 tabular-nums",
             dangerCount > 0
-              ? "bg-red-500/15 text-red-400"
-              : "bg-green-500/15 text-green-400",
+              ? "bg-[var(--color-error)]/15 text-[var(--color-error)]"
+              : "bg-[var(--color-success)]/15 text-[var(--color-success)]",
           )}
         >
           <span className="font-medium">{dangerCount}</span>
@@ -138,7 +138,7 @@ export function ChurnVsBusFactorScatter({
           y={padding.top}
           width={innerW * 0.5}
           height={innerH * 0.5}
-          fill="rgba(244, 63, 94, 0.06)"
+          fill="color-mix(in srgb, var(--color-error) 6%, transparent)"
         />
 
         {/* Axes */}
@@ -214,8 +214,8 @@ export function ChurnVsBusFactorScatter({
           const cx = padding.left + (p._x / 100) * innerW;
           const cy = padding.top + innerH - (p._y / 100) * innerH;
           const fill = p._danger
-            ? "rgba(244,63,94,0.7)"
-            : "rgba(245,158,11,0.45)";
+            ? "color-mix(in srgb, var(--color-error) 70%, transparent)"
+            : "color-mix(in srgb, var(--color-warning) 45%, transparent)";
           return (
             <g key={p.file_path}>
               <circle
@@ -223,7 +223,11 @@ export function ChurnVsBusFactorScatter({
                 cy={cy}
                 r={p._r}
                 fill={fill}
-                stroke={p._danger ? "rgba(244,63,94,0.9)" : "rgba(0,0,0,0.2)"}
+                stroke={
+                  p._danger
+                    ? "color-mix(in srgb, var(--color-error) 90%, transparent)"
+                    : "var(--color-border-default)"
+                }
                 strokeWidth={p._danger ? 1 : 0.5}
                 onClick={onSelect ? () => onSelect(p.file_path) : undefined}
                 style={{ cursor: onSelect ? "pointer" : "default" }}
@@ -244,7 +248,7 @@ export function ChurnVsBusFactorScatter({
             same quadrant. */}
       </svg>
       {dangerPoints.length > 0 && (
-        <ul className="space-y-0.5 text-[11px]">
+        <ul className="space-y-0.5 text-xs">
           {dangerPoints.map((p) => (
             <li
               key={`legend-${p.file_path}`}

@@ -5,7 +5,11 @@
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
-  "files": ["src", "styles"],
+  "files": [
+    "src",
+    "styles",
+    "scripts"
+  ],
   "sideEffects": [
     "./styles/globals.css",
     "**/*.css"
@@ -13,6 +17,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./styles.css": "./styles/globals.css",
+    "./brand": "./src/brand.ts",
     "./graph": "./src/graph/index.ts",
     "./graph/context": "./src/graph/context.ts",
     "./graph/elk-layout": "./src/graph/elk-layout.ts",
@@ -22,12 +27,19 @@
     "./graph/*": "./src/graph/*.tsx",
     "./git": "./src/git/index.ts",
     "./git/*": "./src/git/*.tsx",
+    "./commits": "./src/commits/index.ts",
+    "./commits/*": "./src/commits/*.tsx",
     "./dead-code": "./src/dead-code/index.ts",
     "./dead-code/*": "./src/dead-code/*.tsx",
     "./health": "./src/health/index.ts",
+    "./health/ai-prompt-builder": "./src/health/ai-prompt-builder.ts",
     "./health/*": "./src/health/*.tsx",
+    "./coupling": "./src/coupling/index.ts",
+    "./coupling/*": "./src/coupling/*.tsx",
     "./decisions": "./src/decisions/index.ts",
     "./decisions/*": "./src/decisions/*.tsx",
+    "./files": "./src/files/index.ts",
+    "./files/*": "./src/files/*.tsx",
     "./docs": "./src/docs/index.ts",
     "./docs/doc-nav": "./src/docs/doc-nav.ts",
     "./docs/reader-persona": "./src/docs/reader-persona.ts",
@@ -48,15 +60,24 @@
     "./chat/*": "./src/chat/*.tsx",
     "./dashboard": "./src/dashboard/index.ts",
     "./dashboard/*": "./src/dashboard/*.tsx",
+    "./stats": "./src/stats/index.ts",
+    "./stats/*": "./src/stats/*.tsx",
     "./workspace": "./src/workspace/index.ts",
+    "./workspace/system-map": "./src/workspace/system-map/index.ts",
+    "./workspace/dsm": "./src/workspace/dsm/index.ts",
     "./workspace/*": "./src/workspace/*.tsx",
     "./jobs": "./src/jobs/index.ts",
     "./jobs/*": "./src/jobs/*.tsx",
     "./blast-radius": "./src/blast-radius/index.ts",
     "./blast-radius/*": "./src/blast-radius/*.tsx",
+    "./refactoring": "./src/refactoring/index.ts",
+    "./refactoring/types": "./src/refactoring/types.ts",
+    "./refactoring/*": "./src/refactoring/*.tsx",
     "./c4": "./src/c4/index.ts",
     "./c4/export": "./src/c4/export/index.ts",
     "./c4/*": "./src/c4/*.tsx",
+    "./dependencies": "./src/dependencies/index.ts",
+    "./dependencies/*": "./src/dependencies/*.tsx",
     "./costs": "./src/costs/index.ts",
     "./costs/*": "./src/costs/*.tsx",
     "./security": "./src/security/index.ts",
@@ -67,6 +88,8 @@
     "./settings/*": "./src/settings/*.tsx",
     "./shared": "./src/shared/index.ts",
     "./shared/entity": "./src/shared/entity/index.ts",
+    "./shared/responsive-table": "./src/shared/responsive-table/index.ts",
+    "./shared/virtualized-table": "./src/shared/virtualized-table/index.ts",
     "./shared/context-drawer": "./src/shared/context-drawer/index.ts",
     "./shared/file-card": "./src/shared/file-card/index.ts",
     "./shared/related": "./src/shared/related/index.ts",
@@ -85,9 +108,11 @@
   },
   "scripts": {
     "type-check": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "gates": "bash ./scripts/ui-gates.sh"
   },
   "dependencies": {
+    "@lottiefiles/dotlottie-react": "^0.19.4",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-hover-card": "^1.1.15",
     "@radix-ui/react-label": "^2.1.8",
@@ -102,12 +127,14 @@
     "@radix-ui/react-tooltip": "^1.2.8",
     "@repowise-dev/types": "*",
     "@sigma/edge-curve": "^3.1.0",
+    "@tanstack/react-virtual": "^3.13.12",
     "@xyflow/react": "^12.10.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "d3-force": "^3.0.0",
-    "elkjs": "^0.11.1",
     "d3-hierarchy": "^3.1.2",
+    "d3-shape": "^3.2.0",
+    "elkjs": "^0.11.1",
     "framer-motion": "^11.11.0",
     "fuse.js": "^7.0.0",
     "graphology": "^0.26.0",
@@ -121,23 +148,33 @@
     "remark-gfm": "^4.0.1",
     "shiki": "^4.0.0",
     "sigma": "^3.0.3",
+    "sonner": "^2.0.7",
     "tailwind-merge": "^3.5.0",
     "zustand": "^4.4.0"
   },
   "peerDependencies": {
+    "next-themes": "^0.4.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "swr": "^2.2.5"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.5.0",
     "@testing-library/react": "^16.0.0",
+    "@types/d3-shape": "^3.1.8",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",
     "jsdom": "^25.0.0",
+    "next-themes": "^0.4.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "typescript": "^5.6.0",
     "vitest": "^4.1.5"
+  },
+  "bin": {
+    "repowise-ui-gates": "./scripts/ui-gates.sh",
+    "repowise-ui-no-raw-hex": "./scripts/no-raw-hex-check.sh",
+    "repowise-ui-contrast-check": "./scripts/contrast-check.py"
   }
 }

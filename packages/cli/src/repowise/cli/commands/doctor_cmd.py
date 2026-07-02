@@ -2,35 +2,175 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
+from pathlib import Path as _DoctorPath
+from typing import NamedTuple
+
 import click
 from rich.table import Table
 
-from pathlib import Path as _DoctorPath
-
 from repowise.cli.helpers import (
     console,
+    err_console,
     get_db_url_for_repo,
     get_repowise_dir,
     load_state,
     resolve_command_target,
-    resolve_repo_path,
     run_async,
+    silence_logs_for_machine_output,
 )
 
 
-def _check(name: str, ok: bool, detail: str = "") -> tuple[str, str, str]:
-    status = "[green]OK[/green]" if ok else "[red]FAIL[/red]"
-    return (name, status, detail)
+class DoctorCheck(NamedTuple):
+    name: str
+    ok: bool
+    detail: str = ""
 
 
-def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
-    """Run the standard health checks against one repo. Returns ``True`` if
-    all checks passed.
+def _check(name: str, ok: bool, detail: str = "") -> DoctorCheck:
+    return DoctorCheck(name, ok, detail)
 
-    Extracted so workspace mode can iterate over every repo without
-    duplicating the full check body.
+
+def _status_markup(ok: bool) -> str:
+    return "[green]OK[/green]" if ok else "[red]FAIL[/red]"
+
+
+def _claude_md_stamp_status(repo_path, state: dict) -> tuple[bool, str] | None:
+    """Compare the managed CLAUDE.md "Last indexed" commit to state.json.
+
+    Returns ``(ok, detail)`` or ``None`` to skip the check (no CLAUDE.md, no
+    stamp, or no synced commit yet). After any index/update the stamp and
+    ``state.json``'s ``last_sync_commit`` should agree; a mismatch means
+    editor-file regeneration stopped (e.g. the workspace-update refresh bug or
+    ``editor_files.claude_md`` disabled), so the injected "Last indexed" line is
+    stale and trains agents to distrust the index. Compared against the synced
+    commit, not live HEAD, so being a few commits behind HEAD is not flagged.
     """
-    checks: list[tuple[str, str, str]] = []
+    import re
+
+    claude_md = repo_path / ".claude" / "CLAUDE.md"
+    try:
+        text = claude_md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.search(r"Last indexed:.*?\(commit\s+([0-9a-fA-F]{7,})\)", text)
+    if not m:
+        # No stamp, or a too-short/abbreviated sha we can't compare safely.
+        return None
+    stamp = m.group(1).lower()
+    synced = ((state or {}).get("last_sync_commit") or "").lower()
+    if not synced:
+        return None
+    if synced.startswith(stamp) or stamp.startswith(synced):
+        return (True, f"in sync at {stamp}")
+    return (
+        False,
+        f"stamp {stamp} != index {synced[:8]} — run `repowise update` "
+        "or `repowise claude-md` to refresh",
+    )
+
+
+def _advise_claude_md_stamp(repo_path, state: dict) -> None:
+    """Print an advisory line when the CLAUDE.md stamp lags the index.
+
+    Advisory only (never flips the doctor's pass/fail): a stamp can briefly lag
+    when a commit lands mid-update, which self-heals on the next sync. Skipped
+    entirely when ``editor_files.claude_md`` is disabled, since there is nothing
+    to refresh and the advice would be un-actionable.
+    """
+    from repowise.cli.editor_integrations.claude import _claude_md_enabled
+
+    if not _claude_md_enabled(repo_path):
+        return
+    status = _claude_md_stamp_status(repo_path, state)
+    if status is None:
+        return
+    ok, detail = status
+    if not ok:
+        console.print(f"[yellow]CLAUDE.md stamp drift:[/yellow] {detail}")
+
+
+async def _decision_vector_ids(session, repository_id: str) -> set[str]:
+    """Vector-store ids for this repo's decision records.
+
+    Decisions are co-located in the *page* vector store under the
+    ``decision:<record_id>`` namespace (no separate table). The store therefore
+    legitimately holds page vectors *and* decision vectors, so any SQL↔vector
+    reconciliation must count decisions on the SQL side — otherwise every
+    decision embedding reads as an orphan.
+    """
+    from sqlalchemy import text as _sql_text
+
+    from repowise.core.analysis.decisions.semantic_match import DECISION_VECTOR_PREFIX
+
+    rows = await session.execute(
+        _sql_text("SELECT id FROM decision_records WHERE repository_id = :rid"),
+        {"rid": repository_id},
+    )
+    return {f"{DECISION_VECTOR_PREFIX}{r[0]}" for r in rows}
+
+
+def _print_cli_version_status() -> None:
+    """Print a best-effort CLI update-check line.
+
+    Advisory only: an outdated CLI is informational, not a broken repo, so this
+    never affects doctor's pass/fail outcome and never fails on network errors.
+    Runs once per invocation (the CLI version is global, not per-repo).
+    """
+    try:
+        from repowise.cli.update_check import get_cli_update_check
+
+        check = get_cli_update_check()
+    except Exception:
+        return  # never let the update check break doctor
+
+    # Show the full running command and resolved path verbatim — they can
+    # differ (e.g. a stale shim on PATH vs the venv that launched this process),
+    # and surfacing that mismatch is the point of this row.
+    path_detail = check.resolved_executable or "not on PATH"
+    running = check.running_executable or "?"
+
+    if check.latest_version is None:
+        status = "[green]OK[/green]"
+        detail = (
+            f"current {check.current_version}, could not check latest version, "
+            f"path {path_detail}, running {running}"
+        )
+    elif check.update_available:
+        status = "[yellow]WARN[/yellow]"
+        detail = (
+            f"current {check.current_version}, latest {check.latest_version}, "
+            f"path {path_detail}, running {running}"
+        )
+    else:
+        status = "[green]OK[/green]"
+        detail = f"current {check.current_version} (latest), path {path_detail}, running {running}"
+
+    table = Table(show_header=False, box=None, pad_edge=False)
+    table.add_column(style="cyan")
+    table.add_column()
+    table.add_column()
+    table.add_row("CLI version", status, detail)
+    console.print(table)
+
+    if check.update_available:
+        console.print(f"  [yellow]Update available:[/yellow] {check.suggested_command}")
+        console.print("  [dim]Restart Claude/Codex/Cursor or any MCP client after updating.[/dim]")
+
+
+def _run_repo_checks(
+    repo_path: _DoctorPath, repair: bool, *, fmt: str = "table"
+) -> tuple[bool, list[DoctorCheck]]:
+    """Run the standard health checks against one repo.
+
+    Returns ``(all_ok, checks)``. Extracted so workspace mode can iterate
+    over every repo without duplicating the full check body. When
+    ``fmt != "table"`` the table and advisory lines are not printed (repair
+    is also skipped; callers must not pass ``repair=True`` with a
+    non-table format).
+    """
+    checks: list[DoctorCheck] = []
 
     # 1. Git repository?
     try:
@@ -180,6 +320,14 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
                         return set(), set(), set(), set()
                     pages = await list_pages(session, repo.id, limit=10000)
                     sql_ids = {p.page_id for p in pages}
+                    # The page vector store also holds decision embeddings under
+                    # the "decision:<id>" namespace, so they belong on the SQL
+                    # side of the ORPHAN check (but NOT FTS, which only indexes
+                    # pages). They are deliberately excluded from the MISSING
+                    # check: a decision can legitimately have no vector (empty
+                    # match text, swallowed embed failure) and repair cannot
+                    # re-embed it, so flagging it would be permanent noise.
+                    vector_sql_ids = sql_ids | await _decision_vector_ids(session, repo.id)
 
                 # Check vector store
                 vs_ids: set[str] = set()
@@ -194,7 +342,7 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
                         pass  # LanceDB not available
 
                 m_vec = sql_ids - vs_ids if vs_ids else set()
-                o_vec = vs_ids - sql_ids if vs_ids else set()
+                o_vec = vs_ids - vector_sql_ids if vs_ids else set()
 
                 # Check FTS
                 fts = FullTextSearch(engine)
@@ -234,7 +382,8 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
     coord_drift: float | None = None
     coord_sql_pages: int | None = None
     coord_vector_count: int | None = None
-    coord_graph_nodes: int | None = None
+    coord_drift_color = "white"
+    coord_drift_pct = "N/A"
     if db_ok:
         try:
 
@@ -242,6 +391,7 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
                 from repowise.core.persistence import (
                     create_engine,
                     create_session_factory,
+                    get_repository_by_path,
                     get_session,
                 )
                 from repowise.core.persistence.coordinator import AtomicStorageCoordinator
@@ -267,18 +417,42 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
                     )
                     result = await coord.health_check()
 
+                    # The coordinator's drift compares wiki_pages count against
+                    # the vector count, but the vector store also holds decision
+                    # embeddings ("decision:<id>" namespace). Without counting
+                    # decisions on the SQL side, every decision reads as drift.
+                    # Recompute drift with a decision-aware SQL count so a
+                    # consistent store reports ~0% rather than a false FAIL.
+                    # Count only decisions that actually have a vector: a
+                    # decision can legitimately be unembedded (empty match
+                    # text, swallowed embed failure), and counting it would
+                    # bias drift positive (SQL > Vector) forever.
+                    repo = await get_repository_by_path(session, str(repo_path))
+                    if repo is not None:
+                        dec_ids = await _decision_vector_ids(session, repo.id)
+                        decision_count = len(dec_ids)
+                        if vector_store is not None:
+                            with contextlib.suppress(Exception):
+                                store_ids = await vector_store.list_page_ids()
+                                decision_count = len(dec_ids & store_ids)
+                        sql_pages = result.get("sql_pages")
+                        vector_count = result.get("vector_count")
+                        if sql_pages is not None:
+                            adjusted_sql = sql_pages + decision_count
+                            result["sql_pages"] = adjusted_sql
+                            if vector_count is not None and vector_count != -1:
+                                denom = max(adjusted_sql, 1)
+                                result["drift"] = abs(adjusted_sql - vector_count) / denom
+
                 if vector_store is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         await vector_store.close()
-                    except Exception:
-                        pass
                 await engine.dispose()
                 return result
 
             coord_result = run_async(_check_coordinator())
             coord_sql_pages = coord_result.get("sql_pages")
             coord_vector_count = coord_result.get("vector_count")
-            coord_graph_nodes = coord_result.get("graph_nodes")
             coord_drift = coord_result.get("drift")
 
             drift_pct = f"{coord_drift * 100:.1f}%" if coord_drift is not None else "N/A"
@@ -291,26 +465,50 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
             else:
                 drift_color = "red"
 
-            vec_display = str(coord_vector_count) if coord_vector_count != -1 and coord_vector_count is not None else "unknown"
-            drift_detail = (
-                f"SQL={coord_sql_pages}, Vector={vec_display}, "
-                f"Drift=[{drift_color}]{drift_pct}[/{drift_color}]"
+            vec_display = (
+                str(coord_vector_count)
+                if coord_vector_count != -1 and coord_vector_count is not None
+                else "unknown"
             )
+            drift_detail = f"SQL={coord_sql_pages}, Vector={vec_display}, Drift={drift_pct}"
             coord_ok = coord_drift is None or coord_drift < 0.05
             checks.append(_check("Coordinator drift", coord_ok, drift_detail))
+            coord_drift_color = drift_color
+            coord_drift_pct = drift_pct
         except Exception as exc:
             checks.append(_check("Coordinator drift", True, f"Could not check: {exc}"))
 
-    # Display
+    # 11. Distill — config block, omission store, rewrite hook (advisory)
+    checks.extend(_distill_checks(repo_path))
+
+    all_ok = all(c.ok for c in checks)
+
+    if fmt != "table":
+        return all_ok, checks
+
+    # Display: the "Coordinator drift" row's detail gets its drift
+    # percentage colored here, since that highlight is orthogonal to the
+    # row's own OK/FAIL status.
     table = Table(title=f"repowise Doctor — {repo_path.name}")
     table.add_column("Check", style="cyan")
     table.add_column("Status")
     table.add_column("Detail")
-    for name, status, detail in checks:
-        table.add_row(name, status, detail)
+    for c in checks:
+        detail = c.detail
+        if c.name == "Coordinator drift":
+            detail = detail.replace(
+                f"Drift={coord_drift_pct}",
+                f"Drift=[{coord_drift_color}]{coord_drift_pct}[/{coord_drift_color}]",
+            )
+        table.add_row(c.name, _status_markup(c.ok), detail)
     console.print(table)
 
-    all_ok = all("[green]OK[/green]" in status for _, status, _ in checks)
+    # CLAUDE.md freshness stamp — advisory, never fails the run. The managed
+    # ".claude/CLAUDE.md" block stamps the commit it was generated against; if
+    # editor-file regeneration stops, the stamp freezes while the index moves
+    # on and agents reading the stale "Last indexed" line distrust the tools.
+    _advise_claude_md_stamp(repo_path, state)
+
     if all_ok:
         console.print("[bold green]All checks passed![/bold green]")
     else:
@@ -405,7 +603,82 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
     elif repair and not has_mismatches:
         console.print("[green]Nothing to repair.[/green]")
 
-    return all_ok
+    return all_ok, checks
+
+
+def _distill_checks(repo_path: _DoctorPath) -> list[DoctorCheck]:
+    """Distill feature health: config validity, store sizing, rewrite hook.
+
+    The rewrite hook is opt-in, so its absence is informational, never a
+    failure. Any unexpected error degrades to an advisory OK row — distill
+    problems must not break doctor.
+    """
+    checks: list[DoctorCheck] = []
+
+    # Config block valid?
+    distill_cfg = None
+    try:
+        from repowise.core.repo_config import load_repo_config
+
+        distill_cfg = load_repo_config(repo_path).get("distill")
+        from repowise.core.distill.config import validate_distill_config
+
+        problems = validate_distill_config(distill_cfg)
+        if problems:
+            checks.append(_check("Distill config", False, "; ".join(problems)))
+        else:
+            checks.append(
+                _check("Distill config", True, "valid" if distill_cfg else "defaults (no block)")
+            )
+    except Exception as exc:
+        checks.append(_check("Distill config", True, f"Could not check: {exc}"))
+
+    # Omission store sizing (TTL + cap are pruned opportunistically on write,
+    # so a store far past its cap means pruning is not keeping up).
+    try:
+        from repowise.core.distill.config import omission_store_settings
+
+        _ttl_days, max_mb = omission_store_settings(distill_cfg)
+        db_path = repo_path / ".repowise" / "omissions" / "omissions.db"
+        if not db_path.is_file():
+            checks.append(_check("Omission store", True, "not created yet"))
+        else:
+            size_bytes = db_path.stat().st_size
+            wal = db_path.with_name(db_path.name + "-wal")
+            if wal.is_file():
+                size_bytes += wal.stat().st_size
+            size_mb = size_bytes / (1024 * 1024)
+            ok = size_mb <= max_mb * 1.5  # WAL slack before checkpointing
+            detail = f"{size_mb:.1f} MB (cap {max_mb:g} MB)"
+            if not ok:
+                detail += " — over cap; pruning happens on the next distill write"
+            checks.append(_check("Omission store", ok, detail))
+    except Exception as exc:
+        checks.append(_check("Omission store", True, f"Could not check: {exc}"))
+
+    # Rewrite hook (advisory: strictly opt-in).
+    try:
+        from repowise.cli.agent_adapters.claude_code import ClaudeCodeAdapter
+        from repowise.cli.agent_adapters.codex import CodexAdapter
+
+        surfaces = [("claude-code", ClaudeCodeAdapter())]
+        codex = CodexAdapter()
+        if codex.detect():
+            surfaces.append(("codex", codex))
+        installed_names = [name for name, a in surfaces if a.rewrite_hook_installed()]
+        if installed_names:
+            commands_cfg = distill_cfg.get("commands") if isinstance(distill_cfg, dict) else None
+            opted_out = isinstance(commands_cfg, dict) and commands_cfg.get("enabled") is False
+            detail = ", ".join(installed_names)
+            detail += " (this repo opted out)" if opted_out else ""
+            detail = f"installed: {detail}"
+        else:
+            detail = "not installed (opt-in: repowise hook rewrite install)"
+        checks.append(_check("Distill rewrite hook", True, detail))
+    except Exception as exc:
+        checks.append(_check("Distill rewrite hook", True, f"Could not check: {exc}"))
+
+    return checks
 
 
 @click.command("doctor")
@@ -424,11 +697,20 @@ def _run_repo_checks(repo_path: _DoctorPath, repair: bool) -> bool:
     default=False,
     help="Force single-repo mode even when invoked from a workspace.",
 )
+@click.option(
+    "--format",
+    "fmt",
+    default="table",
+    type=click.Choice(["table", "json"]),
+    help="Output format. json is read-only (incompatible with --repair) and exits "
+    "1 when any check fails.",
+)
 def doctor_command(
     path: str | None,
     repair: bool,
     workspace: bool,
     no_workspace: bool,
+    fmt: str,
 ) -> None:
     """Run health checks on the wiki setup.
 
@@ -436,16 +718,35 @@ def doctor_command(
     workspace mode, runs the full check battery against each indexed repo
     and prints a per-repo table plus a workspace-level summary.
     """
+    if fmt != "table" and repair:
+        raise click.UsageError(
+            "--repair is not supported with --format json (json mode is read-only)."
+        )
+
+    if fmt != "table":
+        silence_logs_for_machine_output()
+
+    status = err_console if fmt != "table" else console
+
     target = resolve_command_target(
         path=path,
         workspace_flag=workspace,
         no_workspace_flag=no_workspace,
     )
-    target.notice(console, command="doctor")
+    target.notice(status, command="doctor")
+
+    if fmt == "table":
+        # Advisory CLI update check, printed once above the repo check table(s).
+        _print_cli_version_status()
 
     if not target.is_workspace:
         assert target.repo_path is not None
-        _run_repo_checks(target.repo_path, repair)
+        all_ok, checks = _run_repo_checks(target.repo_path, repair, fmt=fmt)
+        if fmt != "table":
+            payload = {"ok": all_ok, "checks": [c._asdict() for c in checks]}
+            click.echo(json.dumps(payload, indent=2))
+            if not all_ok:
+                raise SystemExit(1)
         return
 
     # Workspace mode — iterate over every entry, run workspace-level
@@ -455,10 +756,11 @@ def doctor_command(
     ws_root = target.ws_root
     ws_config = target.ws_config
 
-    ws_issues = _run_workspace_checks(ws_root, ws_config, repair=repair)
+    ws_issues = _run_workspace_checks(ws_root, ws_config, repair=repair, fmt=fmt)
 
     overall_ok = True
     not_indexed: list[str] = []
+    all_checks: list[DoctorCheck] = []
     for entry in ws_config.repos:
         abs_path = (ws_root / entry.path).resolve()
         if not abs_path.is_dir():
@@ -466,23 +768,41 @@ def doctor_command(
         if not (abs_path / ".repowise").is_dir():
             not_indexed.append(entry.alias)
             continue
-        console.print()
-        console.print(
-            f"[bold]── {entry.alias}[/bold]  "
-            f"[dim]({entry.path})[/dim]"
-            + ("  [bold cyan](primary)[/bold cyan]" if entry.alias == ws_config.default_repo else "")
-        )
-        ok = _run_repo_checks(abs_path, repair)
+        if fmt == "table":
+            console.print()
+            console.print(
+                f"[bold]── {entry.alias}[/bold]  "
+                f"[dim]({entry.path})[/dim]"
+                + (
+                    "  [bold cyan](primary)[/bold cyan]"
+                    if entry.alias == ws_config.default_repo
+                    else ""
+                )
+            )
+        ok, checks = _run_repo_checks(abs_path, repair, fmt=fmt)
         overall_ok = overall_ok and ok
+        all_checks.extend(DoctorCheck(f"{entry.alias}: {c.name}", c.ok, c.detail) for c in checks)
+
+    if fmt != "table":
+        all_ok = overall_ok and not ws_issues and not not_indexed
+        payload = {
+            "ok": all_ok,
+            "checks": [c._asdict() for c in all_checks],
+            "workspace": {
+                "checked": True,
+                "issues": list(ws_issues),
+                "not_indexed": not_indexed,
+            },
+        }
+        click.echo(json.dumps(payload, indent=2))
+        if not all_ok:
+            raise SystemExit(1)
+        return
 
     console.print()
     if not_indexed:
-        console.print(
-            f"[yellow]Not indexed:[/yellow] {', '.join(not_indexed)}"
-        )
-        console.print(
-            "  Run [bold]repowise update --workspace[/bold] to index them."
-        )
+        console.print(f"[yellow]Not indexed:[/yellow] {', '.join(not_indexed)}")
+        console.print("  Run [bold]repowise update --workspace[/bold] to index them.")
     if ws_issues and not repair:
         console.print(
             f"[yellow]{len(ws_issues)} workspace-level issue(s); "
@@ -503,6 +823,7 @@ def _run_workspace_checks(
     ws_config,
     *,
     repair: bool,
+    fmt: str = "table",
 ) -> list[str]:
     """Run workspace-level validation. Returns a list of issue strings.
 
@@ -512,7 +833,8 @@ def _run_workspace_checks(
         each repo's ``.repowise/state.json``.
       - MCP server registration (best-effort detection in claude config).
       - ``--repair``: rebuild missing ``state.json``, drop dead workspace
-        entries (with a notice).
+        entries (with a notice). Skipped when ``fmt != "table"``; callers
+        must not pass ``repair=True`` with a non-table format.
     """
     from repowise.core.workspace.update import (
         read_state_commit,
@@ -540,51 +862,57 @@ def _run_workspace_checks(
         disk_commit = read_state_commit(abs_path)
         cfg_commit = entry.last_commit_at_index
         if disk_commit and cfg_commit and disk_commit != cfg_commit:
-            rows.append((
-                entry.alias,
-                "[yellow]DRIFT[/yellow]",
-                f"config={cfg_commit[:8]}, state.json={disk_commit[:8]}",
-            ))
+            rows.append(
+                (
+                    entry.alias,
+                    "[yellow]DRIFT[/yellow]",
+                    f"config={cfg_commit[:8]}, state.json={disk_commit[:8]}",
+                )
+            )
             issues.append(f"{entry.alias}: workspace config / state.json drift")
         elif disk_commit and not cfg_commit:
-            rows.append((
-                entry.alias,
-                "[yellow]DRIFT[/yellow]",
-                f"workspace config missing last_commit_at_index (state.json has {disk_commit[:8]})",
-            ))
+            rows.append(
+                (
+                    entry.alias,
+                    "[yellow]DRIFT[/yellow]",
+                    f"workspace config missing last_commit_at_index (state.json has {disk_commit[:8]})",
+                )
+            )
             issues.append(f"{entry.alias}: workspace config missing commit pointer")
         elif (abs_path / ".repowise").is_dir() and not disk_commit:
-            rows.append((
-                entry.alias, "[yellow]WARN[/yellow]",
-                "state.json missing or empty (run `repowise update`)",
-            ))
+            rows.append(
+                (
+                    entry.alias,
+                    "[yellow]WARN[/yellow]",
+                    "state.json missing or empty (run `repowise update`)",
+                )
+            )
             issues.append(f"{entry.alias}: missing state.json")
         else:
             rows.append((entry.alias, "[green]OK[/green]", entry.path))
 
-    table = Table(title="repowise Workspace Doctor")
-    table.add_column("Repo", style="cyan")
-    table.add_column("Status")
-    table.add_column("Detail")
-    for r in rows:
-        table.add_row(*r)
-    console.print(table)
+    if fmt == "table":
+        table = Table(title="repowise Workspace Doctor")
+        table.add_column("Repo", style="cyan")
+        table.add_column("Status")
+        table.add_column("Detail")
+        for r in rows:
+            table.add_row(*r)
+        console.print(table)
 
-    # MCP server registration — best-effort, advisory only.
-    _check_mcp_registered(ws_root)
+        # MCP server registration: best-effort, advisory only.
+        _check_mcp_registered(ws_root)
 
     # --repair: sync the workspace config from disk and drop dead entries.
     if repair:
         changed = sync_workspace_state_from_disk(ws_root, ws_config)
         if changed:
             console.print(
-                f"[green]Repaired workspace config from disk for:[/green] "
-                f"{', '.join(changed)}"
+                f"[green]Repaired workspace config from disk for:[/green] {', '.join(changed)}"
             )
         if dead_entries:
             console.print(
-                f"[yellow]Removing dead workspace entries:[/yellow] "
-                f"{', '.join(dead_entries)}"
+                f"[yellow]Removing dead workspace entries:[/yellow] {', '.join(dead_entries)}"
             )
             for alias in dead_entries:
                 ws_config.remove_repo(alias)
@@ -611,11 +939,13 @@ def _check_mcp_registered(ws_root: _DoctorPath) -> None:
     if appdata:
         candidates.append(_DoctorPath(appdata) / "Claude" / "claude_desktop_config.json")
     home = _DoctorPath.home()
-    candidates.extend([
-        home / ".claude" / "claude_desktop_config.json",
-        home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json",
-        home / ".config" / "Claude" / "claude_desktop_config.json",
-    ])
+    candidates.extend(
+        [
+            home / ".claude" / "claude_desktop_config.json",
+            home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json",
+            home / ".config" / "Claude" / "claude_desktop_config.json",
+        ]
+    )
 
     found_paths: list[str] = []
     for cfg in candidates:
@@ -633,9 +963,7 @@ def _check_mcp_registered(ws_root: _DoctorPath) -> None:
                 found_paths.append(f"{cfg.name}:{name}")
 
     if found_paths:
-        console.print(
-            f"  [dim]MCP: registered ({', '.join(found_paths)})[/dim]"
-        )
+        console.print(f"  [dim]MCP: registered ({', '.join(found_paths)})[/dim]")
     else:
         console.print(
             "  [dim]MCP: no claude_desktop_config.json entry found — run "

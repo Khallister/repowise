@@ -8,10 +8,19 @@ import { Input } from "../ui/input";
 import { EmptyState } from "../shared/empty-state";
 import { ResultsFooter } from "../shared/results-footer";
 import { RowActions } from "../shared/row-actions";
+import { AiPromptButton } from "../health/ai-prompt-button";
 import { ChurnBar } from "./churn-bar";
 import { formatLOC } from "../lib/format";
 import { cn } from "../lib/cn";
+import { useVirtualRows } from "../shared/virtualized-table";
 import type { Hotspot } from "@repowise-dev/types/git";
+
+/**
+ * Collapsed main-row height (px), used as the initial virtualization estimate.
+ * Real heights — including expanded detail rows — are measured at runtime via
+ * `measureElement`, so this only affects the first paint and off-screen spacers.
+ */
+const ESTIMATED_ROW_HEIGHT = 44;
 
 interface HotspotTableProps {
   hotspots: Hotspot[];
@@ -40,6 +49,8 @@ interface HotspotTableProps {
    * The host owns data-fetching and renders the panel body.
    */
   renderExpandedRow?: (hotspot: Hotspot) => React.ReactNode;
+  /** When set, each row shows an "AI stabilize" action that calls this. */
+  onGeneratePrompt?: (hotspot: Hotspot) => void;
 }
 
 type Filter = "all" | "hot" | "risk" | "accelerating";
@@ -68,6 +79,7 @@ export function HotspotTable({
   loadingMore,
   onLoadMore,
   renderExpandedRow,
+  onGeneratePrompt,
 }: HotspotTableProps) {
   const expandable = !!renderExpandedRow;
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
@@ -133,6 +145,36 @@ export function HotspotTable({
     return items;
   }, [hotspots, search, filter, sortKey, sortDir]);
 
+  // Memoize the filter chips' counts so the three full `hotspots` scans only
+  // run when the dataset changes, not on every keystroke / sort / expand.
+  const filters: { key: Filter; label: string; count: number }[] = useMemo(
+    () => [
+      { key: "all", label: "All", count: hotspots.length },
+      { key: "hot", label: "Hot", count: hotspots.filter((h) => h.is_hotspot).length },
+      { key: "risk", label: "Bus factor risk", count: hotspots.filter((h) => h.bus_factor <= 1).length },
+      { key: "accelerating", label: "Accelerating", count: hotspots.filter((h) => h.commit_count_30d * 3 > h.commit_count_90d).length },
+    ],
+    [hotspots],
+  );
+
+  // Window the tbody rows. Rows are variable-height (an expanded row adds a
+  // second <tr>), so we drive the windowing with the lower-level hook and let
+  // it MEASURE real heights via `measureElement`. To capture the *combined*
+  // height of a logical row (main <tr> + optional expanded <tr>) within valid
+  // table semantics, each logical row is rendered as its own <tbody> — a
+  // <table> may contain multiple <tbody>s — and the measured/`data-index`d
+  // element is that <tbody>, so an expanded row's full height is tracked.
+  const {
+    scrollRef,
+    virtualRows,
+    paddingTop,
+    paddingBottom,
+    measureElement,
+  } = useVirtualRows({
+    count: filtered.length,
+    estimateSize: ESTIMATED_ROW_HEIGHT,
+  });
+
   if (hotspots.length === 0) {
     return (
       <EmptyState
@@ -141,13 +183,6 @@ export function HotspotTable({
       />
     );
   }
-
-  const filters: { key: Filter; label: string; count: number }[] = [
-    { key: "all", label: "All", count: hotspots.length },
-    { key: "hot", label: "Hot", count: hotspots.filter((h) => h.is_hotspot).length },
-    { key: "risk", label: "Bus factor risk", count: hotspots.filter((h) => h.bus_factor <= 1).length },
-    { key: "accelerating", label: "Accelerating", count: hotspots.filter((h) => h.commit_count_30d * 3 > h.commit_count_90d).length },
-  ];
 
   return (
     <div className="space-y-3">
@@ -183,21 +218,25 @@ export function HotspotTable({
       {filtered.length === 0 ? (
         <EmptyState title="No matches" description="Try adjusting your search or filters." />
       ) : (
-        <div className="rounded-lg border border-[var(--color-border-default)] overflow-x-auto">
+        <div
+          ref={scrollRef}
+          className="border border-[var(--color-border-default)] overflow-auto"
+          style={{ maxHeight: 600 }}
+        >
           <table className="w-full min-w-[760px] text-sm">
-            <thead className="sticky top-0 z-10 bg-[var(--color-bg-elevated)]">
-              <tr className="border-b border-[var(--color-border-default)] bg-[var(--color-bg-elevated)]">
+            <thead className="sticky top-0 z-10 bg-[var(--color-bg-surface)]">
+              <tr className="border-b border-[var(--color-border-default)] bg-[var(--color-bg-surface)]">
                 {expandable && <th className="w-6 px-1" aria-hidden="true" />}
-                <th className="px-3 py-2.5 text-left text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-8">
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-8">
                   #
                 </th>
-                <th className="px-3 py-2.5 text-left text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
                   File
                 </th>
                 <th
                   scope="col"
                   aria-sort={ariaSortFor("commits", sortKey, sortDir)}
-                  className="px-3 py-2.5 text-right text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-24 cursor-pointer select-none hover:text-[var(--color-text-secondary)]"
+                  className="px-3 py-2.5 text-right text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-24 cursor-pointer select-none hover:text-[var(--color-text-secondary)]"
                   onClick={() => handleSort("commits")}
                 >
                   Commits 90d<SortIcon column="commits" sortKey={sortKey} sortDir={sortDir} />
@@ -205,7 +244,7 @@ export function HotspotTable({
                 <th
                   scope="col"
                   aria-sort={ariaSortFor("churn", sortKey, sortDir)}
-                  className="px-3 py-2.5 text-left text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-32 cursor-pointer select-none hover:text-[var(--color-text-secondary)] hidden lg:table-cell"
+                  className="px-3 py-2.5 text-left text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-32 cursor-pointer select-none hover:text-[var(--color-text-secondary)] hidden lg:table-cell"
                   onClick={() => handleSort("churn")}
                 >
                   Churn<SortIcon column="churn" sortKey={sortKey} sortDir={sortDir} />
@@ -213,35 +252,44 @@ export function HotspotTable({
                 <th
                   scope="col"
                   aria-sort={ariaSortFor("trend", sortKey, sortDir)}
-                  className="px-3 py-2.5 text-right text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-24 cursor-pointer select-none hover:text-[var(--color-text-secondary)]"
+                  className="px-3 py-2.5 text-right text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-24 cursor-pointer select-none hover:text-[var(--color-text-secondary)]"
                   onClick={() => handleSort("trend")}
                   title="Exponential decay score weighting recent commits more heavily (180-day half-life)"
                 >
                   Trend<SortIcon column="trend" sortKey={sortKey} sortDir={sortDir} />
                 </th>
-                <th className="px-3 py-2.5 text-left text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-20 hidden md:table-cell">
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-20 hidden md:table-cell">
                   Bus Factor
                 </th>
-                <th className="px-3 py-2.5 text-left text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-24 hidden lg:table-cell">
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider w-24 hidden lg:table-cell">
                   Lines ±90d
                 </th>
-                <th className="px-3 py-2.5 text-left text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider hidden md:table-cell">
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider hidden md:table-cell">
                   Owner
                 </th>
                 <th className="px-3 py-2.5 w-20" />
               </tr>
             </thead>
-            <tbody>
-              {filtered.map((h, i) => {
-                const accelerating = h.commit_count_30d * 3 > h.commit_count_90d;
-                const trendScore = h.temporal_hotspot_score;
-                const isExpanded = expanded.has(h.file_path);
-                return (
-                  <React.Fragment key={h.file_path}>
+            {paddingTop > 0 && (
+              <tbody aria-hidden>
+                <tr>
+                  <td style={{ height: paddingTop, padding: 0, border: 0 }} />
+                </tr>
+              </tbody>
+            )}
+            {virtualRows.map((vr) => {
+              const h = filtered[vr.index];
+              if (h === undefined) return null;
+              const i = vr.index;
+              const accelerating = h.commit_count_30d * 3 > h.commit_count_90d;
+              const trendScore = h.temporal_hotspot_score;
+              const isExpanded = expanded.has(h.file_path);
+              return (
+                <tbody key={h.file_path} ref={measureElement} data-index={i}>
                   <tr
                     onClick={onSelect ? () => onSelect(h) : undefined}
                     className={cn(
-                      "border-b border-[var(--color-border-default)] hover:bg-[var(--color-bg-elevated)] transition-colors",
+                      "border-b border-[var(--color-table-divider)] hover:bg-[var(--color-bg-elevated)] transition-colors group",
                       !isExpanded && "last:border-0",
                       onSelect && "cursor-pointer",
                     )}
@@ -272,7 +320,7 @@ export function HotspotTable({
                       {i + 1}
                     </td>
                     <td className="px-3 py-2.5 font-mono text-xs text-[var(--color-text-primary)] min-w-[180px] max-w-[420px]">
-                      <span className="block truncate" title={h.file_path}>{h.file_path}</span>
+                      <span className="block truncate group-hover:underline underline-offset-2" title={h.file_path}>{h.file_path}</span>
                     </td>
                     <td className="px-3 py-2.5 tabular-nums text-xs text-right">
                       <span className="inline-flex items-center justify-end gap-1">
@@ -280,9 +328,9 @@ export function HotspotTable({
                           {h.commit_count_90d}
                         </span>
                         {accelerating ? (
-                          <TrendingUp className="h-3 w-3 text-red-500" />
+                          <TrendingUp className="h-3 w-3 text-[var(--color-error)]" />
                         ) : (
-                          <TrendingDown className="h-3 w-3 text-green-500" />
+                          <TrendingDown className="h-3 w-3 text-[var(--color-success)]" />
                         )}
                       </span>
                     </td>
@@ -298,7 +346,7 @@ export function HotspotTable({
                       <span className="inline-flex items-center justify-end gap-1">
                         {trendScore != null ? (
                           <>
-                            <Flame className={cn("h-3 w-3 shrink-0", trendScore >= 5 ? "text-red-500" : trendScore >= 2 ? "text-orange-400" : "text-[var(--color-text-tertiary)]")} />
+                            <Flame className={cn("h-3 w-3 shrink-0", trendScore >= 5 ? "text-[var(--color-error)]" : trendScore >= 2 ? "text-[var(--color-warning)]" : "text-[var(--color-text-tertiary)]")} />
                             <span className="text-[var(--color-text-secondary)]">
                               {trendScore.toFixed(2)}
                             </span>
@@ -312,19 +360,19 @@ export function HotspotTable({
                       <span
                         className={`inline-flex items-center justify-center rounded px-1.5 py-0.5 text-xs font-medium tabular-nums ${
                           h.bus_factor <= 1
-                            ? "bg-red-500/15 text-red-400"
+                            ? "bg-[var(--color-error)]/15 text-[var(--color-error)]"
                             : h.bus_factor === 2
-                              ? "bg-yellow-500/15 text-yellow-400"
-                              : "bg-green-500/15 text-green-400"
+                              ? "bg-[var(--color-warning)]/15 text-[var(--color-warning)]"
+                              : "bg-[var(--color-success)]/15 text-[var(--color-success)]"
                         }`}
                       >
                         {h.bus_factor}
                       </span>
                     </td>
                     <td className="px-3 py-2.5 text-xs tabular-nums hidden lg:table-cell">
-                      <span className="text-green-400">+{formatLOC(h.lines_added_90d)}</span>
+                      <span className="text-[var(--color-success)]">+{formatLOC(h.lines_added_90d)}</span>
                       {" "}
-                      <span className="text-red-400">-{formatLOC(h.lines_deleted_90d)}</span>
+                      <span className="text-[var(--color-error)]">-{formatLOC(h.lines_deleted_90d)}</span>
                     </td>
                     <td className="px-3 py-2.5 text-xs text-[var(--color-text-secondary)] hidden md:table-cell">
                       {h.primary_owner ?? "—"}
@@ -333,12 +381,19 @@ export function HotspotTable({
                       <div className="flex items-center gap-1">
                         {h.is_hotspot && <Badge variant="outdated">Hot</Badge>}
                         {h.is_stable && <Badge variant="fresh">Stable</Badge>}
+                        {onGeneratePrompt && (
+                          <AiPromptButton
+                            variant="icon"
+                            label="AI stabilization prompt"
+                            onClick={() => onGeneratePrompt(h)}
+                          />
+                        )}
                         {prefix && (
                           <RowActions
                             actions={[
-                              { icon: GitBranch, label: "Graph", href: `${prefix}/graph?node=${encodeURIComponent(h.file_path)}` },
+                              { icon: GitBranch, label: "Graph", href: `${prefix}/architecture?view=graph&node=${encodeURIComponent(h.file_path)}` },
                               { icon: BookOpen, label: "Docs", href: `${prefix}/docs?file=${encodeURIComponent(h.file_path)}` },
-                              { icon: Radius, label: "Blast Radius", href: `${prefix}/blast-radius?file=${encodeURIComponent(h.file_path)}` },
+                              { icon: Radius, label: "Blast Radius", href: `${prefix}/code-health?tab=impact&file=${encodeURIComponent(h.file_path)}` },
                             ]}
                           />
                         )}
@@ -346,17 +401,23 @@ export function HotspotTable({
                     </td>
                   </tr>
                   {expandable && isExpanded && (
-                    <tr className="border-b border-[var(--color-border-default)] bg-[var(--color-bg-subtle)] last:border-0">
+                    <tr className="border-b border-[var(--color-table-divider)] bg-[var(--color-bg-subtle)] last:border-0">
                       <td className="px-1" />
                       <td colSpan={9} className="px-3 py-3">
                         {renderExpandedRow!(h)}
                       </td>
                     </tr>
                   )}
-                  </React.Fragment>
-                );
-              })}
-            </tbody>
+                </tbody>
+              );
+            })}
+            {paddingBottom > 0 && (
+              <tbody aria-hidden>
+                <tr>
+                  <td style={{ height: paddingBottom, padding: 0, border: 0 }} />
+                </tr>
+              </tbody>
+            )}
           </table>
           {total != null && (
             <ResultsFooter

@@ -1,9 +1,10 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { X } from "lucide-react";
 import useSWRInfinite from "swr/infinite";
 import { SymbolTable, type SymbolFilters } from "@repowise-dev/ui/symbols/symbol-table";
-import { HotSymbolsBoard, type HotSymbol } from "@repowise-dev/ui/symbols/hot-symbols-board";
 import { SymbolDrawerWrapper } from "./symbol-drawer-wrapper";
 import { listSymbolsPage, type SymbolSortKey } from "@/lib/api/symbols";
 import { useDebounce } from "@/lib/hooks/use-debounce";
@@ -16,6 +17,12 @@ interface Props {
 }
 
 export function SymbolTableWrapper({ repoId }: Props) {
+  // `?file=` deep link (graph inspection panel "Symbols" action) scopes the
+  // table to one source file until dismissed.
+  const searchParams = useSearchParams();
+  const [fileFilter, setFileFilter] = useState<string | null>(
+    () => searchParams.get("file"),
+  );
   const [filters, setFilters] = useState<SymbolFilters>({
     q: "",
     kind: "all",
@@ -31,8 +38,8 @@ export function SymbolTableWrapper({ repoId }: Props) {
   // The fetch key changes whenever any filter does — SWR will fall back to
   // page 0 cleanly without us having to reset infinite state by hand.
   const keyPayload = useMemo(
-    () => ({ ...filters, q: debouncedQ }),
-    [filters, debouncedQ],
+    () => ({ ...filters, q: debouncedQ, file: fileFilter }),
+    [filters, debouncedQ, fileFilter],
   );
 
   const { data, size, setSize, isLoading, isValidating } = useSWRInfinite<
@@ -51,6 +58,7 @@ export function SymbolTableWrapper({ repoId }: Props) {
         language: keyPayload.language !== "all" ? keyPayload.language : undefined,
         visibility:
           keyPayload.visibility !== "all" ? keyPayload.visibility : undefined,
+        file_path: keyPayload.file || undefined,
         in_hot_files: keyPayload.inHotFiles || undefined,
         in_entry_points: keyPayload.inEntryPoints || undefined,
         sort: keyPayload.sort,
@@ -68,24 +76,25 @@ export function SymbolTableWrapper({ repoId }: Props) {
   const total = data && data.length > 0 ? data[0].total : 0;
   const hasMore = data ? data[data.length - 1].has_more : false;
 
-  // Hot symbols board — uses the same server-ranked stream so it matches
-  // the table's order. We just take the top of the first page.
-  const hotSymbols: HotSymbol[] = useMemo(() => {
-    const firstPage = data && data.length > 0 ? data[0].items : [];
-    return firstPage
-      .filter((s) => (s.importance_score ?? 0) > 0)
-      .slice(0, 8)
-      .map((s) => ({
-        symbol: s,
-        score: s.importance_score ?? 0,
-        pagerank: s.file_pagerank ?? 0,
-      }));
-  }, [data]);
-
   return (
     <div className="space-y-6">
-      {hotSymbols.length > 0 && (
-        <HotSymbolsBoard items={hotSymbols} onSelect={setSelected} />
+      {fileFilter && (
+        <div className="flex items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-accent-primary)]/40 bg-[var(--color-accent-muted)] px-2.5 py-1 text-xs font-mono text-[var(--color-accent-primary)]">
+            {fileFilter}
+            <button
+              type="button"
+              onClick={() => setFileFilter(null)}
+              aria-label="Clear file filter"
+              className="hover:opacity-70"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+          <span className="text-xs text-[var(--color-text-tertiary)]">
+            showing symbols in this file only
+          </span>
+        </div>
       )}
       <SymbolTable
         items={items}

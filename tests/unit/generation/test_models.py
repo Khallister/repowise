@@ -153,7 +153,7 @@ def test_generation_config_defaults():
     assert config.staleness_threshold_days == 7
     assert config.expiry_threshold_days == 30
     assert config.top_symbol_percentile == 0.20
-    assert config.module_grouping == "community"
+    assert config.module_grouping == "curated"
     assert config.min_module_size == 3
     assert config.large_file_source_pct == 0.4
     assert config.reasoning == "auto"
@@ -167,6 +167,11 @@ def test_generation_config_embed_concurrency_defaults_to_max_concurrency():
 def test_generation_config_normalizes_reasoning():
     config = GenerationConfig(reasoning="OFF")
     assert config.reasoning == "off"
+
+
+def test_generation_config_accepts_native_reasoning_effort():
+    config = GenerationConfig(reasoning="XHIGH")
+    assert config.reasoning == "xhigh"
 
 
 def test_generation_config_rejects_invalid_reasoning():

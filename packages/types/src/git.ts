@@ -55,6 +55,16 @@ export interface GitMetadata {
   test_gap?: boolean | null;
   /** v0.2.0+ — combined recency × churn × ownership score. Order hotspots by this when present. */
   temporal_hotspot_score?: number | null;
+  /** Hassan change entropy (History Complexity Metric) — decay-weighted commit scatter. */
+  change_entropy?: number;
+  /** Repo-wide percentile rank of change_entropy, 0–100. */
+  change_entropy_pct?: number;
+  /** Bug-fix commits touching this file in the trailing defect window. */
+  prior_defect_count?: number;
+  /** The file's path before its most recent rename, if any. */
+  original_path?: string | null;
+  /** True when the per-file commit-history cap was hit during indexing. */
+  commit_count_capped?: boolean;
 }
 
 export interface Hotspot {
@@ -83,6 +93,128 @@ export interface Hotspot {
   commit_count_capped?: boolean;
   age_days?: number;
   last_commit_at?: string | null;
+  /** Hassan change entropy (History Complexity Metric) — decay-weighted commit scatter. */
+  change_entropy?: number;
+  /** Repo-wide percentile rank of change_entropy, 0–100. */
+  change_entropy_pct?: number;
+  /** Bug-fix commits touching this file in the trailing defect window. */
+  prior_defect_count?: number;
+  /** The file's path before its most recent rename, if any. */
+  original_path?: string | null;
+}
+
+/** Repo-relative review priority derived from the score's percentile within
+ * its own repo (terciles) — portable, unlike the absolute calibration band. */
+export type ReviewPriority = "low" | "moderate" | "high";
+
+export interface Commit {
+  sha: string;
+  short_sha: string;
+  author_name: string;
+  author_email: string;
+  committed_at: string | null;
+  subject: string;
+  lines_added: number;
+  lines_deleted: number;
+  files_changed: number;
+  dirs_changed: number;
+  subsystems_changed: number;
+  entropy: number;
+  is_fix: boolean;
+  /** Raw 0–10 change-risk score from the calibrated model (stored). */
+  change_risk_score: number | null;
+  /** Absolute calibration band — kept for transparency, but skews high on
+   * repos with large typical commits; prefer {@link review_priority}. */
+  change_risk_level: ReviewPriority | null;
+  /** Where this commit's score sits within its repo's distribution, 0–100. */
+  risk_percentile: number;
+  /** Repo-relative review priority (the portable ranking signal). */
+  review_priority: ReviewPriority;
+  /** Label of the dominant risk driver, so rows explain themselves without
+   * opening the detail sheet. Null when the commit was never risk-scored. */
+  top_driver?: string | null;
+  /** Author's cumulative prior-commit count at the time of the commit.
+   * Low values flag a new-to-this-repo contributor. */
+  author_experience?: number | null;
+  /** Coding-agent attribution (deterministic local-git channels).
+   * Null/undefined for human-authored commits. */
+  agent_name?: string | null;
+  /** 1 = near-autonomous bot, 2 = human-driven agent, 3 = assisted/co-authored. */
+  agent_autonomy_tier?: number | null;
+  agent_confidence?: string | null;
+}
+
+/** One feature's signed contribution to a commit's change-risk logit. */
+export interface RiskDriver {
+  feature: string;
+  value: number | null;
+  /** Signed push on the logit; positive raises risk, negative lowers it. */
+  contribution: number;
+  label: string;
+}
+
+export interface CommitDetail extends Commit {
+  /** Per-feature breakdown, strongest contribution first. */
+  drivers: RiskDriver[];
+  /** Which attribution channel identified the agent (e.g. git footer). */
+  agent_channel?: string | null;
+}
+
+/** One month of agent-vs-human commit volume. */
+export interface AgentTrendBucket {
+  month: string; // "YYYY-MM"
+  total_commits: number;
+  agent_commits: number;
+  agent_pct: number; // 0-100
+  tier_counts: Record<string, number>;
+}
+
+/** Monthly agent-share trend across the indexed commit window. */
+export interface AgentTrend {
+  buckets: AgentTrendBucket[];
+  total_commits: number;
+  agent_commits: number;
+  agent_pct: number; // 0-100
+  agent_names: { name: string; count: number }[];
+}
+
+/** Canonical commit-category labels for the Code Evolution timeline. */
+export type CommitCategory =
+  | "feature"
+  | "fix"
+  | "refactor"
+  | "docs"
+  | "test"
+  | "deps"
+  | "chore"
+  | "other";
+
+/** One time bucket of commit-category counts. */
+export interface CommitEvolutionBucket {
+  period: string; // "YYYY-MM" (monthly) or "YYYY-Wnn" (weekly)
+  start: string; // ISO date of the bucket's first day
+  total: number;
+  counts: Partial<Record<CommitCategory, number>>;
+}
+
+/** Commit-category mix over time — the repo's development "story arc". */
+export interface CommitEvolution {
+  buckets: CommitEvolutionBucket[];
+  categories: CommitCategory[]; // present across the window, canonical order
+  totals: Partial<Record<CommitCategory, number>>;
+  total_commits: number;
+  granularity: "month" | "week";
+  first_commit_at: string | null;
+  last_commit_at: string | null;
+}
+
+/** Repo-wide commit aggregates (over all commits, not the loaded page). */
+export interface CommitStats {
+  total_commits: number;
+  high_priority_count: number;
+  fix_commit_count: number;
+  agent_commit_count: number;
+  avg_entropy: number;
 }
 
 export interface OwnershipEntry {

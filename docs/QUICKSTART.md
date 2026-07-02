@@ -14,6 +14,14 @@ pip install "repowise[anthropic]"
 
 Or substitute `openai`, `gemini`, `litellm`, or `all` depending on your LLM provider.
 
+For the Codex CLI subscription flow, no provider SDK or API key is required:
+
+```bash
+pip install repowise
+npm install -g @openai/codex
+codex login
+```
+
 **Requirements:** Python 3.11+, Git.
 
 ## 2. Set Your API Key
@@ -23,6 +31,12 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 Or `OPENAI_API_KEY`, `GEMINI_API_KEY` — whichever provider you installed.
+
+If you use Codex as the LLM provider, authenticate the Codex CLI instead:
+
+```bash
+codex login status
+```
 
 On Windows PowerShell:
 
@@ -38,6 +52,12 @@ repowise init
 ```
 
 Repowise will walk you through an interactive setup — choose a provider, review the cost estimate, and confirm. It parses every file, builds a dependency graph, indexes git history, and generates wiki pages.
+
+Codex users can force project-local MCP/hooks setup and use the Codex CLI provider in one command:
+
+```bash
+repowise init --codex --provider codex_cli --yes
+```
 
 A typical run on a ~500-file codebase takes 5-15 minutes.
 
@@ -67,13 +87,34 @@ repowise serve
 
 If Node.js 20+ is installed, the web UI starts automatically. Otherwise, use Docker (see below).
 
-**Connect to your AI editor (Claude Code, Cursor, Cline, Windsurf):**
+**Connect to your AI editor (Claude Code, Codex, Cursor, Cline, Windsurf):**
 
 ```bash
 repowise mcp --transport stdio
 ```
 
-> **Automatic for Claude Code:** `repowise init` already registers the MCP server and installs PreToolUse/PostToolUse hooks in `~/.claude/settings.json`. Every `Grep`/`Glob` call is automatically enriched with graph context (importers, dependencies, symbols, git signals). After git commits, the agent is notified when the wiki is stale.
+> **Automatic for Claude Code:** `repowise init` already registers the MCP server and installs a PostToolUse hook in `~/.claude/settings.json`. Broad or zero-result `Grep`/`Glob` searches can receive graph context, and git operations can notify the agent when the wiki is stale.
+
+> **Claude Code plugin (one-command):** install from the marketplace to get the MCP server, the hook, and `/repowise:*` slash commands together:
+> ```text
+> /plugin marketplace add repowise-dev/repowise
+> /plugin install repowise@repowise
+> ```
+
+> **Automatic for Codex:** run `repowise init --codex` to write project-local `.codex/config.toml`, `.codex/hooks.json`, and managed `AGENTS.md`. See [Codex Integration](CODEX.md).
+
+**Cut your agent's context spend (optional):**
+
+```bash
+repowise distill pytest -x      # compact errors-first output; raw recoverable via `repowise expand`
+repowise saved                  # tokens & dollars saved so far
+```
+
+Distill compresses noisy command output (tests, builds, git, searches) before
+the agent reads it — **60–90% fewer tokens on noisy commands, with zero
+error-line loss** (measured on a public OSS repo). Opt into the Claude Code
+rewrite hook at `init` (or `repowise hook rewrite install`) to apply it
+automatically, with each rewrite shown for approval. See [Distill](DISTILL.md).
 
 ## 5. Keep It in Sync
 
@@ -185,7 +226,7 @@ REPOWISE_API_URL=http://localhost:7337 npm run dev --workspace packages/web
 
 - **[User Guide](USER_GUIDE.md)** — full CLI reference, web UI features, MCP setup, common workflows, and troubleshooting
 - **[CLI Reference](CLI_REFERENCE.md)** — every command with every flag
-- **[MCP Tools](MCP_TOOLS.md)** — all 7 MCP tools with parameters and examples
+- **[MCP Tools](MCP_TOOLS.md)** — all 9 MCP tools with parameters and examples
 - **[Workspaces](WORKSPACES.md)** — multi-repo workspace setup and cross-repo intelligence
 - **[Auto-Sync](AUTO_SYNC.md)** — hooks, file watcher, webhooks, polling
 - **[Architecture](architecture/ARCHITECTURE.md)** — how repowise is built internally

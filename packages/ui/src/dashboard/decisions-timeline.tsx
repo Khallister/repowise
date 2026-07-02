@@ -2,11 +2,20 @@ import { Landmark, Lightbulb } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { Badge } from "../ui/badge";
 import { EmptyState } from "../shared/empty-state";
-import { formatRelativeTime } from "../lib/format";
-import type { DecisionRecord } from "@repowise-dev/types/decisions";
+import { formatRelativeTime, stripMarkdown } from "../lib/format";
+
+/** Structural slice of a decision record — anything with these fields renders
+ *  (full DecisionRecord rows and the overview-summary slim slice both fit). */
+export interface DecisionsTimelineItem {
+  id: string;
+  title: string;
+  status: string;
+  created_at: string | null;
+  source?: string | null;
+}
 
 interface DecisionsTimelineProps {
-  decisions: DecisionRecord[];
+  decisions: DecisionsTimelineItem[];
   repoId: string;
   linkPrefix?: string;
 }
@@ -76,17 +85,17 @@ export function DecisionsTimeline({ decisions, repoId, linkPrefix }: DecisionsTi
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-medium text-[var(--color-text-primary)] truncate group-hover:text-[var(--color-accent-primary)] transition-colors">
-                      {d.title}
+                      {stripMarkdown(d.title)}
                     </span>
                     <Badge
                       variant="outline"
-                      className={`text-[9px] h-4 shrink-0 ${STATUS_BADGE_VARIANT[d.status] ?? ""}`}
+                      className={`text-[10px] h-4 shrink-0 ${STATUS_BADGE_VARIANT[d.status] ?? ""}`}
                     >
                       {d.status}
                     </Badge>
                   </div>
                   <span className="text-[10px] text-[var(--color-text-tertiary)]">
-                    {formatRelativeTime(d.created_at)}
+                    {d.created_at ? formatRelativeTime(d.created_at) : ""}
                     {d.source && ` · ${d.source.replace("_", " ")}`}
                   </span>
                 </div>

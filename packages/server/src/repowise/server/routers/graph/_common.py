@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import json
-
 from fastapi import Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.persistence import crud
-from repowise.core.persistence.models import GraphEdge, Page, Repository
+from repowise.core.persistence.models import Page, Repository
 from repowise.server.deps import get_db_session
-from repowise.server.schemas import GraphEdgeResponse
 
 
 async def with_repo(

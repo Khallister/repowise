@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { ArrowUpRight, ChevronDown, ChevronRight, Sparkles } from "lucide-react";
-import { biomarkerLabel } from "./biomarker-glossary";
+import { InfoTip } from "../shared/info-tip";
+import { biomarkerInfo, biomarkerLabel } from "./biomarker-glossary";
 import type { BiomarkerDetailsRecord } from "./biomarker-details";
 import { SEVERITY_CHIP, SEVERITY_LABEL, type Severity } from "./tokens";
 
@@ -50,6 +51,8 @@ export interface RefactoringCardProps {
   onStatusChange?: ((findingId: string, status: FindingStatus) => void) | undefined;
   onGeneratePrompt?: ((target: RefactoringTarget) => void) | undefined;
   expandable?: boolean;
+  /** Flash-highlight the card (e.g. after a quadrant dot click scrolled to it). */
+  highlighted?: boolean;
 }
 
 const effortLabel: Record<EffortBucket, string> = {
@@ -60,10 +63,10 @@ const effortLabel: Record<EffortBucket, string> = {
 };
 
 const effortColor: Record<EffortBucket, string> = {
-  S: "bg-emerald-500/15 text-emerald-500",
-  M: "bg-yellow-500/15 text-yellow-600",
-  L: "bg-amber-500/15 text-amber-500",
-  XL: "bg-red-500/15 text-red-500",
+  S: "bg-[var(--color-success)]/15 text-[var(--color-success)]",
+  M: "bg-[var(--color-caution)]/15 text-[var(--color-caution)]",
+  L: "bg-[var(--color-warning)]/15 text-[var(--color-warning)]",
+  XL: "bg-[var(--color-error)]/15 text-[var(--color-error)]",
 };
 
 export function RefactoringCard({
@@ -72,10 +75,18 @@ export function RefactoringCard({
   onStatusChange,
   onGeneratePrompt,
   expandable = true,
+  highlighted = false,
 }: RefactoringCardProps) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-surface)] overflow-hidden">
+    <div
+      data-refactoring-card={target.file_path}
+      className={`rounded-lg border bg-[var(--color-bg-surface)] overflow-hidden transition-colors ${
+        highlighted
+          ? "border-[var(--color-accent-primary)] ring-1 ring-[var(--color-accent-primary)]/40"
+          : "border-[var(--color-border-default)]"
+      }`}
+    >
       <div className="p-4 space-y-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span
@@ -83,8 +94,14 @@ export function RefactoringCard({
           >
             {SEVERITY_LABEL[target.primary_severity]}
           </span>
-          <span className="text-xs font-semibold text-[var(--color-text-primary)]">
+          <span className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--color-text-primary)]">
             {biomarkerLabel(target.primary_biomarker)}
+            {biomarkerInfo(target.primary_biomarker).description ? (
+              <InfoTip
+                content={biomarkerInfo(target.primary_biomarker).description}
+                label={`About ${biomarkerLabel(target.primary_biomarker)}`}
+              />
+            ) : null}
           </span>
           {target.module ? (
             <span className="text-[10px] uppercase tracking-wider text-[var(--color-text-tertiary)] rounded px-1.5 py-0.5 border border-[var(--color-border-default)]">
@@ -97,7 +114,7 @@ export function RefactoringCard({
           >
             {target.effort_bucket}
           </span>
-          <span className="ml-auto text-xs tabular-nums text-red-500" title="Total health impact across this file's findings">
+          <span className="ml-auto text-xs tabular-nums text-[var(--color-error)]" title="Total health impact across this file's findings">
             −{target.total_impact.toFixed(2)}
           </span>
         </div>
@@ -127,7 +144,7 @@ export function RefactoringCard({
             {target.primary_suggestion}
           </p>
         ) : null}
-        <div className="flex items-center gap-3 pt-1 text-[11px] text-[var(--color-text-tertiary)] flex-wrap">
+        <div className="flex items-center gap-3 pt-1 text-xs text-[var(--color-text-tertiary)] flex-wrap">
           <span>Score {target.score.toFixed(1)}/10</span>
           <span>· {target.nloc} NLOC</span>
           <span>· {effortLabel[target.effort_bucket]} effort</span>
@@ -142,7 +159,7 @@ export function RefactoringCard({
                 e.stopPropagation();
                 onGeneratePrompt(target);
               }}
-              className="group/ai inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-600 hover:bg-emerald-500/20 hover:border-emerald-500/60 transition-colors"
+              className="group/ai inline-flex items-center gap-1.5 rounded-md border border-[var(--color-success)]/40 bg-[var(--color-success)]/10 px-2.5 py-1 text-xs font-semibold text-[var(--color-success)] hover:bg-[var(--color-success)]/20 hover:border-[var(--color-success)]/60 transition-colors"
               title="Generate a ready-to-paste prompt for an AI coding agent"
             >
               <Sparkles className="h-3.5 w-3.5 transition-transform group-hover/ai:rotate-12" />
@@ -177,11 +194,11 @@ export function RefactoringCard({
                     {f.function_name ? (
                       <span className="text-xs font-mono text-[var(--color-text-tertiary)]">{f.function_name}</span>
                     ) : null}
-                    <span className="ml-auto text-[11px] tabular-nums text-red-500">
+                    <span className="ml-auto text-xs tabular-nums text-[var(--color-error)]">
                       −{f.health_impact.toFixed(2)}
                     </span>
                   </div>
-                  <p className="text-[11px] text-[var(--color-text-tertiary)] line-clamp-2">{f.reason}</p>
+                  <p className="text-xs text-[var(--color-text-tertiary)] line-clamp-2">{f.reason}</p>
                   {onStatusChange ? (
                     <div className="flex flex-wrap gap-1 pt-1">
                       <StatusButton current={f.status} value="acknowledged" onClick={() => onStatusChange(f.id, "acknowledged")} label="Acknowledge" />

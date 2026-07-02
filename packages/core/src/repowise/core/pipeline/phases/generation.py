@@ -38,10 +38,19 @@ async def run_generation(
     dead_code_report: Any | None = None,
     decision_report: Any | None = None,
     external_systems: list[dict] | None = None,
+    on_page_ready: Any | None = None,
+    prior_pages: dict[str, Any] | None = None,
+    kg_modules: list[dict] | None = None,
+    kg_data: dict | None = None,
 ) -> list[Any]:
     """Run LLM-powered page generation.
 
     Returns a list of ``GeneratedPage`` objects.
+
+    ``prior_pages`` (a ``page_id → PriorPage`` map loaded from a previous run)
+    lets the generator skip the LLM call for any page whose freshly rendered
+    prompt still hashes to the persisted value under the same model — the same
+    cross-run reuse ``repowise update`` relies on. Defaults to empty.
     """
     from repowise.core.generation import (
         ContextAssembler,
@@ -110,6 +119,8 @@ async def run_generation(
         config,
         vector_store=vector_store,
         language=config.language,
+        prior_pages=prior_pages or {},
+        repo_path=repo_path,
     )
 
     generated_pages = await generator.generate_all(
@@ -128,6 +139,9 @@ async def run_generation(
         dead_code_report=dead_code_report,
         decision_report=decision_report,
         external_systems=external_systems,
+        on_page_ready=on_page_ready,
+        kg_modules=kg_modules,
+        kg_data=kg_data,
     )
 
     # Onboarding summary — count generated slots and surface which ones

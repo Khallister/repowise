@@ -8,6 +8,16 @@ from datetime import datetime
 from pydantic import BaseModel
 
 
+class EvidencePreview(BaseModel):
+    """The top-ranked evidence row, slimmed for list rows."""
+
+    source: str
+    source_quote: str
+    verification: str
+    evidence_file: str | None = None
+    evidence_line: int | None = None
+
+
 class DecisionRecordResponse(BaseModel):
     id: str
     repository_id: str
@@ -32,6 +42,12 @@ class DecisionRecordResponse(BaseModel):
     last_code_change: datetime | None
     created_at: datetime
     updated_at: datetime
+    # List-row evidence preview: the top-ranked evidence row's verbatim quote
+    # plus how many evidence rows back the record. Populated by the list
+    # endpoint only (None on detail/graph responses, which have the full
+    # /evidence endpoint instead).
+    evidence_count: int | None = None
+    evidence_preview: EvidencePreview | None = None
 
     @classmethod
     def from_orm(cls, obj: object) -> DecisionRecordResponse:
@@ -41,7 +57,13 @@ class DecisionRecordResponse(BaseModel):
             title=obj.title,  # type: ignore[attr-defined]
             status=obj.status,  # type: ignore[attr-defined]
             context=obj.context,  # type: ignore[attr-defined]
-            decision=obj.decision,  # type: ignore[attr-defined]
+            # Body fallback: the substring gate can clear a paraphrased
+            # ``decision`` while an evidence quote keeps the record alive,
+            # historically leaving a title-only record. Fall back to the title
+            # (the model's canonical one-line summary, always present) so no read
+            # surface emits a body-less decision. New records get this at write
+            # time in the harvest path; this covers pre-fix stored records.
+            decision=(obj.decision or "").strip() or obj.title,  # type: ignore[attr-defined]
             rationale=obj.rationale,  # type: ignore[attr-defined]
             alternatives=json.loads(obj.alternatives_json),  # type: ignore[attr-defined]
             consequences=json.loads(obj.consequences_json),  # type: ignore[attr-defined]

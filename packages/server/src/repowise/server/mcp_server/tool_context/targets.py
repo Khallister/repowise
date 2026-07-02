@@ -8,10 +8,12 @@ blocks delegated to ``enrichment``).
 
 from __future__ import annotations
 
+import contextlib
 import json
+import re
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.persistence.crud import get_kg_layers, get_kg_tour_steps
@@ -25,17 +27,42 @@ from repowise.core.persistence.models import (
     Repository,
     WikiSymbol,
 )
+from repowise.server.mcp_server._helpers import (
+    _decision_body,
+    filter_dicts_by_key,
+    filter_path_list,
+    is_excluded,
+)
 from repowise.server.mcp_server.tool_context.enrichment import (
     _resolve_call_graph,
     _resolve_community,
     _resolve_health,
     _resolve_metrics,
+    _resolve_skeleton,
 )
 from repowise.server.mcp_server.tool_context.kg import (
     _classify_file_role,
     _find_layer_for_file,
     _find_tour_step_for_file,
 )
+
+
+# Skeleton-by-default threshold for file targets. Measured on this repo: a
+# 1,400-line file's default card costs ~2.5k tokens for 16 bare signatures,
+# while the smart skeleton costs ~1.7k and carries every signature plus
+# docstrings and the highest-PageRank bodies — strictly better per token.
+# Small files skeletonize poorly (pct_of_full approaches a plain Read), so
+# the card remains the default below this line count.
+_SKELETON_AUTO_MIN_LINES = 80
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE metacharacters (``%``, ``_``) and the escape char itself.
+
+    Paired with ``escape="\\"`` on every ``.like()`` so a target containing
+    ``_`` or ``%`` is matched literally instead of as a wildcard.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _synthesize_structural_summary(file_path: str, classes: list[str], functions: list[str]) -> str:
@@ -60,16 +87,38 @@ def _synthesize_structural_summary(file_path: str, classes: list[str], functions
     return f"{name}: " + "; ".join(parts) + "."
 
 
+def _clean_signature(signature: str | None) -> str:
+    """Collapse a stored signature onto one line.
+
+    Signatures indexed from CRLF files carry literal ``\\r\\n`` plus the
+    original indentation — pure token waste in a triage card. Whitespace
+    runs collapse to single spaces; the text is unchanged otherwise.
+    """
+    return " ".join((signature or "").split())
+
+
 async def _resolve_one_target(
     session: AsyncSession,
     repository: Repository,
     target: str,
     include: set[str] | None,
     compact: bool = False,
+    *,
+    exclude_spec: Any = None,
+    repo_root: Any = None,
 ) -> dict:
     """Resolve a single target and return its full context."""
     repo_id = repository.id
     result_data: dict[str, Any] = {}
+
+    # Reject excluded file / ``path::Name`` targets outright (bare symbol names
+    # aren't path-matchable here and fall through to neighbor filtering).
+    gate_path = target.split("::", 1)[0] if "::" in target else target
+    if is_excluded(gate_path, exclude_spec):
+        return {
+            "target": target,
+            "error": f"'{target}' is excluded by exclude_patterns configuration",
+        }
 
     # --- Determine target type ---
     # 1. Try file page (most common)
@@ -103,15 +152,45 @@ async def _resolve_one_target(
             )
             page = res.scalar_one_or_none()
         if page is None:
-            # Partial match fallback for modules
-            res = await session.execute(
-                select(Page).where(
-                    Page.repository_id == repo_id,
-                    Page.page_type == "module_page",
-                    Page.target_path.contains(clean_target),
+            # Partial match fallback for modules — but only on a path-segment
+            # boundary, so "api" matches "src/api" yet "apiclient"/"pi" do not.
+            # Curated module ids are path-shaped, so a raw substring match can
+            # (a) hit 2+ module paths (→ MultipleResultsFound) and (b) shadow a
+            # real file of the same name. Guard against both here.
+            #
+            # First: if the target is itself a known real file (present in
+            # git_metadata, the same source the git fallback rung uses), do NOT
+            # let a partial module match preempt that — fall through so the
+            # ladder reaches the "exists but no wiki page" rung below.
+            file_meta_res = await session.execute(
+                select(GitMetadata.file_path).where(
+                    GitMetadata.repository_id == repo_id,
+                    GitMetadata.file_path == clean_target,
                 )
             )
-            page = res.scalar_one_or_none()
+            is_known_file = file_meta_res.scalar_one_or_none() is not None
+            if not is_known_file:
+                esc = _escape_like(clean_target)
+                res = await session.execute(
+                    select(Page).where(
+                        Page.repository_id == repo_id,
+                        Page.page_type == "module_page",
+                        or_(
+                            Page.target_path == clean_target,
+                            Page.target_path.like(f"%/{esc}", escape="\\"),
+                            Page.target_path.like(f"{esc}/%", escape="\\"),
+                            Page.target_path.like(f"%/{esc}/%", escape="\\"),
+                        ),
+                    )
+                )
+                # Deterministic pick when several module paths match: shortest
+                # target_path first, ties broken lexicographically. Module
+                # counts are small, so picking in Python is robust and cheap.
+                candidates = sorted(
+                    res.scalars().all(), key=lambda p: (len(p.target_path), p.target_path)
+                )
+                if candidates:
+                    page = candidates[0]
         if page:
             target_type = "module"
         else:
@@ -189,6 +268,30 @@ async def _resolve_one_target(
                     "is_hotspot": meta.is_hotspot,
                 }
 
+        # Fallback 2b: legacy module ids. Wiki modules used to be keyed by
+        # community ordinal ("community-12"); they are now keyed by directory
+        # path. Point old agent habits at the new vocabulary.
+        if target_type is None and re.fullmatch(r"community[-_]\d+", clean_target, re.IGNORECASE):
+            res = await session.execute(
+                select(Page.target_path)
+                .where(
+                    Page.repository_id == repo_id,
+                    Page.page_type == "module_page",
+                )
+                .order_by(Page.target_path)
+                .limit(10)
+            )
+            module_paths = filter_path_list([row[0] for row in res.all()], exclude_spec)
+            return {
+                "target": target,
+                "error": (
+                    f"Target not found: '{target}'. Module pages are no longer "
+                    "keyed by community ordinal — pass the module's directory "
+                    "path instead (see suggestions)."
+                ),
+                "suggestions": module_paths,
+            }
+
         # Fallback 3: fuzzy path suggestions — match by filename or partial path.
         # Only runs if the prior fallbacks didn't resolve the target.
         if target_type is None:
@@ -215,6 +318,7 @@ async def _resolve_one_target(
                     .limit(5)
                 )
                 suggestions = [row[0] for row in res.all() if row[0] != target]
+            suggestions = filter_path_list(suggestions, exclude_spec)
             if suggestions:
                 return {
                     "target": target,
@@ -225,6 +329,27 @@ async def _resolve_one_target(
 
     result_data["target"] = target
     result_data["type"] = target_type
+
+    # Tombstone redirect: the page documents a file deleted or renamed since
+    # indexing. A "fresh" card here is an active trap — return the redirect
+    # instead of the card.
+    if page is not None and getattr(page, "freshness_status", "") == "tombstone":
+        import json as _json_ts
+
+        try:
+            successors = _json_ts.loads(page.metadata_json or "{}").get("successor_paths") or []
+        except (ValueError, TypeError):
+            successors = []
+        result_data["error"] = (
+            f"'{target}' was deleted or renamed after indexing — this page is a tombstone."
+        )
+        if successors:
+            result_data["successor_paths"] = successors
+            result_data["hint"] = f"Content moved; call get_context on {successors[0]!r} instead."
+        return result_data
+
+    want_skeleton = bool(include and "skeleton" in include)
+    auto_skeleton = False
 
     # --- Docs ---
     # "full_doc" implies "docs" — entering the docs block whenever either is requested.
@@ -249,7 +374,27 @@ async def _resolve_one_target(
             symbols = res.scalars().all()
             classes = [s.name for s in symbols if s.kind == "class"]
             functions = [s.name for s in symbols if s.kind in ("function", "method")]
-            if compact:
+            # Skeleton-by-default: for file targets of meaningful size the
+            # smart skeleton dominates the bare signature list per token, so
+            # the default card upgrades itself. compact=False (the rich
+            # symbol card) and full_doc both opt out.
+            if not want_skeleton and compact and not want_full_doc:
+                total_loc = max((s.end_line or 0 for s in symbols), default=0)
+                if total_loc > _SKELETON_AUTO_MIN_LINES:
+                    want_skeleton = auto_skeleton = True
+            # Explicitly requested skeleton suppresses the symbol list up
+            # front; the auto default still builds the card and only swaps
+            # it out once the skeleton actually resolved (see bottom), so a
+            # moved/unreadable source file degrades to the card, not to an
+            # error-only response.
+            if want_skeleton and not auto_skeleton:
+                # The skeleton block already renders every signature with
+                # line bounds — repeating the symbol list in docs would
+                # roughly double the response for zero information. Keep
+                # the cheap title/summary card only.
+                if not docs.get("summary"):
+                    docs["summary"] = _synthesize_structural_summary(target, classes, functions)
+            elif compact:
                 # Compact mode: name+kind+signature+line+symbol_id only. Drops
                 # docstrings, line ranges, structure, and imported_by — those
                 # live behind compact=False or include= flags. The symbol_id
@@ -267,7 +412,7 @@ async def _resolve_one_target(
                     {
                         "name": s.name,
                         "kind": s.kind,
-                        "signature": s.signature,
+                        "signature": _clean_signature(s.signature),
                         "line": s.start_line,
                         "symbol_id": s.symbol_id,
                     }
@@ -286,7 +431,7 @@ async def _resolve_one_target(
                     {
                         "name": s.name,
                         "kind": s.kind,
-                        "signature": s.signature,
+                        "signature": _clean_signature(s.signature),
                         "start_line": s.start_line,
                         "end_line": s.end_line,
                         "docstring": (s.docstring or "")[:400],
@@ -317,7 +462,9 @@ async def _resolve_one_target(
                     )
                 )
                 importers = res.scalars().all()
-                docs["imported_by"] = [e.source_node_id for e in importers]
+                docs["imported_by"] = filter_path_list(
+                    [e.source_node_id for e in importers], exclude_spec
+                )
 
                 # Community info (compact=False only, ~80 bytes)
                 res = await session.execute(
@@ -329,10 +476,8 @@ async def _resolve_one_target(
                 gn = res.scalar_one_or_none()
                 if gn and gn.community_id is not None:
                     _cmeta: dict[str, Any] = {}
-                    try:
+                    with contextlib.suppress(json.JSONDecodeError, TypeError):
                         _cmeta = json.loads(gn.community_meta_json or "{}")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
                     docs["community"] = {
                         "id": gn.community_id,
                         "label": _cmeta.get("label", ""),
@@ -352,21 +497,28 @@ async def _resolve_one_target(
                 )
             )
             file_pages = res.scalars().all()
-            docs["files"] = [
-                {
-                    "path": f.target_path,
-                    "description": f.title,
-                    "confidence_score": f.confidence,
-                }
-                for f in file_pages
-            ]
+            docs["files"] = filter_dicts_by_key(
+                [
+                    {
+                        "path": f.target_path,
+                        # Page titles are "File: <path>" — pure redundancy
+                        # next to the path field. Use the indexed one-line
+                        # summary when there is one.
+                        "description": (f.summary or "").strip()[:160],
+                        "confidence_score": f.confidence,
+                    }
+                    for f in file_pages
+                ],
+                "path",
+                exclude_spec,
+            )
 
         elif target_type == "symbol":
             sym = sym_matches[0]  # type: ignore[possibly-undefined]
             docs["name"] = sym.name
             docs["qualified_name"] = sym.qualified_name
             docs["kind"] = sym.kind
-            docs["signature"] = sym.signature
+            docs["signature"] = _clean_signature(sym.signature)
             docs["file_path"] = sym.file_path
             docs["docstring"] = sym.docstring or ""
             # File page summary (full content gated behind include=["full_doc"])
@@ -384,13 +536,17 @@ async def _resolve_one_target(
                 )
             )
             edges = res.scalars().all()
-            docs["used_by"] = [e.source_node_id for e in edges][:20]
+            docs["used_by"] = filter_path_list([e.source_node_id for e in edges], exclude_spec)[:20]
             # Candidates
             if len(sym_matches) > 1:  # type: ignore[possibly-undefined]
-                docs["candidates"] = [
-                    {"name": m.name, "kind": m.kind, "file_path": m.file_path}
-                    for m in sym_matches[1:5]  # type: ignore[possibly-undefined]
-                ]
+                docs["candidates"] = filter_dicts_by_key(
+                    [
+                        {"name": m.name, "kind": m.kind, "file_path": m.file_path}
+                        for m in sym_matches[1:5]  # type: ignore[possibly-undefined]
+                    ],
+                    "file_path",
+                    exclude_spec,
+                )
 
         result_data["docs"] = docs
 
@@ -418,36 +574,30 @@ async def _resolve_one_target(
         triage_meta = triage_meta_res.scalar_one_or_none()
         result_data["hotspot"] = bool(triage_meta) if triage_meta is not None else False
 
-        # Bounded graph-link query — replaces full Python scan over all rows.
-        governing: list[DecisionRecord] = []
-        seen_ids: set[str] = set()
-        for lookup_node in dict.fromkeys(
-            [triage_path, target] if triage_path != target else [triage_path]
-        ):
-            if not lookup_node:
-                continue
-            for dr in await get_governing_decisions(session, repo_id, lookup_node):
-                if dr.id not in seen_ids:
-                    seen_ids.add(dr.id)
-                    governing.append(dr)
-        if governing:
-            result_data["decision_records"] = [dr.title for dr in governing[:5]]
-            result_data["decision_records_hint"] = (
-                "Decisions touch this file. Call get_why(targets=[...]) for rationale."
-            )
-            # Compact enriched list — highest-confidence first, capped at 5.
-            governing_sorted = sorted(governing, key=lambda d: -(d.confidence or 0.0))
-            result_data["governing_decisions"] = [
-                {
-                    "id": dr.id,
-                    "title": dr.title,
-                    "status": dr.status,
-                    "staleness_score": dr.staleness_score,
-                    "verification": dr.verification,
-                    "stale": bool(dr.status == "active" and (dr.staleness_score or 0.0) >= 0.5),
-                }
-                for dr in governing_sorted[:5]
-            ]
+        # Governing decisions — opt-in only (``include=["decisions"]``).
+        # The default triage card omits them: the rich form
+        # (id/staleness/verification) is low-signal for an agent's next move and
+        # the per-call graph query isn't worth the latency or the cached-prefix
+        # weight. Agents that want rationale call get_why directly; opting in
+        # here returns a lightweight titles list (no enriched objects).
+        if include and "decisions" in include:
+            governing: list[DecisionRecord] = []
+            seen_ids: set[str] = set()
+            for lookup_node in dict.fromkeys(
+                [triage_path, target] if triage_path != target else [triage_path]
+            ):
+                if not lookup_node:
+                    continue
+                for dr in await get_governing_decisions(session, repo_id, lookup_node):
+                    if dr.id not in seen_ids:
+                        seen_ids.add(dr.id)
+                        governing.append(dr)
+            if governing:
+                governing_sorted = sorted(governing, key=lambda d: -(d.confidence or 0.0))
+                result_data["decision_records"] = [dr.title for dr in governing_sorted[:3]]
+                result_data["decision_records_hint"] = (
+                    "Decisions touch this file. Call get_why(targets=[...]) for rationale."
+                )
 
     # --- Ownership ---
     if include is None or "ownership" in include:
@@ -475,6 +625,15 @@ async def _resolve_one_target(
                 if recent and recent != meta.primary_owner_name:
                     ownership["recent_owner"] = recent
                     ownership["recent_owner_pct"] = getattr(meta, "recent_owner_commit_pct", None)
+                # Agent provenance — only surfaced when agent-attributed
+                # commits exist, so human-only files stay noise-free.
+                if getattr(meta, "agent_commit_count", 0):
+                    ownership["agent_authored_pct"] = getattr(meta, "agent_authored_pct", None)
+                    ownership["agent_commit_count"] = meta.agent_commit_count
+                    with contextlib.suppress(TypeError, ValueError):
+                        ownership["agent_tier_counts"] = json.loads(
+                            getattr(meta, "agent_tier_counts_json", None) or "{}"
+                        )
             else:
                 ownership["primary_owner"] = None
                 ownership["owner_pct"] = None
@@ -539,7 +698,7 @@ async def _resolve_one_target(
                         "id": d.id,
                         "title": d.title,
                         "status": d.status,
-                        "decision": d.decision,
+                        "decision": _decision_body(d),
                         "rationale": d.rationale,
                         "confidence": d.confidence,
                     }
@@ -616,6 +775,7 @@ async def _resolve_one_target(
             result_data,
             want_callers=want_callers,
             want_callees=want_callees,
+            exclude_spec=exclude_spec,
         )
 
     # --- Metrics (replaces get_graph_metrics) ---
@@ -624,10 +784,39 @@ async def _resolve_one_target(
 
     # --- Community (replaces get_community) ---
     if include and "community" in include:
-        await _resolve_community(session, repository, target, result_data)
+        await _resolve_community(
+            session, repository, target, result_data, exclude_spec=exclude_spec
+        )
 
     # --- Code health (Phase 2) ---
     if include and "health" in include:
         await _resolve_health(session, repository, target, target_type, result_data)
+
+    # --- Skeleton (distill) — explicit include or the file-target default ---
+    if want_skeleton:
+        await _resolve_skeleton(
+            session, repository, target, target_type, result_data, repo_root=repo_root
+        )
+        skeleton = result_data.get("skeleton")
+        if auto_skeleton and isinstance(skeleton, dict):
+            if "error" in skeleton:
+                # Auto-upgrade failed (source moved/unreadable) — keep the
+                # symbol card the docs block already built and drop the
+                # failed block so the default response stays usable.
+                result_data.pop("skeleton", None)
+            else:
+                skeleton["auto"] = True
+                skeleton["opt_out_hint"] = (
+                    "Skeleton is the default for file targets above "
+                    f"{_SKELETON_AUTO_MIN_LINES} lines. Pass compact=False "
+                    "for the symbol-list card instead."
+                )
+                docs_block = result_data.get("docs")
+                if isinstance(docs_block, dict):
+                    # The skeleton renders every signature with line bounds —
+                    # the symbol list would double the response for zero
+                    # information.
+                    docs_block.pop("symbols", None)
+                    docs_block.pop("symbols_truncated", None)
 
     return result_data

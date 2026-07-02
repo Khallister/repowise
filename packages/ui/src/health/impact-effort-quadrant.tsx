@@ -44,13 +44,19 @@ export function ImpactEffortQuadrant({
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
   const maxImpact = Math.max(...data.map((d) => d.total_impact), 1);
+  const minImpact = Math.min(...data.map((d) => d.total_impact));
+  // When every impact is identical (or zero) the (max−impact)/max ratio would
+  // collapse every dot onto the top edge and degenerate the midline. Center the
+  // dots vertically instead so the plot stays readable.
+  const flatImpact = maxImpact === minImpact || maxImpact === 0;
 
   const xScale = (pct: number) => padL + (pct / 100) * plotW;
-  const yScale = (impact: number) => padT + ((maxImpact - impact) / maxImpact) * plotH;
+  const yScale = (impact: number) =>
+    flatImpact ? padT + plotH / 2 : padT + ((maxImpact - impact) / maxImpact) * plotH;
 
   // Quadrant midpoints — between M (38) and L (62), and at half impact.
   const midX = xScale(50);
-  const midY = yScale(maxImpact / 2);
+  const midY = flatImpact ? padT + plotH / 2 : yScale(maxImpact / 2);
 
   // Jitter helper so dots within the same effort bucket don't perfectly stack.
   const jitter = (s: string) => {
@@ -71,10 +77,10 @@ export function ImpactEffortQuadrant({
       </div>
       <div className="relative">
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label="Impact vs effort scatter plot">
-          <rect x={padL} y={padT} width={midX - padL} height={midY - padT} fill="currentColor" className="text-emerald-500/8" />
-          <rect x={midX} y={padT} width={W - padR - midX} height={midY - padT} fill="currentColor" className="text-amber-500/5" />
-          <rect x={padL} y={midY} width={midX - padL} height={H - padB - midY} fill="currentColor" className="text-yellow-500/5" />
-          <rect x={midX} y={midY} width={W - padR - midX} height={H - padB - midY} fill="currentColor" className="text-red-500/5" />
+          <rect x={padL} y={padT} width={midX - padL} height={midY - padT} fill="currentColor" className="text-[var(--color-success)]/8" />
+          <rect x={midX} y={padT} width={W - padR - midX} height={midY - padT} fill="currentColor" className="text-[var(--color-warning)]/5" />
+          <rect x={padL} y={midY} width={midX - padL} height={H - padB - midY} fill="currentColor" className="text-[var(--color-caution)]/5" />
+          <rect x={midX} y={midY} width={W - padR - midX} height={H - padB - midY} fill="currentColor" className="text-[var(--color-error)]/5" />
 
           <line x1={padL} y1={padT} x2={padL} y2={H - padB} stroke="currentColor" strokeOpacity={0.2} />
           <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="currentColor" strokeOpacity={0.2} />
@@ -103,7 +109,14 @@ export function ImpactEffortQuadrant({
             const cx = baseX + jitter(p.file_path);
             const cy = yScale(p.total_impact);
             const isHovered = hovered?.file_path === p.file_path;
-            const fillCls = p.score < 4 ? "fill-red-500" : p.score < 7 ? "fill-amber-500" : "fill-emerald-500";
+            const fillCls =
+              p.score < 4
+                ? "fill-[var(--color-error)]"
+                : p.score < 6
+                  ? "fill-[var(--color-warning)]"
+                  : p.score < 8
+                    ? "fill-[var(--color-caution)]"
+                    : "fill-[var(--color-success)]";
             return (
               <circle
                 key={p.file_path}
@@ -124,7 +137,7 @@ export function ImpactEffortQuadrant({
           })}
         </svg>
         {hovered ? (
-          <div className="pointer-events-none absolute bottom-2 left-2 rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] shadow-md">
+          <div className="pointer-events-none absolute bottom-2 left-2 rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-2 py-1 text-xs shadow-md">
             <span className="font-mono text-[var(--color-text-primary)]">{hovered.file_path}</span>
             <span className="ml-2 text-[var(--color-text-tertiary)]">
               −{hovered.total_impact.toFixed(2)} · {hovered.effort_bucket} · {hovered.score.toFixed(1)}

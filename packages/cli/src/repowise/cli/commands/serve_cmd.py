@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import shutil
 import socket
 import subprocess
 import tarfile
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -16,6 +19,56 @@ from repowise.cli import __version__
 from repowise.cli.helpers import console, load_config
 
 _GLOBAL_CONFIG_DIR = Path.home() / ".repowise"
+
+_SERVE_LOCK_NAME = "serve.lock.json"
+
+
+def _serve_lock_path(cwd: Path | None = None) -> Path | None:
+    """Return where the serve lockfile belongs for this directory, if anywhere.
+
+    The lockfile lets other local tooling discover a running server (port,
+    pid) without port-scanning. It lives next to the index the server is
+    serving: ``.repowise/`` for a single repo, ``.repowise-workspace/`` for a
+    workspace root. Returns None when neither exists (nothing to serve).
+    """
+    base = cwd or Path.cwd()
+    for dirname in (".repowise", ".repowise-workspace"):
+        candidate = base / dirname
+        if candidate.is_dir():
+            return candidate / _SERVE_LOCK_NAME
+    return None
+
+
+def _write_serve_lock(lock_path: Path, *, host: str, port: int, ui_port: int | None) -> None:
+    """Best-effort write of the discovery lockfile. Never blocks startup.
+
+    Consumers must treat ``pid`` as the liveness check: a killed server
+    cannot clean up after itself, so a stale file with a dead pid means
+    "not running".
+    """
+    # A wildcard bind isn't a connectable URL; loopback always is.
+    url_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    payload = {
+        "pid": os.getpid(),
+        "host": host,
+        "port": port,
+        "url": f"http://{url_host}:{port}",
+        "ui_port": ui_port,
+        "server_version": __version__,
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    with contextlib.suppress(OSError):
+        lock_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _remove_serve_lock(lock_path: Path) -> None:
+    """Best-effort removal; only removes a lock owned by this process."""
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        if data.get("pid") == os.getpid():
+            lock_path.unlink()
+    except (OSError, ValueError):
+        pass
 
 
 def _setup_embedder() -> None:
@@ -188,6 +241,13 @@ def _load_local_provider_config() -> None:
     embedder = cfg.get("embedder")
     if embedder and embedder != "mock" and not os.environ.get("REPOWISE_EMBEDDER"):
         os.environ["REPOWISE_EMBEDDER"] = str(embedder)
+
+    # 4) Embedding model from config — without this the server rebuilds the
+    # embedder with a provider default (e.g. text-embedding-3-small) that
+    # mismatches the indexed vectors, degrading chat/search retrieval (#426).
+    embedding_model = cfg.get("embedding_model")
+    if embedding_model and not os.environ.get("REPOWISE_EMBEDDING_MODEL"):
+        os.environ["REPOWISE_EMBEDDING_MODEL"] = str(embedding_model)
 
 
 def _is_port_free(host: str, port: int) -> bool:
@@ -471,7 +531,7 @@ def _start_frontend(
 
 
 @click.command("serve")
-@click.option("--port", default=7337, type=int, help="API server port.")
+@click.option("--port", default=7337, type=int, help="API server port.", envvar="REPOWISE_PORT")
 @click.option("--host", default="127.0.0.1", help="Host to bind to.")
 @click.option("--workers", default=1, type=int, help="Number of uvicorn workers.")
 @click.option("--ui-port", default=3000, type=int, help="Web UI port.")
@@ -496,6 +556,18 @@ def serve_command(
     except ImportError:
         console.print("[red]uvicorn is not installed. Install it with: pip install repowise[/red]")
         raise SystemExit(1) from None
+
+    # One-line, non-blocking "newer release available" advisory at startup.
+    # Best-effort and interactive-only; the cached check keeps it off the network
+    # on most launches.
+    if console.is_terminal:
+        try:
+            from repowise.cli.update_check import get_cli_update_check_cached
+            from repowise.cli.whats_new import render_update_advisory
+
+            render_update_advisory(console, get_cli_update_check_cached())
+        except Exception:
+            pass
 
     # Load the local .repowise/.env (API keys written by `repowise init`) and
     # seed the chat/search provider + embedder from .repowise/config.yaml. This
@@ -606,6 +678,15 @@ def serve_command(
 
     console.print(f"[green]API server starting on http://{host}:{port}[/green]")
 
+    lock_path = _serve_lock_path()
+    if lock_path:
+        _write_serve_lock(
+            lock_path,
+            host=host,
+            port=port,
+            ui_port=None if (no_ui or frontend_proc is None) else ui_port,
+        )
+
     try:
         uvicorn.run(
             "repowise.server.app:create_app",
@@ -616,6 +697,8 @@ def serve_command(
             log_level="info",
         )
     finally:
+        if lock_path:
+            _remove_serve_lock(lock_path)
         if frontend_proc:
             frontend_proc.terminate()
             frontend_proc.wait(timeout=5)

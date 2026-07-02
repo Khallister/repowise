@@ -41,13 +41,13 @@ scale, in a regulated or security-sensitive environment**:
 
 All of the following ship in `pip install repowise` today, free for internal use.
 
-- **Five intelligence layers** — Graph (tree-sitter AST across 14 languages, two-tier
+- **Five intelligence layers** — Graph (tree-sitter AST across 15 languages, two-tier
   dependency graph, call resolution, heritage extraction, Leiden communities,
   PageRank / betweenness / SCC), Git (hotspots, ownership, co-change pairs, bus
   factor, significant commits, contributor profiles, module health), Documentation
   (LLM-generated wiki, freshness scoring, RAG search), Decision (architectural
   decision records linked to graph nodes, staleness tracking), and Code Health
-  (fifteen deterministic biomarkers, 1–10 score per file, coverage ingestion, trend
+  (25 deterministic markers, 1–10 score per file, coverage ingestion, trend
   alerts).
 - **Nine task-shaped MCP tools** — `get_overview`, `get_answer`, `get_context`,
   `get_symbol`, `search_codebase`, `get_risk`, `get_why`, `get_dead_code`,
@@ -77,11 +77,11 @@ All of the following ship in `pip install repowise` today, free for internal use
 
 ## 3. First-class language coverage
 
-Repowise treats **8 languages at Full tier** — Python, TypeScript, JavaScript, Java,
-Go, Rust, C++, and **C#** — with AST parsing, import resolution, named bindings, call
-resolution, heritage extraction, multi-project workspace resolvers, framework-aware
-edges, and per-language dynamic-hint extractors. A further 6 languages (C, Kotlin,
-Ruby, Swift, Scala, PHP) sit at Good tier.
+Repowise treats **9 languages at Full tier** — Python, TypeScript, JavaScript, Java,
+Kotlin, Go, Rust, C++, and **C#** — with AST parsing, import resolution, named
+bindings, call resolution, heritage extraction, multi-project workspace resolvers,
+framework-aware edges, and per-language dynamic-hint extractors. A further 5 languages
+(C, Ruby, Swift, Scala, PHP) sit at Good tier.
 
 For estates built on a particular stack, the relevant Full-tier capabilities are
 worth calling out. For **.NET**, as one example:
@@ -119,16 +119,18 @@ the items that matter most to you can be prioritized.
 | Local dashboard (incl. local security pattern scan) | ✅ | ✅ |
 | Auto-sync (hooks, watcher, webhooks) | ✅ | ✅ |
 | Auto-generated CLAUDE.md | ✅ | ✅ |
-| Graph-aware enhanced security scanning | — | ✅ *(dev)* |
+| Graph-aware enhanced security scanning | — | ✅ *(GA on hosted)* |
 | Language-specific security rulesets | — | ✅ *(dev)* |
-| CVE-aware dependency analysis | — | ✅ *(planned)* |
-| Reachability-aware CVE triage | — | ✅ *(planned)* |
-| SBOM generation (CycloneDX) | — | ✅ *(planned)* |
-| Compliance reporting (PCI-DSS / SOC 2) | — | ✅ *(planned)* |
-| Audit trail (in-product + JSON / CSV export) | — | ✅ *(dev)* |
-| Jira / Confluence integration | — | ✅ *(rolling out)* |
+| CVE-aware dependency analysis (KEV / EPSS / priority-scored) | — | ✅ *(GA on hosted)* |
+| Usage-aware CVE triage (imports × dead code) | — | ✅ *(GA on hosted)* |
+| Function-level reachability triage | — | ✅ *(GA on hosted — per-language coverage)* |
+| Secret detection across full git history | — | ✅ *(GA on hosted)* |
+| SBOM generation (CycloneDX) + VEX export + diffs | — | ✅ *(GA on hosted)* |
+| Compliance reporting (PCI-DSS / SOC 2) | — | ✅ *(GA on hosted — Teams)* |
+| Audit trail (in-product + JSON / CSV export + webhook stream) | — | ✅ *(GA on hosted — security surface)* |
+| Jira / Confluence integration | — | ✅ *(GA on hosted — Teams)* |
 | GitHub Enterprise / Azure DevOps / GitLab / Bitbucket | — | ✅ *(rolling out)* |
-| Slack / Teams alerting | — | ✅ *(rolling out)* |
+| Slack / Teams security alerting (signed webhooks) | — | ✅ *(GA on hosted — Teams)* |
 | SAML / OIDC SSO + SCIM | — | ✅ *(rolling out)* |
 | RBAC + multi-tenant | — | ✅ *(planned)* |
 | Air-gapped install bundle | — | ✅ *(planned)* |
@@ -144,42 +146,72 @@ the items that matter most to you can be prioritized.
 
 ### 5.1 Security & Compliance
 
-- **Security scanning layer** *(GA: local pattern scan; dev: graph-aware
-  enrichment)* — pattern-based detection for dangerous APIs (`eval`/`exec`,
-  `pickle.loads`, `shell=True`, `os.system`, hardcoded secrets, concat / f-string
-  SQL, `verify=False`, weak hashes) runs locally today in the dashboard's Security
-  view. Graph-aware enrichment — linking findings to graph nodes and surfacing them
-  through `get_risk` so AI agents see security context before modifying a file — is
-  in development.
+- **Security scanning layer** *(GA: local pattern scan; GA on hosted:
+  graph-aware enrichment)* — pattern-based detection for dangerous APIs
+  (`eval`/`exec`, `pickle.loads`, `shell=True`, `os.system`, hardcoded secrets,
+  concat / f-string SQL, `verify=False`, weak hashes) runs locally today in the
+  dashboard's Security view. On the hosted platform, findings are graph-aware:
+  every vulnerable import site carries hotspot and centrality context from the
+  code graph (feeding a bounded priority bump), and AI agents see security
+  state before modifying a file through the hosted `get_security` MCP tool and
+  the security section `get_risk` attaches.
 - **Language-specific security rulesets** *(dev)* — rulesets built on top of the
   per-language dynamic-hint extractors and framework edges. For .NET, planned checks
   include `[Authorize]` coverage on controllers and Minimal API endpoints,
   `IConfiguration` secret leakage, EF Core raw-SQL risk, `HttpClient` lifetime
   issues, and `AllowAnonymous` on sensitive routes. Each language's ruleset ships as
   a focused subset, then expands on customer feedback.
-- **CVE-aware dependency analysis** *(planned)* — dependency manifests
-  (`*.csproj`, `packages.lock.json`, `package.json`, `pyproject.toml`, `go.mod`)
-  matched against NVD / GitHub Advisory / OSV feeds, with severity, fix availability,
-  and transitive-impact scoring.
-- **Reachability-aware CVE triage** *(planned)* — because Repowise holds a resolved
-  call graph, CVEs can be classified by whether the vulnerable function is actually
-  reachable from your code, reducing SCA noise. Precision is language- and
-  pattern-dependent; we report it honestly per language rather than quoting one
-  global number.
-- **SBOM generation** *(planned)* — CycloneDX output per commit with per-dependency
-  license detection and SBOM diffs between releases. SPDX and cross-format conversion
-  on the extended roadmap.
-- **Compliance reporting** *(planned)* — framework-mapping reports tying findings
-  back to specific files, owners, and decisions. Initial scope: **PCI-DSS** and
-  **SOC 2** control coverage. ISO 27001 Annex A and GDPR / data-residency mappings on
-  the extended roadmap — we'd rather ship two solid mappings than four shallow ones.
-- **Audit trail** *(dev)* — every decision, override, security-finding action, and
-  false-positive resolution logged with user, timestamp, and rationale. Queryable
-  in-product and exportable to JSON / CSV; streaming export to SIEM (Splunk / Datadog
-  / Elastic / syslog) on the roadmap.
-- **Secret-in-code detection** *(planned)* — gitleaks-style scanning across full git
-  history (not just `HEAD`), integrated with the graph so leaked secrets surface
-  which services / modules referenced them.
+- **CVE-aware dependency analysis** *(available on the hosted platform, Pro+)* —
+  full dependency inventory from manifests and lock files (all major ecosystems,
+  transitive deps included) matched against the OSV.dev database (which aggregates
+  GitHub Advisory and NVD-derived data), enriched with CISA KEV listing, EPSS
+  exploitation probability, and fix availability, then ranked by a composed
+  priority score. A nightly refresh re-matches stored inventories so new
+  advisories surface without re-indexing, with in-product notifications.
+- **Usage-aware CVE triage** *(available on the hosted platform, Pro+)* — every
+  CVE is labeled by whether your code actually imports the vulnerable package,
+  imports it only from dead code, or doesn't import it at all (with the import
+  sites as clickable evidence), cross-referencing the existing parse and
+  dead-code layers. Unmappable packages are labeled `unknown` honestly — never
+  guessed.
+- **Function-level reachability triage** *(available on the hosted platform,
+  Pro+)* — classifies CVEs by whether the advisory's affected packages or
+  symbols are actually imported, crossing OSV symbol data with the per-import
+  names the indexer captures. Coverage is per-ecosystem and reported honestly
+  in-product: Go is import-path-reliable (the Go vulndb lists affected
+  packages per advisory), PyPI / npm / cargo are assessed only when both the
+  advisory and the code name symbols, and other ecosystems stay at
+  package-level triage. Provably-unreachable findings are discounted, never
+  hidden; nothing is ever claimed without evidence on both sides.
+- **SBOM generation + VEX export** *(available on the hosted platform, Pro+)* —
+  CycloneDX 1.6 SBOM per snapshot with per-dependency license detection and
+  license-risk classification, downloadable in-product, plus dependency diffs
+  between any two snapshots — and a CycloneDX 1.6 **VEX** document that maps
+  the platform's triage, reachability, and human status decisions onto the
+  standard impact-analysis states, generated fresh at download so it always
+  reflects current triage. SPDX and cross-format conversion on the extended
+  roadmap.
+- **Compliance reporting** *(available on the hosted platform, Teams+)* —
+  **PCI-DSS 4.0** and **SOC 2** control-coverage reports derived from the live
+  security findings, with per-control evidence drill-ins and JSON / Markdown
+  export. Framed honestly in-product and in every export: coverage signals,
+  not an audit or certification — controls automated findings cannot evidence
+  are marked for manual attestation rather than silently passed. ISO 27001
+  Annex A and GDPR / data-residency mappings on the extended roadmap — we'd
+  rather ship two solid mappings than four shallow ones.
+- **Audit trail** *(available on the hosted platform for the security surface,
+  Teams+)* — security reads and actions (scans triggered, vulnerability and
+  secret views, SBOM / VEX exports, compliance views, finding-status changes,
+  and MCP reads by AI agents) logged insert-only with user, IP, and timestamp,
+  queryable in-product and exportable to JSON / CSV — plus an opt-in
+  SIEM-lite stream that forwards audit events to any HTTPS endpoint as signed
+  webhooks. Coverage beyond the security surface (decisions, overrides) is in
+  development; native Splunk / Datadog / Elastic connectors on the roadmap.
+- **Secret-in-code detection** *(available on the hosted platform, Pro+)* —
+  scanning across full git history (not just `HEAD`), with live-at-`HEAD`
+  flagging and incremental re-scans. Only a fingerprint and a redacted preview
+  are ever stored — never the secret value. Graph integration (which services /
+  modules referenced a leaked secret) is on the roadmap.
 
 ### 5.2 Workflow Integrations *(rolling out)*
 
@@ -187,17 +219,28 @@ The plumbing these sit on — audit trail, RBAC, the commercial event bus — is
 development. The connectors themselves are sequenced by customer demand; additional
 integrations beyond this list are available on request.
 
-- **Jira** — bi-directional linking between architectural decisions / risk findings
-  and Jira issues; `get_why` surfaces the originating ticket; PR-impact reports
-  auto-comment on the linked issue.
-- **Confluence** — scheduled publication of the Repowise wiki to nominated spaces,
-  with link-backs preserved and freshness banners on stale pages.
+- **Jira** *(available on the hosted platform, Teams+)* — architectural decisions
+  linked to the Jira issues that motivated them: links are mined from decision
+  evidence commits (validated against the site's real project keys) or added
+  manually by key, with live-ish status on the decision pages and in `get_why`,
+  so AI agents see the originating ticket next to the rationale. Risk-finding
+  links and PR-impact auto-comments on linked issues are on the roadmap.
+- **Confluence** *(available on the hosted platform, Teams+)* — scheduled (weekly
+  or on-demand) publication of the Repowise wiki to a nominated space and parent
+  page, updated in place and never duplicated; every page carries a link-back and
+  a freshness banner stating the exact source commit, with an explicit stale
+  warning when the snapshot trails the repository head.
 - **GitHub Enterprise / Azure DevOps / GitLab / Bitbucket** — managed webhooks, a
   PR-comment bot that posts blast-radius and reviewer suggestions, and a
   branch-protection check that blocks merges touching hotspots without a reviewer
   from the ownership list.
-- **Slack & Microsoft Teams** — alerts on hotspot drift, bus-factor warnings,
-  decision staleness, and security findings, routed by ownership.
+- **Slack & Microsoft Teams** — security alerting is available today on the
+  hosted platform (Teams+) as HMAC-signed webhooks with a Slack-compatible
+  format (works with Slack, Microsoft Teams, and Mattermost inbound
+  webhooks): new critical CVEs, live secrets, failed scans, and
+  rotation-overdue reminders, plus the opt-in audit-event stream. Alerts on
+  hotspot drift, bus-factor warnings, and decision staleness are rolling out
+  on the same plumbing, routed by ownership.
 - **SAML / OIDC SSO** — Okta, Entra ID, Auth0, Google Workspace, generic SAML 2.0.
 - **SCIM provisioning** — automatic user / group lifecycle.
 

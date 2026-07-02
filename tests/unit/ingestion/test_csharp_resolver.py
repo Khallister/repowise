@@ -26,7 +26,6 @@ from repowise.core.ingestion.resolvers.dotnet.global_usings import scan_global_u
 from repowise.core.ingestion.resolvers.dotnet.index import build_index
 from repowise.core.ingestion.resolvers.dotnet.namespace_map import declared_namespaces
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -165,7 +164,9 @@ class TestNamespaceMap:
     def test_build_namespace_map(self, tmp_path: Path) -> None:
         (tmp_path / "user.cs").write_text("namespace Domain.Users; class User {}")
         (tmp_path / "order.cs").write_text("namespace Domain.Orders; class Order {}")
-        ns_map, type_map = build_namespace_map([tmp_path / "user.cs", tmp_path / "order.cs"])
+        ns_map, type_map, _partials = build_namespace_map(
+            [tmp_path / "user.cs", tmp_path / "order.cs"]
+        )
         assert "Domain.Users" in ns_map
         assert "Domain.Orders" in ns_map
         # The type map surfaces the unqualified type name for each declared type.
@@ -261,6 +262,35 @@ class TestProjectIndexCaching:
         assert isinstance(first, DotNetProjectIndex)
         assert first.repo_path == tmp_path.resolve()
         assert "Foo" in first.namespace_map
+
+    def test_build_index_skips_unity_generated_dirs(self, tmp_path: Path) -> None:
+        (tmp_path / "Game.csproj").write_text(_csproj())
+        (tmp_path / "Assets" / "Scripts").mkdir(parents=True)
+        (tmp_path / "Assets" / "Scripts" / "Player.cs").write_text(
+            "namespace Game;\npublic class Player {}\n"
+        )
+        (tmp_path / "Library" / "PackageCache").mkdir(parents=True)
+        (tmp_path / "Library" / "PackageCache" / "Ghost.cs").write_text(
+            "namespace Noise;\npublic class Ghost {}\n"
+        )
+        (tmp_path / "Library" / "Generated.csproj").write_text(_csproj())
+        (tmp_path / "Temp" / "StagingArea").mkdir(parents=True)
+        (tmp_path / "Temp" / "StagingArea" / "TempFile.cs").write_text(
+            "namespace Noise;\npublic class TempFile {}\n"
+        )
+        (tmp_path / "Builds" / "Windows").mkdir(parents=True)
+        (tmp_path / "Builds" / "Windows" / "Exported.cs").write_text(
+            "namespace Noise;\npublic class Exported {}\n"
+        )
+        (tmp_path / "Builds" / "Windows" / "Exported.csproj").write_text(_csproj())
+
+        index = build_index(tmp_path)
+
+        assert {proj.name for proj in index.projects.values()} == {"Game"}
+        assert "Player" in index.type_map
+        assert "Ghost" not in index.type_map
+        assert "TempFile" not in index.type_map
+        assert "Exported" not in index.type_map
 
 
 @pytest.mark.parametrize(

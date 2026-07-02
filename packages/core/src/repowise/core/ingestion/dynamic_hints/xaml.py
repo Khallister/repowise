@@ -95,15 +95,19 @@ class XamlDynamicHints(DynamicHintExtractor):
 
     def extract(self, repo_root: Path) -> list[DynamicEdge]:
         # Cheap pre-flight: any XAML in the tree at all?
-        xaml_files = list(_iter_xaml_files(repo_root))
+        xaml_files = list(_iter_xaml_files(repo_root, rglob=self._rglob))
         if not xaml_files:
             return []
 
         # Reuse the existing C# type index — it already walks every .cs
-        # file under every .csproj and dedupes builtins. Building it
-        # here keeps XAML resolution cross-project / cross-repo
-        # consistent with how `using` directives resolve.
-        type_map = _load_type_map(repo_root)
+        # file under every .csproj and dedupes builtins. Reusing it keeps
+        # XAML resolution cross-project / cross-repo consistent with how
+        # `using` directives resolve. The registry attaches the index the
+        # graph resolvers built; standalone use rebuilds it from disk.
+        if self._dotnet_index is not None:
+            type_map = self._dotnet_index.type_map
+        else:
+            type_map = _load_type_map(repo_root)
         # Even without a .NET project we can still resolve xaml→xaml
         # ResourceDictionary references, so don't early-exit on an empty
         # type_map — only the C# binding pass is gated on it.
@@ -172,10 +176,13 @@ class XamlDynamicHints(DynamicHintExtractor):
 # Helpers (module-level so they're easy to unit-test in isolation)
 # ---------------------------------------------------------------------------
 
-def _iter_xaml_files(repo_root: Path):
-    from ._walk import iter_glob as _iter_glob
+def _iter_xaml_files(repo_root: Path, rglob=None):
+    if rglob is None:
+        from ._walk import iter_glob as _iter_glob
+
+        rglob = _iter_glob
     for ext in _XAML_EXTS:
-        for path in _iter_glob(repo_root, f"*{ext}"):
+        for path in rglob(repo_root, f"*{ext}"):
             try:
                 rel = path.resolve().relative_to(repo_root.resolve())
             except ValueError:

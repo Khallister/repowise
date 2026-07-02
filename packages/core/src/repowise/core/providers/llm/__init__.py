@@ -16,6 +16,8 @@ Built-in providers:
     deepseek   — deepseek-v4-flash, deepseek-v4-pro via api.deepseek.com
     ollama     — local inference (llama3.2, codellama, etc.)
     litellm    — 100+ providers via LiteLLM proxy
+    codex_cli  — local authenticated Codex CLI via codex exec
+    opencode   — local opencode CLI via opencode run
     mock       — deterministic test provider
 """
 

@@ -71,20 +71,20 @@ export function BusFactorPanel({ hotspots, riskPreviewCount = 5 }: BusFactorPane
                 return [`${n} files`, label];
               }}
             />
-            <Bar dataKey="high" stackId="a" fill="#22c55e" radius={[4, 0, 0, 4]} />
-            <Bar dataKey="medium" stackId="a" fill="#eab308" />
-            <Bar dataKey="low" stackId="a" fill="#ef4444" radius={[0, 4, 4, 0]} />
+            <Bar dataKey="high" stackId="a" fill="var(--color-success)" radius={[4, 0, 0, 4]} />
+            <Bar dataKey="medium" stackId="a" fill="var(--color-warning)" />
+            <Bar dataKey="low" stackId="a" fill="var(--color-error)" radius={[0, 4, 4, 0]} />
           </BarChart>
         </ResponsiveContainer>
         <div className="flex items-center gap-4 mt-2 text-[10px] text-[var(--color-text-tertiary)]">
           <span className="flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-sm bg-green-500" /> Safe (≥3): {high}
+            <span className="inline-block h-2 w-2 rounded-sm bg-[var(--color-success)]" /> Safe (≥3): {high}
           </span>
           <span className="flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-sm bg-yellow-500" /> Warning (2): {medium}
+            <span className="inline-block h-2 w-2 rounded-sm bg-[var(--color-warning)]" /> Warning (2): {medium}
           </span>
           <span className="flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-sm bg-red-500" /> Risk (≤1): {low}
+            <span className="inline-block h-2 w-2 rounded-sm bg-[var(--color-error)]" /> Risk (≤1): {low}
           </span>
         </div>
       </div>

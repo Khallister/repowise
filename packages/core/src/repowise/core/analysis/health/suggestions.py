@@ -24,6 +24,19 @@ _TEMPLATES: dict[str, str] = {
         "many dependents — extract cohesive responsibilities into helpers "
         "so each call site sees a smaller surface area."
     ),
+    "low_cohesion": (
+        "Split this class along its cohesion seams. Its methods form "
+        "groups that share no fields or calls — each group is a smaller, "
+        "single-responsibility class waiting to be extracted. Start by "
+        "moving one disconnected method cluster (and the fields only it "
+        "touches) into its own type."
+    ),
+    "god_class": (
+        "Break up this god class. It is large, has many methods, and "
+        "concentrates real logic in a brain method — extract cohesive "
+        "responsibilities into collaborators so no single class owns the "
+        "whole subsystem. Pair the split with characterization tests."
+    ),
     "nested_complexity": (
         "Flatten the control flow. Pull early-return guards to the top, "
         "extract the deepest branch into a helper, and consider "
@@ -67,6 +80,12 @@ _TEMPLATES: dict[str, str] = {
         "uncovered code paths (errors, edge cases, security-sensitive "
         "branches) rather than just chasing the percentage."
     ),
+    "coverage_gradient": (
+        "Raise this file's line coverage. The uncovered fraction tracks "
+        "defect risk directly — add tests for the untested paths, prioritising "
+        "error handling and edge cases, and the deduction shrinks in step with "
+        "the coverage you recover."
+    ),
     "developer_congestion": (
         "Cool the contention. Too many authors are touching this file "
         "at once — clarify ownership, or split the file along its "
@@ -96,6 +115,58 @@ _TEMPLATES: dict[str, str] = {
         "edit profile is one of the strongest defect predictors. Pull in "
         "the original author or write down the design intent before "
         "shipping the next change."
+    ),
+    "ownership_risk": (
+        "Assign a clear owner and reduce drive-by contributors on this "
+        "file. Fragmented ownership — many authors each touching a small "
+        "slice — is one of the strongest defect predictors; nominate a "
+        "DRI for reviews, or split the file along its natural seams so "
+        "each part has a coherent owner."
+    ),
+    "churn_risk": (
+        "This file is being rewritten faster than its size. Stabilize "
+        "the interface and add characterization tests before the next "
+        "change — high relative churn means the design hasn't settled, "
+        "so lock in current behavior and slow the rate of structural "
+        "edits."
+    ),
+    "change_entropy": (
+        "Calm this file's change history. Its modifications arrive in wide, "
+        "scattered commits — a strong history-based fault predictor. Land "
+        "future edits in focused, single-purpose commits, and consider "
+        "splitting the file so unrelated changes stop landing together."
+    ),
+    "co_change_scatter": (
+        "Reduce the blast radius. This file co-changes with many others, so "
+        "every edit ripples across the codebase. Tighten its interface, move "
+        "shared concerns behind a stable boundary, or split it so callers "
+        "depend on smaller, more cohesive units."
+    ),
+    "prior_defect": (
+        "This file has been bug-fixed repeatedly in recent months — defects "
+        "cluster, so it is among the likeliest places the next bug will land. "
+        "Treat it as fragile: add regression tests around the areas that keep "
+        "breaking, harden input handling, and review changes here with extra "
+        "care before they ship."
+    ),
+    "large_assertion_block": (
+        "Split this test. A long run of assertions in one case tests "
+        "several behaviours at once — when it fails it names a line, not a "
+        "cause. Break it into focused cases (one behaviour each), or factor "
+        "shared setup into a fixture so each assertion's intent is clear."
+    ),
+    "duplicated_assertion_block": (
+        "De-duplicate this assertion block. The same checks are copy-pasted "
+        "across tests, so a behaviour change must be edited in several "
+        "places and usually isn't. Extract the shared assertions into a "
+        "helper or parametrize the cases over the varying inputs."
+    ),
+    "error_handling": (
+        "Handle or propagate the error. A swallowed exception, catch-all "
+        "except, unguarded unwrap, or discarded Go error turns failures "
+        "into silent misbehavior — log and re-raise, narrow the caught "
+        "type, replace unwrap with the ? operator or a match, or check "
+        "the error you are currently discarding."
     ),
     "knowledge_loss": (
         "Document the surviving knowledge. The primary author(s) of "

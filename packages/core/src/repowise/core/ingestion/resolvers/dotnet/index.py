@@ -8,8 +8,15 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from repowise.core.fs_walk import iter_glob
+
 from .global_usings import collect_project_global_usings
-from .msbuild import MSBuildProject, find_csproj_files, find_directory_build_props, parse_csproj
+from .msbuild import (
+    MSBuildProject,
+    find_csproj_files,
+    parse_csproj,
+    path_has_dotnet_scan_skip_dir,
+)
 from .namespace_map import build_namespace_map
 from .solution import find_sln_files, parse_sln
 
@@ -36,6 +43,11 @@ class DotNetProjectIndex:
     A type name can appear in multiple files (partial types, distinct types
     with the same simple name in different namespaces). Callers rank the
     candidates by project enclosure — see ``rank_type_candidates`` below."""
+
+    partial_types: dict[str, list[Path]] = field(default_factory=dict)
+    """Maps a fully-qualified ``partial`` type name → files carrying a
+    fragment. Co-fragments of one FQN are literally one class — the
+    graph links them bidirectionally."""
 
     project_globals: dict[Path, set[str]] = field(default_factory=dict)
     """Maps a project's directory → global+implicit using namespaces."""
@@ -144,10 +156,7 @@ class DotNetProjectIndex:
         return package_id in self.package_refs.get(csproj, set())
 
 
-_CS_WALK_SKIP_DIRS = frozenset({"bin", "obj", ".vs", "node_modules", ".git", "packages"})
-
-
-def _walk_repo_cs_files(repo_path: Path) -> list[Path]:
+def _walk_repo_cs_files(repo_path: Path, *, prune_nested_git: bool = True) -> list[Path]:
     """Single repo-wide rglob for ``*.cs`` files, dedup by resolved path.
 
     Lives at module scope (not nested inside ``build_index``) so it's
@@ -156,8 +165,8 @@ def _walk_repo_cs_files(repo_path: Path) -> list[Path]:
     """
     seen: set[Path] = set()
     out: list[Path] = []
-    for cs in repo_path.rglob("*.cs"):
-        if any(part in _CS_WALK_SKIP_DIRS for part in cs.parts):
+    for cs in iter_glob(repo_path, "*.cs", prune_nested_git=prune_nested_git):
+        if path_has_dotnet_scan_skip_dir(cs, repo_path):
             continue
         try:
             resolved = cs.resolve()
@@ -205,7 +214,7 @@ def _bucket_files_by_project(
     return out
 
 
-def build_index(repo_path: Path) -> DotNetProjectIndex:
+def build_index(repo_path: Path, *, prune_nested_git: bool = True) -> DotNetProjectIndex:
     """Walk *repo_path* and construct a fully-populated DotNetProjectIndex.
 
     Performance note: a previous version of this function walked the
@@ -223,7 +232,7 @@ def build_index(repo_path: Path) -> DotNetProjectIndex:
     index = DotNetProjectIndex(repo_path=repo_path)
 
     # ---- 1. Parse every .csproj ----
-    for csproj_path in find_csproj_files(repo_path):
+    for csproj_path in find_csproj_files(repo_path, prune_nested_git=prune_nested_git):
         proj = parse_csproj(csproj_path)
         if proj is None:
             continue
@@ -232,7 +241,7 @@ def build_index(repo_path: Path) -> DotNetProjectIndex:
         index.package_refs[proj.path] = set(proj.package_references)
 
     # ---- 2. Walk .sln files (informational; surfaces orphaned .csprojs) ----
-    index.sln_paths = find_sln_files(repo_path)
+    index.sln_paths = find_sln_files(repo_path, prune_nested_git=prune_nested_git)
     for sln in index.sln_paths:
         for entry in parse_sln(sln):
             if entry.csproj not in index.projects:
@@ -246,7 +255,7 @@ def build_index(repo_path: Path) -> DotNetProjectIndex:
                     index.package_refs.setdefault(proj.path, set()).update(proj.package_references)
 
     # ---- 3. Single master walk: enumerate .cs files & read each once ----
-    all_cs_files = _walk_repo_cs_files(repo_path)
+    all_cs_files = _walk_repo_cs_files(repo_path, prune_nested_git=prune_nested_git)
     cs_texts: dict[Path, str] = {}
     for f in all_cs_files:
         try:
@@ -262,8 +271,8 @@ def build_index(repo_path: Path) -> DotNetProjectIndex:
     ]
     index.file_to_project = _bucket_files_by_project(all_cs_files, project_dirs)
 
-    # ---- 4. Namespace + type map from cached texts ----
-    index.namespace_map, index.type_map = build_namespace_map(
+    # ---- 4. Namespace + type + partial maps from cached texts ----
+    index.namespace_map, index.type_map, index.partial_types = build_namespace_map(
         all_cs_files, texts=cs_texts
     )
 
@@ -310,13 +319,13 @@ def build_index(repo_path: Path) -> DotNetProjectIndex:
 _INDEX_KEY = "_dotnet_index"
 
 
-def get_or_build_index(ctx: "ResolverContext") -> DotNetProjectIndex | None:
+def get_or_build_index(ctx: ResolverContext) -> DotNetProjectIndex | None:
     """Return the cached DotNetProjectIndex, building it on first access."""
     if not ctx.repo_path:
         return None
     cached = getattr(ctx, _INDEX_KEY, None)
     if cached is not None:
         return cached
-    index = build_index(ctx.repo_path)
+    index = build_index(ctx.repo_path, prune_nested_git=ctx.prune_nested_git)
     setattr(ctx, _INDEX_KEY, index)
     return index

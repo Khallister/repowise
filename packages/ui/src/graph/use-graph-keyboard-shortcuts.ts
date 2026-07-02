@@ -10,7 +10,16 @@ interface GraphKeyboardShortcutOptions {
   setSearchQuery: Dispatch<SetStateAction<string>>;
   setCtxMenu: Dispatch<SetStateAction<GraphCtxMenu | null>>;
   setCommunityPanelId: Dispatch<SetStateAction<number | null>>;
-  setColorMode: Dispatch<SetStateAction<ColorMode>>;
+  /** Sets the active color mode. Accepts a concrete mode only (the shortcuts
+   *  always pass a literal), so it composes with both the local state setter
+   *  and a host-controlled setter. */
+  setColorMode: (mode: ColorMode) => void;
+  /** Optional Escape pre-handler. Return true to consume the keystroke and skip
+   *  the default clear. Used to dismiss the top UI layer first: clear an open
+   *  selection/panel, else collapse the most recent constellation hub. */
+  onEscape?: (() => boolean) | undefined;
+  /** `?` toggles the shortcut help overlay. */
+  onToggleHelp?: (() => void) | undefined;
 }
 
 /**
@@ -27,6 +36,8 @@ export function useGraphKeyboardShortcuts(opts: GraphKeyboardShortcutOptions): v
     setCtxMenu,
     setCommunityPanelId,
     setColorMode,
+    onEscape,
+    onToggleHelp,
   } = opts;
 
   useEffect(() => {
@@ -41,6 +52,12 @@ export function useGraphKeyboardShortcuts(opts: GraphKeyboardShortcutOptions): v
           sigmaRef.current?.fitView();
           break;
         case "Escape":
+          // Let the host peel the top UI layer first (selection/panel, then
+          // hub); only fall through to the blanket clear if nothing was open.
+          if (onEscape?.()) {
+            e.preventDefault();
+            break;
+          }
           setSelectedNodeId(null);
           setEgoDepth(0);
           setSearchQuery("");
@@ -61,6 +78,10 @@ export function useGraphKeyboardShortcuts(opts: GraphKeyboardShortcutOptions): v
           document
             .querySelector<HTMLInputElement>('[aria-label="Search graph nodes"]')
             ?.focus();
+          break;
+        case "?":
+          e.preventDefault();
+          onToggleHelp?.();
           break;
       }
 
@@ -83,5 +104,7 @@ export function useGraphKeyboardShortcuts(opts: GraphKeyboardShortcutOptions): v
     setCtxMenu,
     setCommunityPanelId,
     setColorMode,
+    onEscape,
+    onToggleHelp,
   ]);
 }

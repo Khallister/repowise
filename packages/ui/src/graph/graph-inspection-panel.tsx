@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, memo } from "react";
+import { useMemo, useRef, memo } from "react";
 import {
   X,
   FileText,
@@ -20,7 +20,7 @@ import { formatNumber } from "../lib/format";
 import type { FileNodeData, ModuleNodeData } from "./elk-layout";
 import type Graph from "graphology";
 import type { SigmaNodeAttributes, SigmaEdgeAttributes } from "./sigma/types";
-import { COMMUNITY_COLORS } from "./sigma/constants";
+import { useCommunityFamilies } from "../shared/use-theme-tokens";
 
 interface NeighborInfo {
   id: string;
@@ -38,7 +38,9 @@ export interface GraphInspectionPanelProps {
   onClose: () => void;
   onNavigateToNode: (nodeId: string) => void;
   onViewDocs?: () => void;
-  onViewSymbols?: () => void;
+  onViewSymbols?: (() => void) | undefined;
+  /** Canonical file-page href — renders the primary "Open file page" action. */
+  filePageHref?: string | undefined;
   onFindPath?: (() => void) | undefined;
   onShowEgoGraph?: (() => void) | undefined;
   onExpandModule?: (() => void) | undefined;
@@ -71,6 +73,7 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
   onNavigateToNode,
   onViewDocs,
   onViewSymbols,
+  filePageHref,
   onFindPath,
   onShowEgoGraph,
   onExpandModule,
@@ -78,6 +81,8 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
   onEgoDepthChange,
   egoVisibleCount,
 }: GraphInspectionPanelProps) {
+  const communityFamily = useCommunityFamilies();
+  const touchStartY = useRef<number | null>(null);
   const neighbors = useMemo(() => {
     if (!graph || !graph.hasNode(nodeId)) return [];
     const result: NeighborInfo[] = [];
@@ -131,8 +136,23 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
 
   return (
     <div
-      className="absolute right-0 top-0 bottom-0 w-full sm:w-[300px] border-l border-[var(--color-border-default)] bg-[var(--color-bg-surface)] z-20 flex flex-col shadow-xl shadow-black/20 animate-in slide-in-from-right duration-200"
+      // Right panel on sm+; bottom sheet (drag handle + swipe-dismiss) below.
+      className="absolute inset-x-0 bottom-0 top-auto max-h-[70%] rounded-t-xl border-t border-[var(--color-border-default)] bg-[var(--color-bg-surface)] z-20 flex flex-col shadow-xl shadow-black/20 animate-in slide-in-from-bottom sm:slide-in-from-bottom-0 sm:slide-in-from-right duration-200 sm:inset-x-auto sm:right-0 sm:top-0 sm:bottom-0 sm:left-auto sm:w-[300px] sm:max-h-none sm:rounded-none sm:border-t-0 sm:border-l"
+      onTouchStart={(e) => {
+        touchStartY.current = e.touches[0]?.clientY ?? null;
+      }}
+      onTouchEnd={(e) => {
+        const start = touchStartY.current;
+        touchStartY.current = null;
+        if (start == null || window.innerWidth >= 640) return;
+        const end = e.changedTouches[0]?.clientY ?? start;
+        if (end - start > 80) onClose();
+      }}
     >
+      {/* Drag handle (mobile sheet only) */}
+      <div className="flex justify-center py-1.5 sm:hidden" aria-hidden>
+        <span className="h-1 w-9 rounded-full bg-[var(--color-border-default)]" />
+      </div>
       {/* Header */}
       <div className="flex items-start gap-2 px-4 py-3 border-b border-[var(--color-border-default)]">
         {headerIcon}
@@ -164,13 +184,14 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
               inDegree={inDegree}
               outDegree={outDegree}
               communityLabel={communityLabel}
+              communityColor={communityFamily((data as FileNodeData).communityId).hub}
             />
           )}
 
           {/* Neighbors */}
           {neighbors.length > 0 && (
             <div className="border-t border-[var(--color-border-default)] pt-3">
-              <p className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
+              <p className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
                 {isMod ? "Connected Modules" : "Neighbors"} ({neighbors.length})
               </p>
               <div className="space-y-0.5 max-h-48 overflow-y-auto">
@@ -182,14 +203,14 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
                   >
                     <span
                       className="w-0.5 h-5 rounded-full shrink-0"
-                      style={{ background: COMMUNITY_COLORS[n.communityId % COMMUNITY_COLORS.length] }}
+                      style={{ background: communityFamily(n.communityId).hub }}
                     />
                     <div className="min-w-0 flex-1">
-                      <p className="text-[11px] font-mono text-[var(--color-text-secondary)] group-hover:text-[var(--color-text-primary)] truncate">
+                      <p className="text-xs font-mono text-[var(--color-text-secondary)] group-hover:text-[var(--color-text-primary)] truncate">
                         {n.label}
                       </p>
                     </div>
-                    <span className="text-[9px] text-[var(--color-text-tertiary)] shrink-0">
+                    <span className="text-[10px] text-[var(--color-text-tertiary)] shrink-0">
                       {n.direction === "importer" ? "imports this" : "imported"}
                     </span>
                   </button>
@@ -207,13 +228,13 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
               Ego Graph
             </span>
             {egoDepth != null && egoDepth > 0 && egoVisibleCount != null && (
-              <span className="text-[9px] text-[var(--color-text-tertiary)] tabular-nums">
+              <span className="text-[10px] text-[var(--color-text-tertiary)] tabular-nums">
                 {egoVisibleCount} nodes
               </span>
             )}
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[9px] text-[var(--color-text-tertiary)] w-4 text-right tabular-nums">
+            <span className="text-[10px] text-[var(--color-text-tertiary)] w-4 text-right tabular-nums">
               {egoDepth ?? 0}
             </span>
             <input
@@ -225,9 +246,9 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
               className="flex-1 h-1 accent-[var(--color-accent-graph)] cursor-pointer"
               aria-label="Ego graph depth"
             />
-            <span className="text-[9px] text-[var(--color-text-tertiary)]">5</span>
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">5</span>
           </div>
-          <p className="text-[9px] text-[var(--color-text-tertiary)] mt-1">
+          <p className="text-[10px] text-[var(--color-text-tertiary)] mt-1">
             {(egoDepth ?? 0) === 0
               ? "Slide to filter by hop distance"
               : `Showing nodes within ${egoDepth} hop${egoDepth === 1 ? "" : "s"}`}
@@ -237,6 +258,14 @@ export const GraphInspectionPanel = memo(function GraphInspectionPanel({
 
       {/* Actions */}
       <div className="border-t border-[var(--color-border-default)] p-3 grid grid-cols-2 gap-2">
+        {!isMod && filePageHref && (
+          <a
+            href={filePageHref}
+            className="flex items-center justify-center gap-1.5 rounded-lg bg-[var(--color-accent-graph)]/10 hover:bg-[var(--color-accent-graph)]/20 border border-[var(--color-accent-graph)]/30 px-2 py-1.5 text-[10px] font-medium text-[var(--color-accent-graph)] transition-colors col-span-2"
+          >
+            <FileText className="w-3 h-3" /> Open file page
+          </a>
+        )}
         {isMod && onExpandModule && (
           <button
             onClick={onExpandModule}
@@ -289,6 +318,7 @@ function FileMetadata({
   inDegree,
   outDegree,
   communityLabel,
+  communityColor,
 }: {
   data: FileNodeData;
   pagerankPct: number;
@@ -296,6 +326,7 @@ function FileMetadata({
   inDegree: number;
   outDegree: number;
   communityLabel?: string | undefined;
+  communityColor: string;
 }) {
   return (
     <div className="space-y-2">
@@ -333,7 +364,7 @@ function FileMetadata({
         <span className="flex items-center gap-1.5">
           <span
             className="w-2 h-2 rounded-full"
-            style={{ background: COMMUNITY_COLORS[data.communityId % COMMUNITY_COLORS.length] }}
+            style={{ background: communityColor }}
           />
           <span className="font-medium text-[var(--color-text-primary)]">
             {communityLabel ?? `#${data.communityId}`}
@@ -360,16 +391,16 @@ function FileMetadata({
           </span>
         )}
         {data.isTest && (
-          <span className="inline-flex items-center gap-1 rounded-md bg-purple-500/10 text-purple-400 px-1.5 py-0.5 text-[10px] font-medium">
+          <span className="inline-flex items-center gap-1 rounded-md bg-[var(--color-accent-secondary)]/10 text-[var(--color-accent-secondary)] px-1.5 py-0.5 text-[10px] font-medium">
             <FlaskConical className="w-2.5 h-2.5" /> Test
           </span>
         )}
         {data.hasDoc ? (
-          <span className="inline-flex items-center gap-1 rounded-md bg-green-500/10 text-green-400 px-1.5 py-0.5 text-[10px] font-medium">
+          <span className="inline-flex items-center gap-1 rounded-md bg-[var(--color-success)]/10 text-[var(--color-success)] px-1.5 py-0.5 text-[10px] font-medium">
             <BookOpen className="w-2.5 h-2.5" /> Documented
           </span>
         ) : (
-          <span className="inline-flex items-center gap-1 rounded-md bg-slate-500/10 text-slate-400 px-1.5 py-0.5 text-[10px] font-medium">
+          <span className="inline-flex items-center gap-1 rounded-md bg-[var(--color-bg-inset)] text-[var(--color-text-tertiary)] px-1.5 py-0.5 text-[10px] font-medium">
             <BookOpen className="w-2.5 h-2.5" /> No docs
           </span>
         )}
@@ -388,7 +419,7 @@ function ModuleMetadata({
   outDegree: number;
 }) {
   const docPct = Math.round((data.docCoveragePct ?? 0) * 100);
-  const docColor = docPct >= 70 ? "#22c55e" : docPct >= 30 ? "#f59e0b" : "#ef4444";
+  const docColor = docPct >= 70 ? "var(--color-success)" : docPct >= 30 ? "var(--color-warning)" : "var(--color-error)";
 
   return (
     <div className="space-y-2">

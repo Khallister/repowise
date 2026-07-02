@@ -18,6 +18,9 @@ class Person:
     id: str
     name: str
     description: str = ""
+    # How this actor enters the system: cli | api | scheduler | developer |
+    # user. Drives the L1 actor icon; "user" is the generic fallback.
+    kind: str = "user"
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,9 @@ class ExternalSystemView:
     category: str      # framework | service | tool | library
     ecosystem: str
     version: str | None = None
+    # Boundary type in {db, network, filesystem, subprocess, lock}; None when
+    # the dependency isn't in the io_kind seed table (renders untyped).
+    io_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,8 +63,8 @@ class Container:
 
 @dataclass(frozen=True)
 class Component:
-    """A sub-module inside a container — top-level child directory, or the
-    synthetic ``_root`` group for files at the container root.
+    """A sub-module inside a container — a meaningful child directory, or the
+    synthetic ``(root)`` group for files that sit at the container root.
     """
 
     id: str            # "cmp:packages/core/ingestion"
@@ -80,6 +86,9 @@ class Relation:
     label: str = ""
     edge_count: int = 1
     edge_types: tuple[str, ...] = field(default_factory=tuple)
+    # Qualitative coupling strength derived from ``edge_count``:
+    # loose | moderate | tight. Empty on synthetic edges (e.g. L1 actor->system).
+    coupling: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,16 @@ class C4L3:
 
 
 @dataclass(frozen=True)
+class ArchSubGroup:
+    """A curated sub-group inside a layer (drill-down tier between layer
+    cards and file cards). Produced by the KG curation pass."""
+
+    id: str
+    name: str
+    node_ids: list[str]
+
+
+@dataclass(frozen=True)
 class ArchLayer:
     id: str
     name: str
@@ -119,6 +138,8 @@ class ArchLayer:
     file_count: int
     complexity_distribution: dict[str, int]
     health_score: float | None
+    sub_groups: list[ArchSubGroup] = field(default_factory=list)
+    display_order: int = 0
 
 
 @dataclass(frozen=True)
@@ -164,6 +185,13 @@ class ArchTourStep:
     title: str
     description: str
     node_ids: list[str]
+    # Curated, layer-aware fields (None/empty for legacy LLM tours).
+    target_path: str | None = None
+    layer_id: str | None = None
+    reason: str = ""
+    depth: int | None = None
+    kind: str = ""
+    page_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,3 +208,6 @@ class ArchitectureView:
     languages: list[str]
     frameworks: list[str]
     external_systems: list[ExternalSystemView]
+    # Curated, ranked entry points (repo-relative paths; empty when uncurated).
+    entry_points: list[str] = field(default_factory=list)
+    entry_candidates: list[str] = field(default_factory=list)

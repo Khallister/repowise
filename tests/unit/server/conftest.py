@@ -23,21 +23,26 @@ def _create_test_app():
     """Create a FastAPI app without the lifespan (we manage state manually)."""
     from contextlib import asynccontextmanager
 
+    from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
 
-    from fastapi import FastAPI
     from repowise.server.routers import (
         c4,
+        costs,
         dead_code,
         decisions,
+        external_systems,
         git,
         graph,
         health,
         jobs,
+        meta,
         modules,
+        overview,
         owners,
         pages,
+        refactoring,
         repos,
         search,
         symbols,
@@ -66,18 +71,23 @@ def _create_test_app():
 
     app.include_router(health.router)
     app.include_router(repos.router)
+    app.include_router(costs.router)
     app.include_router(pages.router)
     app.include_router(search.router)
     app.include_router(jobs.router)
     app.include_router(symbols.router)
     app.include_router(graph.router)
     app.include_router(c4.router)
+    app.include_router(meta.router)
     app.include_router(webhooks.router)
     app.include_router(git.router)
     app.include_router(dead_code.router)
     app.include_router(owners.router)
     app.include_router(modules.router)
     app.include_router(decisions.router)
+    app.include_router(external_systems.router)
+    app.include_router(overview.router)
+    app.include_router(refactoring.router)
 
     return app
 

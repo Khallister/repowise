@@ -91,6 +91,26 @@ def resolve_repo_path(path: str | None) -> Path:
     return Path(path).resolve()
 
 
+def find_repowise_repo_root(start: Path | None = None) -> Path | None:
+    """Walk upward from *start* looking for a repo with ``.repowise``."""
+
+    current = (start or Path.cwd()).resolve()
+    home = Path.home().resolve()
+    for candidate in (current, *current.parents):
+        if _same_path(candidate, home):
+            return None
+        if (candidate / REPOWISE_DIR).is_dir():
+            return candidate
+    return None
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return left == right
+
+
 def find_workspace_root(start: Path | None = None) -> Path | None:
     """Walk up from *start* (default: cwd) looking for ``.repowise-workspace.yaml``.
 
@@ -105,6 +125,18 @@ def find_workspace_root(start: Path | None = None) -> Path | None:
 def get_repowise_dir(repo_path: Path) -> Path:
     """Return the ``.repowise/`` directory for a given repo root."""
     return repo_path / REPOWISE_DIR
+
+
+def user_global_dir() -> Path:
+    """Return the user-global ``~/.repowise`` dir (created), for cross-repo state.
+
+    Home to machine-wide, repo-independent artifacts: the cached web bundle, the
+    PyPI update-check cache, and the last-seen release marker. Distinct from a
+    repo's local ``.repowise/`` store.
+    """
+    d = Path.home() / REPOWISE_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def ensure_repowise_dir(repo_path: Path) -> Path:
@@ -163,8 +195,20 @@ def load_state(repo_path: Path) -> dict[str, Any]:
 
 
 def save_state(repo_path: Path, state: dict[str, Any]) -> None:
-    """Write *state* to ``.repowise/state.json``."""
+    """Write *state* to ``.repowise/state.json``.
+
+    Every persist stamps the store-format markers (``store_format_version`` and
+    the ``written_by_version`` package version that wrote it) so the upgrade
+    layer always has a current record of the store's shape and provenance.
+    """
     ensure_repowise_dir(repo_path)
+    try:
+        from repowise.cli import __version__ as _pkg_version
+        from repowise.core.upgrade import stamp as _stamp_store_version
+
+        _stamp_store_version(state, package_version=_pkg_version)
+    except Exception:  # never let stamping block a persist
+        pass
     state_path = get_repowise_dir(repo_path) / STATE_FILENAME
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -191,16 +235,22 @@ def acquire_update_lock(repo_path: Path, target_commit: str | None) -> Path:
     """Write the update lock file. Returns its path.
 
     The lock contains the PID and target commit so the augment hook can
-    decide whether a stale-wiki warning is redundant. Best-effort: if write
-    fails (read-only fs, permissions), returns the path anyway — callers
-    must still call ``release_update_lock`` in a finally block.
+    decide whether a stale-wiki warning is redundant, plus the writing
+    process's creation-time token so ``read_update_lock`` can tell a live
+    lock owner apart from an unrelated process that recycled the PID.
+    Best-effort: if write fails (read-only fs, permissions), returns the
+    path anyway — callers must still call ``release_update_lock`` in a
+    finally block.
     """
     import time
+
+    from repowise.core.procutils import process_create_token
 
     ensure_repowise_dir(repo_path)
     lock_path = _update_lock_path(repo_path)
     payload = {
         "pid": os.getpid(),
+        "pid_create_token": process_create_token(os.getpid()),
         "target_commit": target_commit,
         "started_at": time.time(),
     }
@@ -220,8 +270,20 @@ def release_update_lock(repo_path: Path) -> None:
 
 
 def read_update_lock(repo_path: Path) -> dict[str, Any] | None:
-    """Return the lock payload if present and not stale, else ``None``."""
+    """Return the lock payload if present and not stale, else ``None``.
+
+    A lock is stale when its wall-clock age exceeds
+    ``UPDATE_LOCK_STALE_AFTER_SECONDS`` (a hung-but-alive update must not
+    block forever) — or, much sooner, when its owning PID is positively
+    dead or has been recycled by an unrelated process. The PID probe means
+    a crashed/killed update (SIGKILL, power loss — paths atexit can't
+    cover) no longer blocks further updates for the full 30-minute window.
+    Probes that can't decide ("unknown") fall back to the wall clock, so a
+    live update is never treated as stale by mistake.
+    """
     import time
+
+    from repowise.core.procutils import pid_alive, process_create_token
 
     lock_path = _update_lock_path(repo_path)
     if not lock_path.exists():
@@ -236,6 +298,20 @@ def read_update_lock(repo_path: Path) -> dict[str, Any] | None:
         return None
     if time.time() - started > UPDATE_LOCK_STALE_AFTER_SECONDS:
         return None
+
+    pid = payload.get("pid")
+    if isinstance(pid, int) and pid > 0:
+        alive = pid_alive(pid)
+        if alive is False:
+            return None
+        if alive is True:
+            stored_token = payload.get("pid_create_token")
+            # Legacy locks (pre-token) skip the identity check and rely on
+            # liveness + wall clock alone.
+            if isinstance(stored_token, str) and stored_token:
+                current_token = process_create_token(pid)
+                if current_token is not None and current_token != stored_token:
+                    return None
     return payload
 
 
@@ -295,9 +371,7 @@ def write_update_queued(repo_path: Path, head: str | None) -> None:
         return
     payload = {"target_commit": head, "queued_at": time.time()}
     try:
-        _update_queued_path(repo_path).write_text(
-            json.dumps(payload), encoding="utf-8"
-        )
+        _update_queued_path(repo_path).write_text(json.dumps(payload), encoding="utf-8")
     except OSError:
         pass
 
@@ -453,6 +527,7 @@ def save_config(
     model: str,
     embedder: str,
     *,
+    embedding_model: str | None = None,
     exclude_patterns: list[str] | None = None,
     commit_limit: int | None = None,
     reasoning: str | None = None,
@@ -460,6 +535,11 @@ def save_config(
     """Write provider/model/embedder (and optionally exclude_patterns) to ``.repowise/config.yaml``.
 
     Performs a round-trip load so existing keys are preserved.
+
+    ``embedding_model`` is persisted so ``repowise serve`` can rebuild the same
+    embedder used at init time — without it the server silently falls back to a
+    provider default (e.g. ``text-embedding-3-small``), which mismatches the
+    indexed vectors and breaks chat/search retrieval (issue #426).
     """
     ensure_repowise_dir(repo_path)
     config_path = get_repowise_dir(repo_path) / CONFIG_FILENAME
@@ -469,6 +549,8 @@ def save_config(
     existing["provider"] = provider
     existing["model"] = model
     existing["embedder"] = embedder
+    if embedding_model:
+        existing["embedding_model"] = embedding_model
     if exclude_patterns is not None:
         existing["exclude_patterns"] = exclude_patterns
     if commit_limit is not None:
@@ -486,14 +568,97 @@ def save_config(
     except ImportError:
         # Fallback: write simple key-value format (lists not supported)
         lines = [f"provider: {provider}", f"model: {model}", f"embedder: {embedder}"]
+        if embedding_model:
+            lines.append(f"embedding_model: {embedding_model}")
         if reasoning is not None:
             lines.append(f"reasoning: {resolve_reasoning(reasoning)}")
         config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def save_config_partial(
+    repo_path: Path,
+    *,
+    exclude_patterns: list[str] | None = None,
+    commit_limit: int | None = None,
+    **extra: Any,
+) -> None:
+    """Merge optional keys into ``.repowise/config.yaml``, preserving existing keys.
+
+    ``exclude_patterns`` / ``commit_limit`` are explicit for the common case;
+    any other config keys (e.g. ``enable_onboarding=False``) can be passed as
+    keyword arguments. ``None`` values are skipped so callers can forward
+    optional flags without clobbering existing keys.
+
+    No scalar-only fallback like :func:`save_config`: it would silently drop
+    ``exclude_patterns``, and PyYAML is a hard dependency anyway.
+    """
+    import yaml  # type: ignore[import-untyped]
+
+    updates: dict[str, Any] = {}
+    if exclude_patterns is not None:
+        updates["exclude_patterns"] = exclude_patterns
+    if commit_limit is not None:
+        updates["commit_limit"] = commit_limit
+    updates.update({k: v for k, v in extra.items() if v is not None})
+    if not updates:
+        return
+
+    ensure_repowise_dir(repo_path)
+    config_path = get_repowise_dir(repo_path) / CONFIG_FILENAME
+    existing = load_config(repo_path)
+    existing.update(updates)
+
+    config_path.write_text(
+        yaml.dump(existing, default_flow_style=False, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def save_distill_commands_enabled(repo_path: Path, *, enabled: bool) -> None:
+    """Deep-merge ``distill.commands.enabled`` into ``.repowise/config.yaml``.
+
+    :func:`save_config_partial` merges shallowly at the top level, so the
+    ``distill`` block is merged here first to avoid clobbering sibling keys
+    like ``disabled_filters``.
+    """
+    cfg = load_config(repo_path)
+    distill = dict(cfg.get("distill") or {})
+    commands = dict(distill.get("commands") or {})
+    commands["enabled"] = enabled
+    distill["commands"] = commands
+    save_config_partial(repo_path, distill=distill)
+
+
+def config_fingerprint(repo_path: Path) -> str:
+    """SHA-256 hex of ``.repowise/config.yaml`` + ``health-rules.json`` content.
+
+    Used by ``repowise update`` and ``repowise init`` to detect config changes
+    across runs without relying on filesystem timestamps. Missing files are
+    skipped, so an absent config still yields a stable hash.
+    """
+    import hashlib
+
+    rw_dir = get_repowise_dir(repo_path)
+    h = hashlib.sha256()
+    for name in ("config.yaml", "health-rules.json"):
+        p = rw_dir / name
+        if p.exists():
+            h.update(name.encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Provider resolution
 # ---------------------------------------------------------------------------
+
+
+def _is_codex_cli_available() -> bool:
+    """Check if the Codex CLI binary is available."""
+
+    import shutil
+
+    return shutil.which("codex") is not None
 
 
 def resolve_provider(
@@ -520,8 +685,10 @@ def resolve_provider(
 
     if provider_name is None and cfg.get("provider"):
         provider_name = cfg["provider"]
-        if model is None and cfg.get("model"):
-            model = cfg["model"]
+
+    # Honor the config model regardless of how the provider was resolved (#416).
+    if model is None and cfg.get("model"):
+        model = cfg["model"]
 
     def _resolve_base_url(name: str) -> str | None:
         """Return base_url from env or repo config for the provider."""
@@ -559,6 +726,10 @@ def resolve_provider(
         base_url = _resolve_base_url(provider_name)
         if base_url:
             kwargs["base_url"] = base_url
+        if provider_name == "codex_cli" and repo_path is not None:
+            kwargs["repo_path"] = repo_path
+        if provider_name == "opencode" and repo_path is not None:
+            kwargs["repo_path"] = repo_path
 
         # Pass API key from environment if available
         if provider_name == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
@@ -637,7 +808,10 @@ def resolve_provider(
 
     raise click.ClickException(
         "No provider configured. Use --provider, set REPOWISE_PROVIDER, "
-        "or set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / OLLAMA_BASE_URL / GEMINI_API_KEY / GOOGLE_API_KEY / DEEPSEEK_API_KEY / LITELLM_API_KEY."
+        "or set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / "
+        "OLLAMA_BASE_URL / GEMINI_API_KEY / GOOGLE_API_KEY / DEEPSEEK_API_KEY / "
+        "LITELLM_API_KEY. Use REPOWISE_PROVIDER=codex_cli to use an authenticated "
+        "Codex CLI subscription, or REPOWISE_PROVIDER=opencode to use opencode."
     )
 
 
@@ -679,6 +853,28 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
     }
 
     if provider_name:
+        if provider_name == "codex_cli":
+            if not _is_codex_cli_available():
+                warnings.append(
+                    "Provider 'codex_cli' requires the Codex CLI. "
+                    "Install it with: npm install -g @openai/codex"
+                )
+            return warnings
+
+        if provider_name == "opencode":
+            import shutil
+
+            if not shutil.which("opencode"):
+                warnings.append(
+                    "Provider 'opencode' requires the opencode CLI.\n"
+                    "  Install:  curl -fsSL https://opencode.ai/install | bash\n"
+                    "  Setup:    run 'opencode' once to configure your provider\n"
+                    "  Models:   opencode models (list available models)\n"
+                    "  More:     https://opencode.ai\n"
+                    "  Usage:    repowise init --provider opencode --model opencode/openai/gpt-5"
+                )
+            return warnings
+
         # Validate specific provider
         if provider_name not in provider_env_vars:
             warnings.append(f"Unknown provider '{provider_name}' - cannot validate configuration")
@@ -888,7 +1084,9 @@ def resolve_command_target(
         raise click.UsageError("--workspace and --no-workspace are mutually exclusive.")
 
     if repo_alias is not None and no_workspace_flag:
-        raise click.UsageError("--repo <alias> implies workspace mode, but --no-workspace was passed.")
+        raise click.UsageError(
+            "--repo <alias> implies workspace mode, but --no-workspace was passed."
+        )
 
     explicit_path = path is not None
     base_path = resolve_repo_path(path)
@@ -927,14 +1125,12 @@ def resolve_command_target(
         ws_config = _load_ws(ws_root)
         if ws_config is None:
             raise WorkspaceNotFound(
-                f"Found workspace config at {ws_root} but couldn't load it. "
-                "Is it valid YAML?"
+                f"Found workspace config at {ws_root} but couldn't load it. Is it valid YAML?"
             )
         if repo_alias is not None and ws_config.get_repo(repo_alias) is None:
             available = ", ".join(ws_config.repo_aliases()) or "(none)"
             raise click.UsageError(
-                f"Unknown repo alias '{repo_alias}' in workspace. "
-                f"Available: {available}"
+                f"Unknown repo alias '{repo_alias}' in workspace. Available: {available}"
             )
         reason = "via --workspace flag" if workspace_flag else f"via --repo {repo_alias}"
         return CommandTarget(

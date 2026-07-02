@@ -4,26 +4,21 @@ import { useState } from "react";
 import useSWR from "swr";
 import { useParams } from "next/navigation";
 import { DollarSign } from "lucide-react";
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-} from "recharts";
 import { StatCard } from "@repowise-dev/ui/shared/stat-card";
+import { MetricCard } from "@repowise-dev/ui/shared/metric-card";
+import { PageShell } from "@repowise-dev/ui/shared/page-shell";
 import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
 import { Skeleton } from "@repowise-dev/ui/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@repowise-dev/ui/ui/tabs";
+import { Tabs, ScrollableTabsList, TabsTrigger, TabsContent } from "@repowise-dev/ui/ui/tabs";
 import {
-  CacheHitRatioCard,
   CostHeatmap,
+  DailySpendChart,
+  DistillSavingsCard,
   ProviderComparison,
   OperationBreakdown,
 } from "@repowise-dev/ui/costs";
-import { listCosts, getCostSummary } from "@/lib/api/costs";
-import type { CostGroup, CostSummary } from "@/lib/api/costs";
+import { listCosts, getCostSummary, getDistillSavings } from "@/lib/api/costs";
+import type { CostGroup, CostSummary, DistillSavings } from "@/lib/api/costs";
 import { formatCost, formatNumber, formatTokens } from "@repowise-dev/ui/lib/format";
 
 export default function CostsPage() {
@@ -55,58 +50,31 @@ export default function CostsPage() {
     { revalidateOnFocus: false },
   );
 
-  return (
-    <div className="p-4 sm:p-6 space-y-6 max-w-[1600px]">
-      <div>
-        <h1 className="text-xl font-semibold text-[var(--color-text-primary)] mb-1 flex items-center gap-2">
-          <DollarSign className="h-5 w-5 text-green-500" />
-          Cost Tracking
-        </h1>
-        <p className="text-sm text-[var(--color-text-secondary)]">
-          LLM token usage and spend across all generation runs.
-        </p>
-      </div>
+  const { data: distillSavings } = useSWR<DistillSavings>(
+    `distill-savings:${id}`,
+    () => getDistillSavings(id),
+    { revalidateOnFocus: false },
+  );
 
-      {loadingSummary ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Skeleton key={i} className="h-24 w-full rounded-lg" />
-          ))}
-        </div>
-      ) : summary ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <StatCard
-            label="Total Cost"
-            value={formatCost(summary.total_cost_usd)}
-            description="all time"
-            icon={<DollarSign className="h-4 w-4 text-green-500" />}
-          />
-          <StatCard
-            label="Total Calls"
-            value={formatNumber(summary.total_calls)}
-            description="LLM API calls"
-          />
-          <StatCard
-            label="Input Tokens"
-            value={formatTokens(summary.total_input_tokens)}
-            description="prompt tokens"
-          />
-          <StatCard
-            label="Output Tokens"
-            value={formatTokens(summary.total_output_tokens)}
-            description="completion tokens"
-          />
-        </div>
-      ) : null}
+  return (
+    <PageShell
+      maxWidth="wide"
+      icon={<DollarSign className="h-5 w-5 text-[var(--color-success)]" />}
+      title="Cost Tracking"
+      description="What repowise saved your coding agent — and what generating the docs cost."
+    >
+      {/* Hero: the honest results surface — all tokens & dollars saved for the
+          coding agent, across distill (CLI + hook) and MCP tool responses. */}
+      <DistillSavingsCard data={distillSavings} />
 
       <Tabs value={tab} onValueChange={setTab} className="w-full">
-        <TabsList>
+        <ScrollableTabsList>
           <TabsTrigger value="daily">Daily</TabsTrigger>
-          <TabsTrigger value="cache">Cache & savings</TabsTrigger>
-          <TabsTrigger value="hotspots">Hotspots</TabsTrigger>
+          <TabsTrigger value="operations">Spend by operation</TabsTrigger>
           <TabsTrigger value="providers">Providers</TabsTrigger>
-          <TabsTrigger value="operations">Operations</TabsTrigger>
-        </TabsList>
+          <TabsTrigger value="hotspots">Hotspots</TabsTrigger>
+          <TabsTrigger value="efficiency">Efficiency</TabsTrigger>
+        </ScrollableTabsList>
 
         <TabsContent value="daily" className="mt-4">
           <Card>
@@ -116,95 +84,50 @@ export default function CostsPage() {
             <CardContent className="pt-0">
               {loadingDay ? (
                 <Skeleton className="h-48 w-full" />
-              ) : dayGroups && dayGroups.length > 0 ? (
-                <ResponsiveContainer width="100%" height={220}>
-                  <BarChart
-                    data={[...dayGroups].sort((a, b) => a.group.localeCompare(b.group))}
-                    margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
-                  >
-                    <XAxis
-                      dataKey="group"
-                      tick={{ fill: "var(--color-text-tertiary)", fontSize: 11 }}
-                      axisLine={false}
-                      tickLine={false}
-                      interval="preserveStartEnd"
-                      minTickGap={24}
-                      tickFormatter={(v: string) => {
-                        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
-                        return m ? `${Number(m[2])}/${Number(m[3])}` : v;
-                      }}
-                    />
-                    <YAxis
-                      tick={{ fill: "var(--color-text-tertiary)", fontSize: 10 }}
-                      axisLine={false}
-                      tickLine={false}
-                      tickFormatter={(v: number) => `$${v.toFixed(3)}`}
-                    />
-                    <Tooltip
-                      cursor={{ fill: "var(--color-bg-elevated)" }}
-                      contentStyle={{
-                        background: "var(--color-bg-overlay)",
-                        border: "1px solid var(--color-border-default)",
-                        borderRadius: "6px",
-                        fontSize: "12px",
-                        color: "var(--color-text-primary)",
-                      }}
-                      formatter={(value: number) => [formatCost(value), "Cost"]}
-                      labelFormatter={(label: string) => `Date: ${label}`}
-                    />
-                    <Bar dataKey="cost_usd" fill="var(--color-accent-primary)" radius={[4, 4, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
               ) : (
-                <p className="text-sm text-[var(--color-text-secondary)] py-8 text-center">
-                  No cost data available.
-                </p>
+                <DailySpendChart groups={dayGroups ?? []} />
               )}
             </CardContent>
           </Card>
         </TabsContent>
 
-        <TabsContent value="cache" className="mt-4">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <CacheHitRatioCard />
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">Token efficiency</CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0">
-                {summary ? (
-                  <div className="space-y-2 text-xs text-[var(--color-text-secondary)]">
-                    <div className="flex justify-between">
-                      <span>Avg input tokens / call</span>
-                      <span className="tabular-nums text-[var(--color-text-primary)]">
-                        {summary.total_calls > 0
-                          ? Math.round(summary.total_input_tokens / summary.total_calls).toLocaleString()
-                          : "—"}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>Avg output tokens / call</span>
-                      <span className="tabular-nums text-[var(--color-text-primary)]">
-                        {summary.total_calls > 0
-                          ? Math.round(summary.total_output_tokens / summary.total_calls).toLocaleString()
-                          : "—"}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>Avg cost / call</span>
-                      <span className="tabular-nums text-[var(--color-text-primary)]">
-                        {summary.total_calls > 0
-                          ? formatCost(summary.total_cost_usd / summary.total_calls)
-                          : "—"}
-                      </span>
-                    </div>
-                  </div>
-                ) : (
-                  <Skeleton className="h-24 w-full" />
-                )}
-              </CardContent>
-            </Card>
-          </div>
+        {/* Cache analytics aren't wired to real data yet; the tab shows the
+            real per-call efficiency numbers as a compact stat strip. */}
+        <TabsContent value="efficiency" className="mt-4">
+          {summary ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <MetricCard
+                label="Avg input / call"
+                value={
+                  summary.total_calls > 0
+                    ? Math.round(summary.total_input_tokens / summary.total_calls).toLocaleString()
+                    : "—"
+                }
+              />
+              <MetricCard
+                label="Avg output / call"
+                value={
+                  summary.total_calls > 0
+                    ? Math.round(summary.total_output_tokens / summary.total_calls).toLocaleString()
+                    : "—"
+                }
+              />
+              <MetricCard
+                label="Avg cost / call"
+                value={
+                  summary.total_calls > 0
+                    ? formatCost(summary.total_cost_usd / summary.total_calls)
+                    : "—"
+                }
+              />
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <Skeleton key={i} className="h-24 w-full rounded-lg" />
+              ))}
+            </div>
+          )}
         </TabsContent>
 
         <TabsContent value="hotspots" className="mt-4">
@@ -242,6 +165,45 @@ export default function CostsPage() {
           </Card>
         </TabsContent>
       </Tabs>
-    </div>
+
+      {/* Indexing / generation cost — deliberately secondary to the savings
+          hero above. */}
+      <div className="space-y-2">
+        <p className="text-xs font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">
+          Indexing &amp; generation cost
+        </p>
+        {loadingSummary ? (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <Skeleton key={i} className="h-24 w-full rounded-lg" />
+            ))}
+          </div>
+        ) : summary ? (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <StatCard
+              label="Indexing cost"
+              value={formatCost(summary.total_cost_usd)}
+              description="across all generation runs"
+              icon={<DollarSign className="h-4 w-4 text-[var(--color-success)]" />}
+            />
+            <StatCard
+              label="Total Calls"
+              value={formatNumber(summary.total_calls)}
+              description="LLM API calls"
+            />
+            <StatCard
+              label="Input Tokens"
+              value={formatTokens(summary.total_input_tokens)}
+              description="prompt tokens"
+            />
+            <StatCard
+              label="Output Tokens"
+              value={formatTokens(summary.total_output_tokens)}
+              description="completion tokens"
+            />
+          </div>
+        ) : null}
+      </div>
+    </PageShell>
   );
 }

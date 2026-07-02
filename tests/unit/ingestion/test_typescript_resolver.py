@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import networkx as nx
+import pytest
 
 from repowise.core.ingestion.resolvers import resolve_import
 from repowise.core.ingestion.resolvers.context import ResolverContext
@@ -70,6 +71,34 @@ class TestSfcExtensions:
         assert result == "src/components/Button.vue"
 
 
+class TestExplicitRelativeExtensions:
+    @pytest.mark.parametrize(
+        "extension",
+        [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"],
+    )
+    def test_existing_explicit_relative_file_wins(
+        self, tmp_path: Path, extension: str
+    ) -> None:
+        ctx = _ctx(tmp_path, [f"data/example{extension}", "services/reader.js"])
+        result = resolve_ts_js_import(
+            f"../data/example{extension}",
+            "services/reader.js",
+            ctx,
+        )
+        assert result == f"data/example{extension}"
+
+    def test_ts_rewrite_fallback_still_resolves_when_js_file_absent(
+        self, tmp_path: Path
+    ) -> None:
+        ctx = _ctx(tmp_path, ["data/example.ts", "services/reader.js"])
+        result = resolve_ts_js_import(
+            "../data/example.js",
+            "services/reader.js",
+            ctx,
+        )
+        assert result == "data/example.ts"
+
+
 class TestWorkspaceMap:
     def test_workspaces_array_form(self, tmp_path: Path) -> None:
         (tmp_path / "package.json").write_text(json.dumps({"workspaces": ["packages/*"]}))
@@ -117,6 +146,24 @@ class TestWorkspaceResolution:
         # No package.json → no workspaces → returns None (resolver itself
         # would then return external:).
         assert resolve_via_workspaces("@unknown/pkg", ctx) is None
+
+    def test_resolves_workspace_subpath_to_mts(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text(json.dumps({"workspaces": ["packages/*"]}))
+        pkg = tmp_path / "packages" / "core"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({"name": "@org/core"}))
+        ctx = _ctx(tmp_path, ["packages/core/src/index.mts"])
+        result = resolve_via_workspaces("@org/core/src/index", ctx)
+        assert result == "packages/core/src/index.mts"
+
+    def test_resolves_workspace_index_cts(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text(json.dumps({"workspaces": ["packages/*"]}))
+        pkg = tmp_path / "packages" / "core"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({"name": "@org/core"}))
+        ctx = _ctx(tmp_path, ["packages/core/index.cts"])
+        result = resolve_via_workspaces("@org/core", ctx)
+        assert result == "packages/core/index.cts"
 
 
 def _setup_workspace(
@@ -285,3 +332,21 @@ class TestWorkspaceExportsField:
             resolve_via_workspaces("@org/ui/secret", ctx)
             == "packages/ui/src/secret.ts"
         )
+
+
+class TestMtsCtsResolution:
+    def test_extensionless_import_resolves_to_mts(self, tmp_path: Path) -> None:
+        ctx = _ctx(tmp_path, ["src/module.mts", "src/main.ts"])
+        assert resolve_ts_js_import("./module", "src/main.ts", ctx) == "src/module.mts"
+
+    def test_extensionless_import_resolves_to_cts(self, tmp_path: Path) -> None:
+        ctx = _ctx(tmp_path, ["src/module.cts", "src/main.ts"])
+        assert resolve_ts_js_import("./module", "src/main.ts", ctx) == "src/module.cts"
+
+    def test_directory_import_resolves_to_index_mts(self, tmp_path: Path) -> None:
+        ctx = _ctx(tmp_path, ["src/pkg/index.mts", "src/main.ts"])
+        assert resolve_ts_js_import("./pkg", "src/main.ts", ctx) == "src/pkg/index.mts"
+
+    def test_directory_import_resolves_to_index_cts(self, tmp_path: Path) -> None:
+        ctx = _ctx(tmp_path, ["src/pkg/index.cts", "src/main.ts"])
+        assert resolve_ts_js_import("./pkg", "src/main.ts", ctx) == "src/pkg/index.cts"

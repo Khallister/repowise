@@ -1,6 +1,7 @@
 "use client";
 
-import { ArrowUpRight, Flame } from "lucide-react";
+import { useState } from "react";
+import { ArrowUpRight, ChevronDown, ChevronRight, Flame } from "lucide-react";
 import { biomarkerLabel } from "./biomarker-glossary";
 import type { BiomarkerDetailsRecord } from "./biomarker-details";
 import { SEVERITY_CHIP, SEVERITY_LABEL, type Severity } from "./tokens";
@@ -15,6 +16,8 @@ export interface HotFunctionFinding {
   health_impact: number;
   reason: string;
   details?: BiomarkerDetailsRecord | null;
+  /** Matching symbol id (server join); enables the symbol-page link. */
+  symbol_id?: string | null;
 }
 
 export interface HotFunctionsPanelProps {
@@ -23,6 +26,12 @@ export interface HotFunctionsPanelProps {
   limit?: number;
   /** Click → open file drawer (and ideally scroll to the function). */
   onSelect?: ((f: HotFunctionFinding) => void) | undefined;
+  /** Href for the function name → canonical symbol page. */
+  symbolHrefFor?: ((f: HotFunctionFinding) => string | undefined) | undefined;
+  /** Start collapsed, showing only `collapsedCount` rows behind a toggle. */
+  collapsible?: boolean;
+  /** Rows shown while collapsed. */
+  collapsedCount?: number;
 }
 
 const HOT_FUNCTION_BIOMARKERS = new Set([
@@ -83,24 +92,50 @@ export function HotFunctionsPanel({
   findings,
   limit = 15,
   onSelect,
+  symbolHrefFor,
+  collapsible = false,
+  collapsedCount = 4,
 }: HotFunctionsPanelProps) {
-  const rows = aggregate(findings).slice(0, limit);
-  if (rows.length === 0) return null;
+  const all = aggregate(findings).slice(0, limit);
+  const [open, setOpen] = useState(!collapsible);
+  if (all.length === 0) return null;
+  const rows = open ? all : all.slice(0, collapsedCount);
+  const headerInner = (
+    <>
+      {collapsible ? (
+        open ? (
+          <ChevronDown className="h-4 w-4 text-[var(--color-text-tertiary)]" aria-hidden="true" />
+        ) : (
+          <ChevronRight className="h-4 w-4 text-[var(--color-text-tertiary)]" aria-hidden="true" />
+        )
+      ) : null}
+      <Flame className="h-4 w-4 text-[var(--color-warning)]" aria-hidden="true" />
+      <h2 className="text-sm font-medium text-[var(--color-text-primary)]">Hot functions</h2>
+      <span className="text-xs text-[var(--color-text-tertiary)]">
+        Top functions where churn, age, and complexity collide
+      </span>
+      <span className="ml-auto text-xs text-[var(--color-text-tertiary)]">
+        {all.length} function{all.length === 1 ? "" : "s"}
+      </span>
+    </>
+  );
 
   return (
     <section className="rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-surface)]">
-      <header className="flex items-center gap-2 px-4 py-3 border-b border-[var(--color-border-default)]">
-        <Flame className="h-4 w-4 text-amber-500" aria-hidden="true" />
-        <h2 className="text-sm font-medium text-[var(--color-text-primary)]">
-          Hot functions
-        </h2>
-        <span className="text-xs text-[var(--color-text-tertiary)]">
-          Top functions where churn, age, and complexity collide
-        </span>
-        <span className="ml-auto text-xs text-[var(--color-text-tertiary)]">
-          {rows.length} function{rows.length === 1 ? "" : "s"}
-        </span>
-      </header>
+      {collapsible ? (
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex w-full items-center gap-2 px-4 py-3 border-b border-[var(--color-border-default)] text-left hover:bg-[var(--color-bg-elevated)] transition-colors"
+        >
+          {headerInner}
+        </button>
+      ) : (
+        <header className="flex items-center gap-2 px-4 py-3 border-b border-[var(--color-border-default)]">
+          {headerInner}
+        </header>
+      )}
       <ul className="divide-y divide-[var(--color-border-default)]">
         {rows.map((row) => {
           const interactive = !!onSelect;
@@ -116,14 +151,30 @@ export function HotFunctionsPanel({
                 >
                   {SEVERITY_LABEL[row.worst_severity]}
                 </span>
-                <span className="text-xs font-mono text-[var(--color-text-primary)]">
-                  {row.function_name}
-                </span>
-                <span className="text-[11px] font-mono text-[var(--color-text-tertiary)] truncate">
+                {(() => {
+                  const href = symbolHrefFor
+                    ? symbolHrefFor(row.representative)
+                    : undefined;
+                  return href ? (
+                    <a
+                      href={href}
+                      onClick={(e) => e.stopPropagation()}
+                      className="text-xs font-mono text-[var(--color-accent-primary)] hover:underline"
+                      title="Open symbol page"
+                    >
+                      {row.function_name}
+                    </a>
+                  ) : (
+                    <span className="text-xs font-mono text-[var(--color-text-primary)]">
+                      {row.function_name}
+                    </span>
+                  );
+                })()}
+                <span className="text-xs font-mono text-[var(--color-text-tertiary)] truncate">
                   {row.file_path}
                 </span>
                 <span className="ml-auto inline-flex items-center gap-2">
-                  <span className="text-xs tabular-nums text-red-500">
+                  <span className="text-xs tabular-nums text-[var(--color-error)]">
                     −{row.total_impact.toFixed(2)}
                   </span>
                   {interactive ? (
@@ -145,6 +196,15 @@ export function HotFunctionsPanel({
           );
         })}
       </ul>
+      {collapsible && all.length > collapsedCount ? (
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="w-full border-t border-[var(--color-border-default)] px-4 py-2 text-xs font-medium text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-primary)] transition-colors"
+        >
+          {open ? "Show less" : `Show all ${all.length}`}
+        </button>
+      ) : null}
     </section>
   );
 }

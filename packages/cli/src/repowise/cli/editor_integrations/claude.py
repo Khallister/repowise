@@ -47,6 +47,7 @@ class ClaudeCodeSetup:
 
     def register_client(self, console_obj: Any, repo_path: Path) -> None:
         from repowise.cli.editor_integrations.claude_config import (
+            enable_tool_search_in_claude_code,
             install_claude_code_hooks,
             register_with_claude_code,
             register_with_claude_desktop,
@@ -62,8 +63,12 @@ class ClaudeCodeSetup:
 
         hooks = install_claude_code_hooks()
         if hooks:
+            console_obj.print("  [green]✓[/green] Claude Code hooks registered (PostToolUse)")
+
+        if enable_tool_search_in_claude_code():
             console_obj.print(
-                "  [green]✓[/green] Claude Code hooks registered (PreToolUse + PostToolUse)"
+                "  [green]✓[/green] Claude Code tool-search enabled "
+                "(defers MCP tool schemas)"
             )
 
     def refresh_project_files(
@@ -125,8 +130,11 @@ def maybe_generate_claude_md(
         return
     if not _claude_md_enabled(repo_path):
         return
+
+    from repowise.cli.ui import OWL_SPINNER
+
     try:
-        with console_obj.status("  Generating .claude/CLAUDE.md…", spinner="dots"):
+        with console_obj.status("  Generating .claude/CLAUDE.md…", spinner=OWL_SPINNER):
             run_async(_write_claude_md_async(repo_path))
         console_obj.print("  [green]✓[/green] .claude/CLAUDE.md updated")
     except Exception as exc:

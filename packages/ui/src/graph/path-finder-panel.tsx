@@ -98,7 +98,7 @@ function NodeAutocomplete({
       {showDropdown && displayResults.length > 0 && (
         <div className="absolute top-full left-0 mt-1 w-full max-h-52 overflow-auto z-50 rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-overlay)] shadow-xl shadow-black/30 py-1">
           {results.length === 0 && topNodes.length > 0 && (
-            <div className="px-3 py-1 text-[9px] text-[var(--color-text-tertiary)] uppercase tracking-wider">
+            <div className="px-3 py-1 text-[10px] text-[var(--color-text-tertiary)] uppercase tracking-wider">
               Top files by importance
             </div>
           )}
@@ -234,7 +234,7 @@ export function PathFinderPanel({
         className="w-full h-7 text-xs font-medium gap-1.5"
         style={{
           background: "var(--color-accent-graph)",
-          color: "#000",
+          color: "var(--color-text-on-accent)",
         }}
       >
         {loading ? (

@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repowise"
-version = "0.14.0"
+version = "0.25.0"
 description = "The codebase intelligence layer for your AI coding agent — dependency graph, git history, dead code, decisions, and code health, exposed over MCP"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -112,6 +112,7 @@ dev = [
 [project.scripts]
 repowise = "repowise.cli.main:cli"
 repowise-augment = "repowise.cli.augment_hook:main"
+repowise-rewrite = "repowise.cli.rewrite_hook:main"
 
 [project.urls]
 Homepage = "https://github.com/repowise-dev/repowise"
@@ -135,6 +136,11 @@ namespaces = true
 [tool.setuptools.package-data]
 "repowise.core.ingestion" = ["queries/*.scm"]
 "repowise.core.generation" = ["templates/*.j2"]
+# Bundled copy of docs/CHANGELOG.md so the CLI `whats-new` / post-upgrade panel
+# and the web what's-new view work offline from the installed wheel. Lives in
+# core (the neutral home shared by cli + server). Kept in sync with the
+# canonical docs/CHANGELOG.md by a drift-guard test (see tests/unit/upgrade).
+"repowise.core.upgrade" = ["_data/CHANGELOG.md"]
 
 # ---------------------------------------------------------------------------
 # uv workspace (kept for local development)

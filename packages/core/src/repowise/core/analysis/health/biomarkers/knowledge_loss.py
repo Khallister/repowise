@@ -8,17 +8,29 @@ this code.
 
 Fires when:
 
-- ``bus_factor`` ≤ 1 (the file has one true author)
-- AND ``primary_owner_name`` differs from ``recent_owner_name`` OR the
+- the file is still changing (``commit_count_90d`` ≥ 1 or it is a
+  hotspot; an ``is_stable`` file never fires), AND
+- ``bus_factor`` ≤ 1 (the file has one true author), AND
+- ``primary_owner_name`` differs from ``recent_owner_name`` OR the
   recent owner contributes < 20% of recent commits
 
+The activity gate is what makes this signal point the right way: an
+abandoned-but-stable file is *low* risk (the survivor effect — code
+nobody touches doesn't break), so knowledge loss only matters while the
+code is live and the lost author's intent is still being edited around.
+
 Severity grades on whether the file is also a hotspot.
+
+On a small team (≤ ``SMALL_TEAM_MAX_CONTRIBUTORS`` active contributors
+in 90d), bus-factor-1 files are the expected operating model — the risk
+is real but not actionable, so severity is capped at LOW unless the file
+is also a hotspot (issue #361).
 """
 
 from __future__ import annotations
 
 from ..models import Severity
-from .base import BiomarkerResult, FileContext
+from .base import SMALL_TEAM_MAX_CONTRIBUTORS, BiomarkerResult, FileContext
 
 _BUS_FACTOR_THRESHOLD = 1
 _RECENT_SHARE_THRESHOLD = 0.2
@@ -50,6 +62,14 @@ class KnowledgeLossDetector:
 
     def detect(self, ctx: FileContext) -> list[BiomarkerResult]:
         meta = ctx.git_meta or {}
+
+        # Activity gate: an abandoned-but-stable file is low risk
+        # (survivor effect). Only fire while the code is still live.
+        if meta.get("is_stable"):
+            return []
+        if _as_int(meta.get("commit_count_90d")) < 1 and not _is_hotspot(meta):
+            return []
+
         bus = _as_int(meta.get("bus_factor"))
         if bus > _BUS_FACTOR_THRESHOLD or bus == 0:
             # bus_factor 0 means git indexing was skipped or the file
@@ -69,12 +89,28 @@ class KnowledgeLossDetector:
         if not (primary_gone or recent_quiet):
             return []
 
-        if _is_hotspot(meta):
+        hotspot = _is_hotspot(meta)
+        if hotspot:
             severity = Severity.HIGH
         elif primary_gone and recent_quiet:
             severity = Severity.MEDIUM
         else:
             severity = Severity.LOW
+
+        reason = (
+            f"Primary owner {primary} no longer the recent owner"
+            if primary_gone
+            else f"Primary owner {primary} barely active (recent share {share:.0%})"
+        )
+
+        # Small-team calibration (issue #361): on a 1-3 person team,
+        # bus_factor ≤ 1 is the norm, not a silo signal. Keep the finding
+        # but cap it at LOW unless the file is hotspot-active.
+        active = ctx.repo_active_contributors_90d
+        small_team = active is not None and active <= SMALL_TEAM_MAX_CONTRIBUTORS
+        if small_team and not hotspot and severity != Severity.LOW:
+            severity = Severity.LOW
+            reason += f" (informational: small team, {active} active contributors in 90d)"
 
         return [
             BiomarkerResult(
@@ -88,13 +124,10 @@ class KnowledgeLossDetector:
                     "primary_owner": primary,
                     "recent_owner": recent or None,
                     "recent_owner_share": round(share, 3),
-                    "is_hotspot": _is_hotspot(meta),
+                    "is_hotspot": hotspot,
+                    "small_team": small_team,
                 },
-                reason=(
-                    f"Primary owner {primary} no longer the recent owner"
-                    if primary_gone
-                    else f"Primary owner {primary} barely active (recent share {share:.0%})"
-                ),
+                reason=reason,
             )
         ]
 

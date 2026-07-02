@@ -16,6 +16,10 @@ from pathlib import Path
 
 import structlog
 
+from repowise.core.fs_walk import iter_glob
+
+from .msbuild import path_has_dotnet_scan_skip_dir
+
 log = structlog.get_logger(__name__)
 
 # Project("{TYPE}") = "Name", "rel\path.csproj", "{GUID}"
@@ -56,11 +60,10 @@ def parse_sln(sln_path: Path) -> list[SolutionEntry]:
     return out
 
 
-def find_sln_files(repo_path: Path) -> list[Path]:
-    skip = {".git", "node_modules", "bin", "obj"}
+def find_sln_files(repo_path: Path, *, prune_nested_git: bool = True) -> list[Path]:
     out: list[Path] = []
-    for sln in repo_path.rglob("*.sln"):
-        if any(part in skip for part in sln.parts):
+    for sln in iter_glob(repo_path, "*.sln", prune_nested_git=prune_nested_git):
+        if path_has_dotnet_scan_skip_dir(sln, repo_path):
             continue
         out.append(sln)
     return out

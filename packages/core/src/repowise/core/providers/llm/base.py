@@ -14,13 +14,45 @@ Adding a new provider:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from repowise.core.reasoning import ReasoningMode, normalize_reasoning
 
-
 CacheSegment = Literal["system", "user_prefix"]
+ModelOptionSource = Literal["api", "local", "fallback"]
+
+
+@dataclass(frozen=True)
+class ProviderModelOption:
+    """A model choice exposed by a provider for interactive configuration."""
+
+    model: str
+    label: str | None = None
+    reasoning_modes: tuple[ReasoningMode, ...] = ("auto",)
+    recommended: bool = False
+    source: ModelOptionSource = "fallback"
+    notes: str = ""
+
+
+def fallback_model_option(
+    model: str,
+    *,
+    label: str | None = None,
+    reasoning_modes: tuple[ReasoningMode, ...] = ("auto",),
+    notes: str = "model list unavailable; using configured model",
+) -> ProviderModelOption:
+    """Return the single fallback option used when live discovery fails."""
+
+    return ProviderModelOption(
+        model=model,
+        label=label or model,
+        reasoning_modes=reasoning_modes,
+        recommended=True,
+        source="fallback",
+        notes=notes,
+    )
 
 
 @dataclass(frozen=True)
@@ -120,8 +152,8 @@ class BaseProvider(ABC):
                            repowise uses 0.3 for consistent doc style.
             request_id:    Optional trace ID for logging and debugging.
             reasoning:     Provider-level reasoning intent. ``auto`` preserves
-                           provider defaults; ``off`` and ``minimal`` are
-                           translated by providers that support them.
+                           provider defaults; explicit modes are translated by
+                           providers that support them.
             cache_hints:   Optional hints that one or more prompt segments are
                            reusable across calls. Providers with an explicit
                            caching primitive (Anthropic) use them; others
@@ -156,6 +188,29 @@ class BaseProvider(ABC):
         """
         ...
 
+    def supported_reasoning_modes(self) -> tuple[ReasoningMode, ...]:
+        """Return reasoning modes supported by this provider/model.
+
+        ``auto`` is always present because it means "preserve provider defaults".
+        Providers with model-specific support should override this method and
+        return the exact explicit modes they can translate before an API call.
+        """
+
+        return ("auto",)
+
+    def available_model_options(self) -> tuple[ProviderModelOption, ...]:
+        """Return model options available for interactive provider setup."""
+
+        return (
+            ProviderModelOption(
+                model=self.model_name,
+                label=self.model_name,
+                reasoning_modes=self.supported_reasoning_modes(),
+                recommended=True,
+                source="fallback",
+            ),
+        )
+
 
 class ProviderError(Exception):
     """Raised when a provider returns an unrecoverable error.
@@ -177,12 +232,115 @@ class ProviderError(Exception):
 
 
 class RateLimitError(ProviderError):
-    """Raised when rate limits are permanently exhausted after retries.
+    """Raised on a 429 response from the provider.
 
-    This is a sub-class of ProviderError. Callers can catch either,
-    but RateLimitError signals that backing off longer won't help —
-    the operator needs to review rate limits or reduce concurrency.
+    This is a sub-class of ProviderError. Callers can catch either.
+    Rate-limit 429s are *recoverable* — the shared retry policy
+    (``provider_retry_*`` below) backs off patiently (respecting the
+    provider's ``retry-after`` when known) before giving up.
+
+    Attributes:
+        retry_after: Seconds the provider asked us to wait before retrying,
+                     parsed from the ``retry-after`` header (or provider
+                     equivalent). ``None`` when the provider didn't say.
     """
+
+    def __init__(
+        self,
+        provider: str,
+        message: str,
+        status_code: int | None = 429,
+        retry_after: float | None = None,
+    ) -> None:
+        self.retry_after = retry_after
+        super().__init__(provider, message, status_code=status_code)
+
+
+def parse_retry_after(headers: Any) -> float | None:
+    """Best-effort parse of a ``retry-after`` header value in seconds.
+
+    Accepts any mapping-like object with ``.get`` (httpx.Headers, dict).
+    Returns ``None`` when absent or unparseable. HTTP-date form is ignored —
+    providers we call send delta-seconds.
+    """
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        if raw is None:
+            return None
+        seconds = float(raw)
+        return seconds if 0 < seconds <= 600 else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Shared tenacity retry policy for all HTTP providers
+#
+# Philosophy: the client-side RateLimiter is only a flood guard with very
+# generous defaults; the provider's own 429s are the real throttle signal.
+# 429s therefore get a patient, retry-after-aware backoff (they resolve
+# within the provider's rate window), while transient 5xx/network errors get
+# a short exponential retry, and non-retryable 4xx (400/401/403/404/422)
+# fail immediately instead of burning three pointless attempts.
+# ---------------------------------------------------------------------------
+
+_TRANSIENT_ATTEMPTS = 3  # 5xx / network / unknown errors
+_RATE_LIMIT_ATTEMPTS = 6  # 429s — waits 2+4+8+16+30 ≈ one full rate window
+_RATE_LIMIT_MAX_WAIT = 30.0  # per-attempt cap; cumulative covers the window
+_NON_RETRYABLE_STATUS = frozenset({400, 401, 403, 404, 405, 413, 422})
+
+# Multiplier applied to every computed wait. Production leaves this at 1.0;
+# tests shrink it (e.g. 0.01) so persistent-429 retry paths stay fast without
+# changing the retry shape. Read at call time, so monkeypatching works.
+_WAIT_SCALE = 1.0
+
+
+def _retry_exc(retry_state: Any) -> BaseException | None:
+    outcome = retry_state.outcome
+    return outcome.exception() if outcome is not None else None
+
+
+def provider_should_retry(retry_state: Any) -> bool:
+    """tenacity ``retry`` predicate: retry 429s and transient errors only."""
+    exc = _retry_exc(retry_state)
+    if not isinstance(exc, ProviderError):
+        return False
+    if isinstance(exc, RateLimitError):
+        return True
+    return exc.status_code not in _NON_RETRYABLE_STATUS
+
+
+def provider_retry_stop(retry_state: Any) -> bool:
+    """tenacity ``stop`` predicate: more attempts for 429s than for 5xx."""
+    limit = (
+        _RATE_LIMIT_ATTEMPTS
+        if isinstance(_retry_exc(retry_state), RateLimitError)
+        else _TRANSIENT_ATTEMPTS
+    )
+    return retry_state.attempt_number >= limit
+
+
+def provider_retry_wait(retry_state: Any) -> float:
+    """tenacity ``wait`` callable.
+
+    429 with retry-after → honour it (+ jitter). 429 without → exponential
+    jitter, per-attempt cap 30s, cumulatively covering a full per-minute rate
+    window. Everything else → short exponential jitter (1-4s), matching the
+    old policy.
+    """
+    import random
+
+    exc = _retry_exc(retry_state)
+    attempt = retry_state.attempt_number
+    if isinstance(exc, RateLimitError):
+        if exc.retry_after is not None:
+            wait = min(exc.retry_after + random.uniform(0, 1), 65.0)
+        else:
+            wait = min(2.0**attempt + random.uniform(0, 1), _RATE_LIMIT_MAX_WAIT)
+        return wait * _WAIT_SCALE
+    return (min(2.0 ** (attempt - 1), 4.0) * random.uniform(0.5, 1.0) + 0.5) * _WAIT_SCALE
 
 
 def ensure_reasoning_supported(

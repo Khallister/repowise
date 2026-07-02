@@ -43,21 +43,21 @@ export const BADGE_DEFS: readonly BadgeDef[] = [
 
 /** Hex colors mirrored on the Sigma canvas dot renderer (see sigma-canvas). */
 export const BADGE_COLORS: Record<BadgeDef["tone"], string> = {
-  danger: "#ef4444",
-  warn: "#f59520",
-  success: "#22c55e",
-  info: "#a78bfa",
-  accent: "#60a5fa",
-  neutral: "#94a3b8",
+  danger: "var(--color-error)",
+  warn: "var(--color-accent-primary)",
+  success: "var(--color-success)",
+  info: "var(--color-plum-400)",
+  accent: "var(--color-info)",
+  neutral: "var(--color-text-tertiary)",
 };
 
 const TONE_CLASSES: Record<BadgeDef["tone"], string> = {
-  danger: "bg-red-500/10 text-red-400",
-  warn: "bg-amber-500/10 text-amber-400",
-  success: "bg-green-500/10 text-green-400",
-  info: "bg-purple-500/10 text-purple-400",
-  accent: "bg-sky-500/10 text-sky-400",
-  neutral: "bg-slate-500/10 text-slate-400",
+  danger: "bg-[var(--color-error)]/10 text-[var(--color-error)]",
+  warn: "bg-[var(--color-warning)]/10 text-[var(--color-warning)]",
+  success: "bg-[var(--color-success)]/10 text-[var(--color-success)]",
+  info: "bg-[var(--color-plum-400)]/10 text-[var(--color-plum-400)]",
+  accent: "bg-[var(--color-info)]/10 text-[var(--color-info)]",
+  neutral: "bg-[var(--color-text-tertiary)]/10 text-[var(--color-text-tertiary)]",
 };
 
 export interface NodeBadgesProps {
@@ -76,7 +76,7 @@ export function NodeBadges({ signals, only, size = "xs", className }: NodeBadges
   if (active.length === 0) return null;
 
   const sizeClass =
-    size === "sm" ? "text-[11px] px-2 py-0.5" : "text-[10px] px-1.5 py-0.5";
+    size === "sm" ? "text-xs px-2 py-0.5" : "text-[10px] px-1.5 py-0.5";
   const iconSize = size === "sm" ? "w-3 h-3" : "w-2.5 h-2.5";
 
   return (

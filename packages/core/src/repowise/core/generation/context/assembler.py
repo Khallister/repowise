@@ -90,8 +90,14 @@ class ContextAssembler:
         page_summaries: dict[str, str] | None = None,
         decision_records: list[dict] | None = None,
         kg_context: Any | None = None,
+        symbol_index: dict[str, list[tuple[Any, dict]]] | None = None,
     ) -> FilePageContext:
-        """Assemble context for the file_page template."""
+        """Assemble context for the file_page template.
+
+        *symbol_index* (see :func:`build_symbol_index`) makes the call-graph /
+        heritage extraction a dict lookup instead of a full graph-node scan —
+        pass it when assembling context for many files against one graph.
+        """
         path = parsed.file_info.path
         budget = self._config.token_budget
         used = 0
@@ -158,8 +164,8 @@ class ContextAssembler:
         depth = self._select_generation_depth(path, git_meta, pagerank.get(path, 0.0))
 
         # Graph intelligence: call graph, heritage, community metadata
-        call_graph_entries = extract_call_graph(path, graph)
-        heritage_entries = extract_heritage(path, graph)
+        call_graph_entries = extract_call_graph(path, graph, symbol_index)
+        heritage_entries = extract_heritage(path, graph, symbol_index)
         community_label, community_cohesion = extract_community_meta(path, graph)
 
         return FilePageContext(
@@ -195,6 +201,7 @@ class ContextAssembler:
             community_cohesion=community_cohesion,
             decision_records=decision_records or [],
             kg_layer_name=kg_context.layer_name if kg_context else "",
+            kg_layer_id=kg_context.layer_id if kg_context else "",
             kg_layer_description=kg_context.layer_description if kg_context else "",
             kg_layer_role=kg_context.role if kg_context else "",
             kg_neighbors=kg_context.neighbors if kg_context else [],

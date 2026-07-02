@@ -26,6 +26,79 @@ from repowise.core.pipeline import persist_pipeline_result, run_pipeline
 
 logger = structlog.get_logger(__name__)
 
+
+def _repo_exclude_patterns(repo: Any, repo_path: str) -> list[str]:
+    """Collect a server job's exclude patterns from both config sources.
+
+    Web-managed repos store settings in ``Repository.settings_json``; CLI and
+    ``repowise init`` workflows write them to ``.repowise/config.yaml``. Server
+    jobs should honor either, so we merge both — order-preserving and
+    de-duplicated, settings first. A missing or malformed source is ignored
+    rather than fatal.
+    """
+    patterns: list[str] = []
+
+    def _add(values: Any) -> None:
+        if not isinstance(values, list):
+            return
+        for value in values:
+            if isinstance(value, str) and value not in patterns:
+                patterns.append(value)
+
+    # Source 1: DB-stored repo settings (web UI).
+    try:
+        settings = json.loads(getattr(repo, "settings_json", "") or "{}")
+        if isinstance(settings, dict):
+            _add(settings.get("exclude_patterns"))
+    except (TypeError, ValueError):
+        logger.debug("repo_settings_json_unparsable", repo_path=repo_path)
+
+    # Source 2: repo-local .repowise/config.yaml (CLI/init). Reuse the shared
+    # loader so we inherit its YAML + flat-format fallback handling.
+    try:
+        from repowise.core.repo_config import load_repo_config
+
+        cfg = load_repo_config(Path(repo_path))
+        if isinstance(cfg, dict):
+            _add(cfg.get("exclude_patterns"))
+    except Exception:
+        logger.debug("repo_config_yaml_unreadable", repo_path=repo_path)
+
+    return patterns
+
+
+def _repo_wiki_style(repo: Any, repo_path: str) -> str:
+    """Resolve a server job's effective wiki style from both config sources.
+
+    Web-managed repos store the style in ``Repository.settings_json`` (set via the
+    PATCH endpoint); CLI/``repowise init`` write it to ``.repowise/config.yaml``.
+    Settings take precedence (the web UI is the more deliberate, recent signal),
+    then config.yaml, then the default. Unknown values resolve to the default
+    rather than failing the job.
+    """
+    from repowise.core.generation.styles import resolve_style
+
+    style: str | None = None
+    try:
+        settings = json.loads(getattr(repo, "settings_json", "") or "{}")
+        if isinstance(settings, dict):
+            style = settings.get("wiki_style")
+    except (TypeError, ValueError):
+        logger.debug("repo_settings_json_unparsable", repo_path=repo_path)
+
+    if not style:
+        try:
+            from repowise.core.repo_config import load_repo_config
+
+            cfg = load_repo_config(Path(repo_path))
+            if isinstance(cfg, dict):
+                style = cfg.get("wiki_style")
+        except Exception:
+            logger.debug("repo_config_yaml_unreadable", repo_path=repo_path)
+
+    return resolve_style(style, repo_path=repo_path).name
+
+
 # Phase → numeric level mapping for job.current_level
 _PHASE_LEVELS = {
     "traverse": 0,
@@ -86,9 +159,7 @@ class JobProgressCallback:
             self._sync_job_status()
 
     def on_message(self, level: str, text: str) -> None:
-        getattr(logger, level, logger.info)(
-            text, job_id=self._job_id, phase=self._phase
-        )
+        getattr(logger, level, logger.info)(text, job_id=self._job_id, phase=self._phase)
 
     def _sync_job_status(self, *, force: bool = False) -> None:
         """Fire-and-forget progress update in the current event loop.
@@ -211,11 +282,18 @@ async def execute_job(
             repo = await get_repository(session, job.repository_id)
             if repo is None:
                 logger.error("repo_not_found", job_id=job_id, repo_id=job.repository_id)
-                await update_job_status(session, job_id, "failed", error_message="Repository not found")
+                await update_job_status(
+                    session, job_id, "failed", error_message="Repository not found"
+                )
                 return
 
             repo_path = repo.local_path
             repo_id = repo.id
+            # Resolve excludes while ``repo`` is still session-attached. Every
+            # job entry point flows through here, so this covers them all.
+            exclude_patterns = _repo_exclude_patterns(repo, repo_path)
+            # Resolve the wiki style while ``repo`` is still session-attached.
+            wiki_style = _repo_wiki_style(repo, repo_path)
             config = json.loads(job.config_json) if job.config_json else {}
             is_full_resync = config.get("mode") == "full_resync"
 
@@ -234,7 +312,10 @@ async def execute_job(
         try:
             from repowise.server.provider_config import get_chat_provider_instance
 
-            llm_client = get_chat_provider_instance()
+            # Pass the repo path so the job reuses the provider/model/key the
+            # repo was configured with (``.repowise/config.yaml`` + ``.env``)
+            # rather than the server-global default.
+            llm_client = get_chat_provider_instance(repo_path=repo_path)
         except Exception as exc:
             logger.warning("no_provider_configured", error=str(exc))
             # Continue without LLM — ingestion + analysis still work
@@ -248,6 +329,8 @@ async def execute_job(
             llm_client=llm_client,
             vector_store=vector_store,
             progress=progress,
+            exclude_patterns=exclude_patterns or None,
+            wiki_style=wiki_style,
         )
 
         # ---- Incremental page regeneration for sync mode ------------------
@@ -257,12 +340,17 @@ async def execute_job(
         incremental_pages: list = []
         if not is_full_resync and llm_client is not None:
             incremental_pages = await _incremental_page_regen(
-                Path(repo_path), result, llm_client, config, progress,
+                Path(repo_path),
+                result,
+                llm_client,
+                config,
+                progress,
+                repo_wiki_style=wiki_style,
             )
 
         # ---- Persist results -----------------------------------------------
         async with get_session(session_factory) as session:
-            await persist_pipeline_result(result, session, repo_id)
+            swept_page_ids = await persist_pipeline_result(result, session, repo_id)
 
             # Persist incrementally regenerated pages
             if incremental_pages:
@@ -271,8 +359,22 @@ async def execute_job(
                 for page in incremental_pages:
                     await upsert_page_from_generated(session, page, repo_id)
 
-        # FTS indexing runs after session closes to avoid SQLite write conflicts
+            # Drop swept pages from the vector store *before* the SQL session
+            # commits. The vector store is a separate engine/file (pgvector DB,
+            # LanceDB dir, or in-memory), so there is no SQLite write-lock
+            # conflict and the idempotent delete leaves the durable SQL commit
+            # last: an interrupted run self-heals (embedding already gone, SQL
+            # rows follow on commit).
+            if swept_page_ids and vector_store is not None:
+                await vector_store.delete_many(swept_page_ids)
+
+        # FTS deletes/indexing run after the session closes: the FTS index can
+        # share the SQLite file with the session, so writing it while the
+        # session holds a write lock raises "database is locked". The swept-id
+        # delete is idempotent (orphan FTS rows only) and must stay here.
         all_pages = (result.generated_pages or []) + incremental_pages
+        if fts is not None and swept_page_ids:
+            await fts.delete_many(swept_page_ids)
         if fts is not None and all_pages:
             for page in all_pages:
                 await fts.index(page.page_id, page.title, page.content)
@@ -390,6 +492,7 @@ async def _incremental_page_regen(
     llm_client: Any,
     job_config: dict,
     progress: Any | None,
+    repo_wiki_style: str = "comprehensive",
 ) -> list:
     """Regenerate only wiki pages affected by recent changes.
 
@@ -439,7 +542,9 @@ async def _incremental_page_regen(
             return []
 
         cascade_budget = compute_adaptive_budget(file_diffs, result.file_count)
-        affected = detector.get_affected_pages(file_diffs, result.graph_builder.graph(), cascade_budget)
+        affected = detector.get_affected_pages(
+            file_diffs, result.graph_builder.graph(), cascade_budget
+        )
 
         if not affected.regenerate:
             logger.info("incremental_page_regen_skipped", reason="no_affected_pages")
@@ -461,14 +566,24 @@ async def _incremental_page_regen(
         affected_source = {p: s for p, s in result.source_map.items() if p in regen_set}
 
         from repowise.core.generation import ContextAssembler, GenerationConfig, PageGenerator
+
+        # Effective style: a per-page override carried in the job config (set by
+        # the regenerate endpoint, D10) wins over the repo's default style.
+        from repowise.core.generation.styles import resolve_style
         from repowise.core.reasoning import resolve_reasoning
         from repowise.core.repo_config import load_repo_config
 
+        effective_style = resolve_style(
+            job_config.get("style") or repo_wiki_style, repo_path=repo_path
+        ).name
         generation_config = GenerationConfig(
-            reasoning=resolve_reasoning(config=load_repo_config(repo_path))
+            reasoning=resolve_reasoning(config=load_repo_config(repo_path)),
+            wiki_style=effective_style,
         )
         assembler = ContextAssembler(generation_config)
-        generator = PageGenerator(llm_client, assembler, generation_config)
+        generator = PageGenerator(
+            llm_client, assembler, generation_config, repo_path=repo_path
+        )
 
         pages = await generator.generate_all(
             affected_parsed,
@@ -477,6 +592,7 @@ async def _incremental_page_regen(
             result.repo_structure,
             result.repo_name,
             git_meta_map=result.git_meta_map,
+            repo_path=repo_path,
         )
 
         logger.info("incremental_page_regen_done", pages=len(pages))

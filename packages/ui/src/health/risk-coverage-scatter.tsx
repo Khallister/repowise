@@ -78,10 +78,10 @@ export function RiskCoverageScatter({
       <div className="relative">
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label="Risk vs coverage scatter plot">
           {/* Quadrant tinting */}
-          <rect x={padL} y={padT} width={midX - padL} height={midY - padT} fill="currentColor" className="text-amber-500/5" />
-          <rect x={midX} y={padT} width={W - padR - midX} height={midY - padT} fill="currentColor" className="text-emerald-500/5" />
-          <rect x={padL} y={midY} width={midX - padL} height={H - padB - midY} fill="currentColor" className="text-red-500/8" />
-          <rect x={midX} y={midY} width={W - padR - midX} height={H - padB - midY} fill="currentColor" className="text-yellow-500/5" />
+          <rect x={padL} y={padT} width={midX - padL} height={midY - padT} fill="currentColor" className="text-[var(--color-warning)]/5" />
+          <rect x={midX} y={padT} width={W - padR - midX} height={midY - padT} fill="currentColor" className="text-[var(--color-success)]/5" />
+          <rect x={padL} y={midY} width={midX - padL} height={H - padB - midY} fill="currentColor" className="text-[var(--color-error)]/8" />
+          <rect x={midX} y={midY} width={W - padR - midX} height={H - padB - midY} fill="currentColor" className="text-[var(--color-caution)]/5" />
 
           {/* Axes */}
           <line x1={padL} y1={padT} x2={padL} y2={H - padB} stroke="currentColor" strokeOpacity={0.2} />
@@ -122,7 +122,14 @@ export function RiskCoverageScatter({
             const cx = xScale(p.line_coverage_pct ?? 0);
             const cy = yScale(p.health_score);
             const isHovered = hovered?.file_path === p.file_path;
-            const fillCls = p.health_score < 4 ? "fill-red-500" : p.health_score < 7 ? "fill-amber-500" : "fill-emerald-500";
+            const fillCls =
+              p.health_score < 4
+                ? "fill-[var(--color-error)]"
+                : p.health_score < 6
+                  ? "fill-[var(--color-warning)]"
+                  : p.health_score < 8
+                    ? "fill-[var(--color-caution)]"
+                    : "fill-[var(--color-success)]";
             return (
               <circle
                 key={p.file_path}
@@ -143,7 +150,7 @@ export function RiskCoverageScatter({
           })}
         </svg>
         {hovered ? (
-          <div className="pointer-events-none absolute bottom-2 left-2 rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] shadow-md">
+          <div className="pointer-events-none absolute bottom-2 left-2 rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-2 py-1 text-xs shadow-md">
             <span className="font-mono text-[var(--color-text-primary)]">{hovered.file_path}</span>
             <span className="ml-2 text-[var(--color-text-tertiary)]">
               {hovered.health_score.toFixed(1)} · {hovered.line_coverage_pct?.toFixed(0)}% · {hovered.nloc} NLOC

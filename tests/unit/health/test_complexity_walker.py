@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from repowise.core.analysis.health.complexity import walk_file_complexity
+from repowise.core.analysis.health.complexity import walk_file, walk_file_complexity
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "lang_samples"
 
@@ -26,9 +26,55 @@ def _walk(rel_path: str, language: str):
     return results
 
 
+def _walk_classes(rel_path: str, language: str):
+    p = FIXTURES / rel_path
+    if not p.exists():
+        pytest.skip(f"fixture missing: {p}")
+    fcx = walk_file(str(p), language, p.read_bytes())
+    if not fcx.classes:
+        pytest.skip(f"tree-sitter language pack missing / no classes for {language}")
+    return {c.name: c for c in fcx.classes}
+
+
 def _find(results, name):
     matches = [r for r in results if r.name == name]
     return matches[0] if matches else None
+
+
+def _require_language(language: str) -> None:
+    try:
+        from repowise.core.ingestion.parser import _get_language
+    except Exception:
+        pytest.skip(f"tree-sitter language pack missing for {language}")
+    if _get_language(language) is None:
+        pytest.skip(f"tree-sitter language pack missing for {language}")
+
+
+def test_tcc_cohesive_vs_split():
+    """TCC is 1.0 when every method pair shares a field, lower when the class
+    splinters into disjoint field groups."""
+    _require_language("python")
+
+    cohesive = (
+        b"class C:\n"
+        b"    def a(self):\n        self.x = 1\n"
+        b"    def b(self):\n        return self.x\n"
+        b"    def c(self):\n        self.x += 1\n"
+    )
+    split = (
+        b"class D:\n"
+        b"    def a(self):\n        self.x = 1\n"
+        b"    def b(self):\n        return self.x\n"
+        b"    def c(self):\n        self.y = 1\n"
+        b"    def d(self):\n        return self.y\n"
+    )
+    c = next(k for k in walk_file("c.py", "python", cohesive).classes if k.name == "C")
+    d = next(k for k in walk_file("d.py", "python", split).classes if k.name == "D")
+
+    assert c.tcc == 1.0
+    # D has 6 method pairs, 2 connected (a-b via x, c-d via y) -> 1/3.
+    assert d.tcc == pytest.approx(2 / 6)
+    assert d.tcc < c.tcc
 
 
 def test_python_nested_depth():
@@ -73,6 +119,52 @@ def test_javascript_nested_depth():
     assert deep.max_nesting >= 4
 
 
+def test_javascript_module_level_arrow_callback_is_function_entry():
+    _require_language("javascript")
+    source = b"""
+router.get("/users", async (req, res) => {
+  if (req.query.active && req.user) {
+    return res.json(await loadUsers());
+  }
+  return res.status(400).end();
+});
+
+function wrapper(items) {
+  return items.map((item) => item.id);
+}
+"""
+    fcx = walk_file("/tmp/routes.js", "javascript", source)
+    names = [fn.name for fn in fcx.functions]
+    assert "router.get callback" in names
+    assert "wrapper" in names
+    assert "item" not in names
+
+    route = _find(fcx.functions, "router.get callback")
+    assert route is not None
+    assert route.ccn >= 3
+    assert route.max_nesting >= 1
+
+
+def test_javascript_test_suite_wrapper_callback_is_not_function_entry():
+    _require_language("javascript")
+    source = b"""
+test.describe("routes", () => {
+  beforeEach(() => resetDb());
+
+  it("handles active users", async () => {
+    if (ready()) {
+      await request(app).get("/users");
+    }
+  });
+});
+"""
+    fcx = walk_file("/tmp/routes.test.js", "javascript", source)
+    names = [fn.name for fn in fcx.functions]
+    assert "test.describe callback" not in names
+    assert "it callback" in names
+    assert "beforeEach callback" in names
+
+
 def test_rust_flat_match_complexity():
     """A flat match (all arms are simple expressions) should count as 1 CCN
     point for the match itself; individual arms should NOT add CCN."""
@@ -105,3 +197,188 @@ def test_rust_flat_match_complexity():
 def test_unsupported_language_returns_empty():
     results = walk_file_complexity("/tmp/x.unknown", "klingon", b"")
     assert results == []
+
+
+# ---- class-level metrics (LCOM4) -----------------------------------------
+
+
+def test_python_class_cohesion():
+    classes = _walk_classes("python/classes.py", "python")
+    cohesive = classes.get("Cohesive")
+    splintered = classes.get("Splintered")
+    assert cohesive is not None and splintered is not None
+    # All methods collaborate around shared state → single component.
+    assert cohesive.lcom4 == 1
+    # Two disjoint field clusters + a loner → three components.
+    assert splintered.lcom4 == 3
+    assert splintered.method_count == 5
+    assert splintered.field_count == 2
+
+
+def test_typescript_class_cohesion():
+    classes = _walk_classes("typescript/classes.ts", "typescript")
+    cohesive = classes.get("Cohesive")
+    splintered = classes.get("Splintered")
+    if cohesive is None or splintered is None:
+        pytest.skip("typescript classes not detected")
+    assert cohesive.lcom4 == 1
+    assert splintered.lcom4 == 3
+
+
+def test_class_metrics_carry_methods_and_size():
+    classes = _walk_classes("python/classes.py", "python")
+    cohesive = classes["Cohesive"]
+    # methods are the same FunctionComplexity objects the function pass found
+    assert len(cohesive.methods) == cohesive.method_count
+    assert cohesive.total_nloc > 0
+    assert cohesive.max_method_ccn >= 1
+
+
+def test_unsupported_language_has_no_classes():
+    fcx = walk_file("/tmp/x.unknown", "klingon", b"")
+    assert fcx.classes == []
+    assert fcx.functions == []
+
+
+# ---- assertion-block detection (test-quality) ----------------------------
+
+
+def test_python_assertion_blocks():
+    results = _walk("python/assertions.py", "python")
+    many = _find(results, "test_many_bare_asserts")
+    assert many is not None
+    # One uninterrupted run of 16 bare asserts.
+    assert len(many.assertion_blocks) == 1
+    assert many.assertion_blocks[0][2] == 16
+
+    calls = _find(results, "test_unittest_calls")
+    assert calls is not None
+    # self.assertEqual / assertTrue calls counted as assertions.
+    assert calls.assertion_blocks[0][2] == 3
+
+
+def test_python_assertion_runs_split_on_non_assert():
+    results = _walk("python/assertions.py", "python")
+    split = _find(results, "test_split_runs")
+    assert split is not None
+    # A non-assert statement between the asserts breaks the run into two.
+    assert [b[2] for b in split.assertion_blocks] == [2, 2]
+
+
+def test_python_single_assert_is_not_a_block():
+    results = _walk("python/assertions.py", "python")
+    few = _find(results, "test_few_asserts")
+    assert few is not None
+    # Two asserts separated by an assignment → no run of ≥2.
+    assert few.assertion_blocks == []
+
+
+def test_typescript_expect_blocks():
+    results = _walk("typescript/assertions.ts", "typescript")
+    many = _find(results, "testManyExpects")
+    if many is None:
+        pytest.skip("typescript function not detected")
+    assert many.assertion_blocks[0][2] == 16
+    few = _find(results, "testFewExpects")
+    assert few is not None
+    assert few.assertion_blocks == []
+
+
+# ---- full-tier language coverage: Kotlin / C++ / C# ----------------------
+#
+# Each new full-tier language is validated end-to-end against the walker:
+# control-flow (nesting + CCN), class-level cohesion (LCOM4), and
+# assertion-block detection — mirroring the Python/TypeScript fixtures.
+
+
+def test_kotlin_nesting_and_ccn():
+    results = _walk("kotlin/nested.kt", "kotlin")
+    deep = _find(results, "deeplyNested")
+    assert deep is not None
+    assert deep.max_nesting >= 4, f"expected ≥4 nesting, got {deep.max_nesting}"
+    many = _find(results, "manyBranches")
+    assert many is not None
+    # 6 ifs + 2 boolean operators over the base path.
+    assert many.ccn >= 9, f"expected CCN ≥ 9, got {many.ccn}"
+    shallow = _find(results, "shallow")
+    assert shallow is not None and shallow.max_nesting == 0
+
+
+def test_kotlin_class_cohesion():
+    classes = _walk_classes("kotlin/classes.kt", "kotlin")
+    cohesive = classes.get("Cohesive")
+    splintered = classes.get("Splintered")
+    assert cohesive is not None and splintered is not None
+    assert cohesive.lcom4 == 1
+    assert splintered.lcom4 == 3
+    assert splintered.method_count == 5
+    assert splintered.field_count == 2
+
+
+def test_kotlin_assertion_blocks():
+    results = _walk("kotlin/assertions.kt", "kotlin")
+    many = _find(results, "testManyAsserts")
+    assert many is not None
+    assert many.assertion_blocks[0][2] == 16
+    few = _find(results, "testFewAsserts")
+    assert few is not None and few.assertion_blocks == []
+
+
+def test_cpp_nesting_and_ccn():
+    results = _walk("cpp/nested.cpp", "cpp")
+    deep = _find(results, "deeplyNested")
+    assert deep is not None
+    assert deep.max_nesting >= 4, f"expected ≥4 nesting, got {deep.max_nesting}"
+    many = _find(results, "manyBranches")
+    assert many is not None
+    assert many.ccn >= 9, f"expected CCN ≥ 9, got {many.ccn}"
+
+
+def test_cpp_class_cohesion():
+    classes = _walk_classes("cpp/classes.cpp", "cpp")
+    cohesive = classes.get("Cohesive")
+    splintered = classes.get("Splintered")
+    assert cohesive is not None and splintered is not None
+    assert cohesive.lcom4 == 1
+    assert splintered.lcom4 == 3
+    assert splintered.method_count == 5
+    assert splintered.field_count == 2
+
+
+def test_cpp_assertion_blocks():
+    results = _walk("cpp/assertions.cpp", "cpp")
+    many = _find(results, "testManyAsserts")
+    assert many is not None
+    assert many.assertion_blocks[0][2] == 16
+    few = _find(results, "testFewAsserts")
+    assert few is not None and few.assertion_blocks == []
+
+
+def test_csharp_nesting_and_ccn():
+    results = _walk("csharp/nested.cs", "csharp")
+    deep = _find(results, "DeeplyNested")
+    assert deep is not None
+    assert deep.max_nesting >= 4, f"expected ≥4 nesting, got {deep.max_nesting}"
+    many = _find(results, "ManyBranches")
+    assert many is not None
+    assert many.ccn >= 9, f"expected CCN ≥ 9, got {many.ccn}"
+
+
+def test_csharp_class_cohesion():
+    classes = _walk_classes("csharp/classes.cs", "csharp")
+    cohesive = classes.get("Cohesive")
+    splintered = classes.get("Splintered")
+    assert cohesive is not None and splintered is not None
+    assert cohesive.lcom4 == 1
+    assert splintered.lcom4 == 3
+    assert splintered.method_count == 5
+    assert splintered.field_count == 2
+
+
+def test_csharp_assertion_blocks():
+    results = _walk("csharp/assertions.cs", "csharp")
+    many = _find(results, "TestManyAsserts")
+    assert many is not None
+    assert many.assertion_blocks[0][2] == 16
+    few = _find(results, "TestFewAsserts")
+    assert few is not None and few.assertion_blocks == []

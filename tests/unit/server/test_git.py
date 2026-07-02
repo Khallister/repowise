@@ -34,6 +34,12 @@ async def _insert_git_metadata(session_factory, repo_id: str) -> None:
             is_stable=False,
             churn_percentile=0.85,
             age_days=365,
+            change_entropy=1.5,
+            change_entropy_pct=0.9,
+            prior_defect_count=4,
+            temporal_hotspot_score=12.3,
+            commit_count_capped=True,
+            original_path="src/old_main.py",
         )
         await crud.upsert_git_metadata(
             session,
@@ -67,6 +73,13 @@ async def test_get_git_metadata(client: AsyncClient, app) -> None:
     assert data["commit_count_total"] == 50
     assert data["is_hotspot"] is True
     assert data["primary_owner_name"] == "Alice"
+    # Newly surfaced change-complexity + defect-history signals.
+    assert data["change_entropy"] == 1.5
+    assert data["change_entropy_pct"] == 90.0  # normalized 0-1 -> 0-100
+    assert data["prior_defect_count"] == 4
+    assert data["temporal_hotspot_score"] == 12.3
+    assert data["commit_count_capped"] is True
+    assert data["original_path"] == "src/old_main.py"
 
 
 @pytest.mark.asyncio
@@ -93,6 +106,9 @@ async def test_get_hotspots(client: AsyncClient, app) -> None:
     assert len(data) == 1
     assert data[0]["file_path"] == "src/main.py"
     assert data[0]["is_hotspot"] is True
+    assert data[0]["change_entropy_pct"] == 90.0
+    assert data[0]["prior_defect_count"] == 4
+    assert data[0]["original_path"] == "src/old_main.py"
 
 
 @pytest.mark.asyncio
@@ -126,6 +142,198 @@ async def test_get_co_changes(client: AsyncClient, app) -> None:
     assert data["file_path"] == "src/main.py"
     assert len(data["co_change_partners"]) == 1
     assert data["co_change_partners"][0]["file_path"] == "src/utils.py"
+
+
+async def _insert_git_commits(session_factory, repo_id: str) -> None:
+    """Insert a small spread of commits with distinct risk scores."""
+    from datetime import UTC, datetime
+
+    def _row(sha: str, risk: float, ts: int, **over) -> dict:
+        base = {
+            "sha": sha,
+            "author_name": "Ann",
+            "author_email": "ann@example.com",
+            "committed_at": datetime.fromtimestamp(ts, tz=UTC),
+            "subject": f"commit {sha}",
+            "lines_added": 40,
+            "lines_deleted": 5,
+            "files_changed": 4,
+            "dirs_changed": 2,
+            "subsystems_changed": 1,
+            "entropy": 1.2,
+            "is_fix": False,
+            "author_experience": 3,
+            "change_risk_score": risk,
+            "change_risk_level": "high" if risk >= 7 else "moderate" if risk >= 4 else "low",
+        }
+        base.update(over)
+        return base
+
+    async with get_session(session_factory) as session:
+        await crud.upsert_git_commits_bulk(
+            session,
+            repo_id,
+            [
+                _row("aaaaaaaa11", 2.0, 3000),
+                _row("bbbbbbbb22", 8.5, 1000),
+                _row("cccccccc33", 5.0, 2000),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_commits_sorted_by_risk(client: AsyncClient, app) -> None:
+    repo = await create_test_repo(client)
+    await _insert_git_commits(app.state.session_factory, repo["id"])
+
+    resp = await client.get(f"/api/repos/{repo['id']}/commits", params={"sort": "risk"})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total"] == 3
+    items = payload["items"]
+    # Risk-descending review-priority order.
+    assert [c["short_sha"] for c in items] == ["bbbbbbbb", "cccccccc", "aaaaaaaa"]
+    top = items[0]
+    assert top["change_risk_score"] == 8.5
+    # Repo-relative normalization: the top commit is the highest percentile and
+    # falls in the top tercile (portable, not the absolute calibration band).
+    assert top["risk_percentile"] > items[-1]["risk_percentile"]
+    assert top["review_priority"] == "high"
+    assert items[-1]["review_priority"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_get_commits_sorted_by_date(client: AsyncClient, app) -> None:
+    repo = await create_test_repo(client)
+    await _insert_git_commits(app.state.session_factory, repo["id"])
+
+    resp = await client.get(f"/api/repos/{repo['id']}/commits", params={"sort": "date"})
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert [c["short_sha"] for c in items] == ["aaaaaaaa", "cccccccc", "bbbbbbbb"]
+
+
+@pytest.mark.asyncio
+async def test_get_commit_detail_has_drivers(client: AsyncClient, app) -> None:
+    repo = await create_test_repo(client)
+    await _insert_git_commits(app.state.session_factory, repo["id"])
+
+    resp = await client.get(f"/api/repos/{repo['id']}/commits/bbbbbbbb")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["sha"] == "bbbbbbbb22"
+    assert data["author_experience"] == 3
+    # Re-scoring the stored features reproduces the persisted score exactly.
+    assert data["change_risk_score"] == 8.5
+    assert len(data["drivers"]) == 7  # la, ld, nf, nd, ns, entropy, exp
+    feats = {d["feature"] for d in data["drivers"]}
+    assert {"la", "exp", "entropy"} <= feats
+
+
+@pytest.mark.asyncio
+async def test_get_commit_not_found(client: AsyncClient) -> None:
+    repo = await create_test_repo(client)
+    resp = await client.get(f"/api/repos/{repo['id']}/commits/deadbeef")
+    assert resp.status_code == 404
+
+
+async def _insert_agent_commit(session_factory, repo_id: str) -> None:
+    from datetime import UTC, datetime
+
+    async with get_session(session_factory) as session:
+        await crud.upsert_git_commits_bulk(
+            session,
+            repo_id,
+            [
+                {
+                    "sha": "dddddddd44",
+                    "author_name": "claude",
+                    "author_email": "bot@example.com",
+                    "committed_at": datetime.fromtimestamp(4000, tz=UTC),
+                    "subject": "agent commit",
+                    "lines_added": 10,
+                    "lines_deleted": 2,
+                    "files_changed": 1,
+                    "dirs_changed": 1,
+                    "subsystems_changed": 1,
+                    "entropy": 0.5,
+                    "is_fix": False,
+                    "author_experience": 1,
+                    "change_risk_score": 3.0,
+                    "change_risk_level": "low",
+                    "agent_name": "claude-code",
+                    "agent_autonomy_tier": 2,
+                    "agent_channel": "git_footer",
+                    "agent_confidence": "high",
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_commits_carry_agent_provenance_and_top_driver(
+    client: AsyncClient, app
+) -> None:
+    repo = await create_test_repo(client)
+    await _insert_git_commits(app.state.session_factory, repo["id"])
+    await _insert_agent_commit(app.state.session_factory, repo["id"])
+
+    resp = await client.get(f"/api/repos/{repo['id']}/commits", params={"sort": "date"})
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert items[0]["sha"] == "dddddddd44"
+    assert items[0]["agent_name"] == "claude-code"
+    assert items[0]["agent_autonomy_tier"] == 2
+    assert items[0]["agent_confidence"] == "high"
+    assert items[0]["author_experience"] == 1
+    # Human rows carry no agent attribution but do carry a top driver.
+    human = items[-1]
+    assert human["agent_name"] is None
+    assert isinstance(human["top_driver"], str) and human["top_driver"]
+
+    detail = await client.get(f"/api/repos/{repo['id']}/commits/dddddddd")
+    assert detail.status_code == 200
+    assert detail.json()["agent_channel"] == "git_footer"
+
+
+@pytest.mark.asyncio
+async def test_commits_authorship_filter(client: AsyncClient, app) -> None:
+    repo = await create_test_repo(client)
+    await _insert_git_commits(app.state.session_factory, repo["id"])
+    await _insert_agent_commit(app.state.session_factory, repo["id"])
+
+    agents = await client.get(
+        f"/api/repos/{repo['id']}/commits", params={"authorship": "agent"}
+    )
+    assert agents.status_code == 200
+    assert agents.json()["total"] == 1
+    assert agents.json()["items"][0]["agent_name"] == "claude-code"
+
+    humans = await client.get(
+        f"/api/repos/{repo['id']}/commits", params={"authorship": "human"}
+    )
+    assert humans.json()["total"] == 3
+    assert all(c["agent_name"] is None for c in humans.json()["items"])
+
+
+@pytest.mark.asyncio
+async def test_agent_trend(client: AsyncClient, app) -> None:
+    repo = await create_test_repo(client)
+    await _insert_git_commits(app.state.session_factory, repo["id"])
+    await _insert_agent_commit(app.state.session_factory, repo["id"])
+
+    resp = await client.get(f"/api/repos/{repo['id']}/commits/agent-trend")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_commits"] == 4
+    assert data["agent_commits"] == 1
+    assert data["agent_pct"] == 25.0
+    assert data["agent_names"] == [{"name": "claude-code", "count": 1}]
+    # All four fixture commits share the epoch-1970 month bucket.
+    assert len(data["buckets"]) == 1
+    bucket = data["buckets"][0]
+    assert bucket["total_commits"] == 4
+    assert bucket["tier_counts"] == {"2": 1}
 
 
 @pytest.mark.asyncio

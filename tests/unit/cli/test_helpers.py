@@ -10,6 +10,7 @@ import pytest
 from repowise.cli.helpers import (
     CONFIG_FILENAME,
     ensure_repowise_dir,
+    find_repowise_repo_root,
     get_db_url_for_repo,
     get_head_commit,
     get_repowise_dir,
@@ -68,6 +69,28 @@ class TestResolveRepoPath:
         assert result == tmp_path.resolve()
 
 
+class TestFindRepowiseRepoRoot:
+    def test_finds_parent_repowise_dir(self, tmp_path):
+        root = tmp_path / "repo"
+        nested = root / "src" / "pkg"
+        nested.mkdir(parents=True)
+        (root / ".repowise").mkdir()
+
+        assert find_repowise_repo_root(nested) == root.resolve()
+
+    def test_returns_none_when_missing(self, tmp_path):
+        assert find_repowise_repo_root(tmp_path) is None
+
+    def test_ignores_nested_git_dirs(self, tmp_path):
+        root = tmp_path / "repo"
+        nested = root / "vendor" / "dep" / "src"
+        nested.mkdir(parents=True)
+        (root / ".repowise").mkdir()
+        (root / "vendor" / "dep" / ".git").mkdir()
+
+        assert find_repowise_repo_root(nested) == root.resolve()
+
+
 # ---------------------------------------------------------------------------
 # .repowise/ directory
 # ---------------------------------------------------------------------------
@@ -107,12 +130,12 @@ class TestResolveReasoning:
         assert resolve_reasoning("off", {"reasoning": "auto"}) == "off"
 
     def test_env_wins_over_config(self, monkeypatch):
-        monkeypatch.setenv("REPOWISE_REASONING", "minimal")
-        assert resolve_reasoning(config={"reasoning": "off"}) == "minimal"
+        monkeypatch.setenv("REPOWISE_REASONING", "high")
+        assert resolve_reasoning(config={"reasoning": "off"}) == "high"
 
     def test_config_wins_over_default(self, monkeypatch):
         monkeypatch.delenv("REPOWISE_REASONING", raising=False)
-        assert resolve_reasoning(config={"reasoning": "off"}) == "off"
+        assert resolve_reasoning(config={"reasoning": "xhigh"}) == "xhigh"
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +158,100 @@ class TestStateFile:
     def test_save_creates_repowise_dir(self, tmp_path):
         save_state(tmp_path, {"key": "value"})
         assert (tmp_path / ".repowise" / "state.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# save_config_partial
+# ---------------------------------------------------------------------------
+
+
+class TestSaveConfigPartial:
+    def test_save_config_partial_persists_exclude_patterns(self, tmp_path):
+        """save_config_partial should merge keys into existing config.yaml."""
+        from repowise.cli.helpers import load_config, save_config_partial
+
+        rw_dir = tmp_path / ".repowise"
+        rw_dir.mkdir()
+        (rw_dir / "config.yaml").write_text("embedder: minilm\n", encoding="utf-8")
+
+        save_config_partial(tmp_path, exclude_patterns=[".claude/", "tools/"])
+
+        cfg = load_config(tmp_path)
+        assert cfg["exclude_patterns"] == [".claude/", "tools/"]
+        assert cfg["embedder"] == "minilm"  # existing keys preserved
+
+    def test_save_config_partial_noop_when_no_values(self, tmp_path):
+        """save_config_partial with no values should not modify config."""
+        from repowise.cli.helpers import load_config, save_config_partial
+
+        rw_dir = tmp_path / ".repowise"
+        rw_dir.mkdir()
+        (rw_dir / "config.yaml").write_text("embedder: minilm\n", encoding="utf-8")
+
+        save_config_partial(tmp_path)  # no kwargs
+
+        cfg = load_config(tmp_path)
+        assert "exclude_patterns" not in cfg
+        assert cfg["embedder"] == "minilm"
+
+    def test_save_config_partial_creates_config_if_missing(self, tmp_path):
+        """save_config_partial should create config.yaml if it doesn't exist."""
+        from repowise.cli.helpers import load_config, save_config_partial
+
+        rw_dir = tmp_path / ".repowise"
+        rw_dir.mkdir()
+
+        save_config_partial(tmp_path, exclude_patterns=[".claude/"])
+
+        cfg = load_config(tmp_path)
+        assert cfg["exclude_patterns"] == [".claude/"]
+
+    def test_save_config_partial_persists_commit_limit(self, tmp_path):
+        """save_config_partial should persist commit_limit alongside other keys."""
+        from repowise.cli.helpers import load_config, save_config_partial
+
+        rw_dir = tmp_path / ".repowise"
+        rw_dir.mkdir()
+        (rw_dir / "config.yaml").write_text("embedder: minilm\n", encoding="utf-8")
+
+        save_config_partial(tmp_path, commit_limit=500)
+
+        cfg = load_config(tmp_path)
+        assert cfg["commit_limit"] == 500
+        assert cfg["embedder"] == "minilm"
+
+
+class TestConfigFingerprint:
+    def test_config_fingerprint_detects_change(self, tmp_path):
+        """config_fingerprint returns a stable hash that changes with config."""
+        from repowise.cli.helpers import config_fingerprint
+
+        rw_dir = tmp_path / ".repowise"
+        rw_dir.mkdir()
+        (rw_dir / "config.yaml").write_text("exclude_patterns: [.claude/]", encoding="utf-8")
+        (rw_dir / "health-rules.json").write_text(
+            '{"disabled_biomarkers": []}', encoding="utf-8"
+        )
+
+        fp1 = config_fingerprint(tmp_path)
+        assert isinstance(fp1, str)
+        assert len(fp1) == 64  # sha256 hex
+        assert config_fingerprint(tmp_path) == fp1
+
+        (rw_dir / "health-rules.json").write_text(
+            '{"disabled_biomarkers": ["ungoverned_hotspot"]}', encoding="utf-8"
+        )
+        assert config_fingerprint(tmp_path) != fp1
+
+    def test_config_fingerprint_missing_files(self, tmp_path):
+        """config_fingerprint handles missing config files gracefully."""
+        from repowise.cli.helpers import config_fingerprint
+
+        rw_dir = tmp_path / ".repowise"
+        rw_dir.mkdir()
+        fp = config_fingerprint(tmp_path)
+        assert isinstance(fp, str)
+        assert len(fp) == 64
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +314,7 @@ class TestUpdateLock:
         )
 
         ensure_repowise_dir(tmp_path)
-        (tmp_path / ".repowise" / UPDATE_LOCK_FILENAME).write_text(
-            "not json", encoding="utf-8"
-        )
+        (tmp_path / ".repowise" / UPDATE_LOCK_FILENAME).write_text("not json", encoding="utf-8")
         assert read_update_lock(tmp_path) is None
 
 
@@ -333,7 +448,9 @@ class TestResolveProviderBaseUrl:
             return "provider"
 
         monkeypatch.setattr("repowise.core.providers.get_provider", fake_get_provider)
-        monkeypatch.setattr("repowise.cli.helpers.validate_provider_config", lambda *_args, **_kw: [])
+        monkeypatch.setattr(
+            "repowise.cli.helpers.validate_provider_config", lambda *_args, **_kw: []
+        )
         monkeypatch.setenv("REPOWISE_PROVIDER", "openai")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         monkeypatch.setenv("OPENAI_BASE_URL", "http://proxy.local")
@@ -354,7 +471,9 @@ class TestResolveProviderBaseUrl:
             return "provider"
 
         monkeypatch.setattr("repowise.core.providers.get_provider", fake_get_provider)
-        monkeypatch.setattr("repowise.cli.helpers.validate_provider_config", lambda *_args, **_kw: [])
+        monkeypatch.setattr(
+            "repowise.cli.helpers.validate_provider_config", lambda *_args, **_kw: []
+        )
         monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
         cfg = {
             "provider": "ollama",
@@ -370,7 +489,9 @@ class TestResolveProviderBaseUrl:
             yaml = None
 
         if "yaml" in locals() and yaml is not None:
-            config_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False), encoding="utf-8")
+            config_path.write_text(
+                yaml.dump(cfg, default_flow_style=False, sort_keys=False), encoding="utf-8"
+            )
         else:
             config_path.write_text(
                 "provider: ollama\nmodel: llama3\nollama:\n  base_url: http://ollama.local:11434\n",
@@ -382,6 +503,70 @@ class TestResolveProviderBaseUrl:
         assert result == "provider"
         assert captured["name"] == "ollama"
         assert captured["kwargs"].get("base_url") == "http://ollama.local:11434"
+
+
+# ---------------------------------------------------------------------------
+# Provider model resolution from config.yaml (issue #416)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveProviderConfigModel:
+    """The config.yaml ``model`` must be honored whenever no model is passed
+    explicitly, regardless of how the *provider* was resolved. Otherwise the
+    provider constructor falls back to its hardcoded default (issue #416)."""
+
+    @staticmethod
+    def _capture(monkeypatch, tmp_path, cfg: dict[str, Any]) -> dict[str, Any]:
+        import yaml  # type: ignore[import-untyped]
+
+        (ensure_repowise_dir(tmp_path) / CONFIG_FILENAME).write_text(
+            yaml.dump(cfg, default_flow_style=False, sort_keys=False), encoding="utf-8"
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_get_provider(name: str, **kwargs: Any):
+            captured["name"] = name
+            captured["kwargs"] = kwargs
+            return "provider"
+
+        monkeypatch.setattr("repowise.core.providers.get_provider", fake_get_provider)
+        monkeypatch.setattr(
+            "repowise.cli.helpers.validate_provider_config", lambda *_args, **_kw: []
+        )
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+        return captured
+
+    def test_config_model_used_when_provider_from_env(self, monkeypatch, tmp_path):
+        captured = self._capture(monkeypatch, tmp_path, {"model": "google/gemini-3.1"})
+        monkeypatch.setenv("REPOWISE_PROVIDER", "openrouter")
+
+        assert resolve_provider(None, None, repo_path=tmp_path) == "provider"
+        assert captured["name"] == "openrouter"
+        assert captured["kwargs"].get("model") == "google/gemini-3.1"
+
+    def test_config_model_used_when_provider_from_flag(self, monkeypatch, tmp_path):
+        captured = self._capture(monkeypatch, tmp_path, {"model": "google/gemini-3.1"})
+        monkeypatch.delenv("REPOWISE_PROVIDER", raising=False)
+
+        assert resolve_provider("openrouter", None, repo_path=tmp_path) == "provider"
+        assert captured["kwargs"].get("model") == "google/gemini-3.1"
+
+    def test_config_model_used_on_api_key_auto_detect(self, monkeypatch, tmp_path):
+        captured = self._capture(monkeypatch, tmp_path, {"model": "google/gemini-3.1"})
+        monkeypatch.delenv("REPOWISE_PROVIDER", raising=False)
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+        assert resolve_provider(None, None, repo_path=tmp_path) == "provider"
+        assert captured["name"] == "openrouter"
+        assert captured["kwargs"].get("model") == "google/gemini-3.1"
+
+    def test_explicit_model_overrides_config(self, monkeypatch, tmp_path):
+        captured = self._capture(monkeypatch, tmp_path, {"model": "google/gemini-3.1"})
+        monkeypatch.delenv("REPOWISE_PROVIDER", raising=False)
+
+        assert resolve_provider("openrouter", "anthropic/claude-opus-4", repo_path=tmp_path)
+        assert captured["kwargs"].get("model") == "anthropic/claude-opus-4"
 
 
 # ---------------------------------------------------------------------------

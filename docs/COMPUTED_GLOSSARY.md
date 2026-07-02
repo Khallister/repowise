@@ -137,6 +137,8 @@ workspace overlays, MCP responses, and CLI output.
 | Hotspot flag | Top churn file: percentile >= 0.75 and has recent commits. | `_compute_percentiles()` | `is_hotspot: true` |
 | Stable file flag | File with more than 10 total commits and no recent 90-day commits. | `_index_file()` | `is_stable: true` |
 | Co-change partner | File historically changed in the same commits, with temporal decay. | `_compute_co_changes()` | `{file_path: "src/schema.py", co_change_count: 3.72, last_co_change: "2026-04-14"}` |
+| Agent provenance (commit) | Which coding agent (if any) authored a commit, from local-git channels only (identity fields, message footers, co-author trailers); tier 1 = near-autonomous bot account, 2 = human-driven agent, 3 = assisted. | `agent_provenance.AgentProvenanceClassifier.classify()` | `{agent_name: "claude", agent_autonomy_tier: 2, agent_channel: "message_footer", agent_confidence: "high"}` |
+| Agent-authored share (file) | Fraction of a file's indexed commits that are agent-attributed, with per-tier counts. | `_index_file()` | `{agent_authored_pct: 0.42, agent_commit_count: 21, agent_tier_counts: {"2": 18, "3": 3}}` |
 | Git index summary | Repo-level indexing result. | `GitIndexSummary` | `{files_indexed: 420, hotspots: 38, stable_files: 71, duration_seconds: 12.4}` |
 
 ## Generated Wiki Pages
@@ -244,6 +246,14 @@ workspace overlays, MCP responses, and CLI output.
 | Risk summary | One-line synthesized risk sentence for MCP. | `tool_risk._assess_one_target()` | `src/auth.py - hotspot score 88% (increasing), 6 dependents...` |
 | Top hotspots | Highest churn/hotspot files returned for context. | `get_risk()` | `[{file_path: "src/db.py", hotspot_score: 0.94}]` |
 
+## Code Health And Defect-Score Benchmark Metrics
+
+| Term | Definition | Computed by | Example |
+| --- | --- | --- | --- |
+| ROC AUC (Area Under the ROC Curve) | A ranking-quality measure for a binary classifier. Given one file that later received a bug fix and one that did not, it is the probability the model scores the buggy file as riskier. 0.5 is random, 1.0 is perfect separation. Repowise's defect score reaches a cross-project mean of 0.737 across 21 repositories. | Defect-score benchmark harness (cross-project validation) | `roc_auc: 0.737` |
+| Popt (effort-aware ranking) | A normalized cumulative-lift (Alberg-curve) score that ranks files by predicted risk against review effort measured in lines of code. It rewards a model that concentrates real defects in the fewest lines a reviewer would read. 0 is worst, 1 is best. It complements ROC AUC, which ignores file size. | Defect-score benchmark harness (cross-project validation) | `popt: 0.58` |
+| LCOM4 (Lack of Cohesion of Methods, version 4) | The number of connected components formed by a class's methods when two methods are linked if they share a field or one calls the other. 1 means a cohesive class; a value of 2 or more means the methods split into groups that share nothing, a signal the class should be split (the basis of the low_cohesion marker and the Extract Class refactoring). | `analysis/health/biomarkers/low_cohesion.py`, `analysis/health/complexity/class_analysis.py` | `lcom4: 3` |
+
 ## Search, Answer Cache, And Retrieval
 
 | Term | Definition | Computed by | Example |
@@ -350,7 +360,8 @@ workspace overlays, MCP responses, and CLI output.
 | `repowise workspace` | Workspace repo discovery, config entries, update status, cross-repo hook output. | `Found 2 new repo(s)` |
 | `repowise generate-claude-md` | Editor-file data and rendered `.claude/CLAUDE.md`. | `hotspots`, `key_modules`, `decisions` in markdown |
 | `repowise augment` | Hook-time graph/search enrichment for AI tool calls. | Related files, symbols, importers, dependencies |
-| `repowise mcp` | FastMCP server exposing the computed graph/wiki/risk tools below. | stdio or SSE transport |
+| `repowise distill` / `expand` / `saved` | Compact errors-first command output with reversible omission markers, marker restoration, and the savings ledger rollup ([DISTILL.md](DISTILL.md)). | `[repowise#a1b2c3d4e5f6: 230 lines omitted (~6.1k tokens); ...]` |
+| `repowise mcp` | FastMCP server exposing the computed graph/wiki/risk tools below. | stdio, streamable HTTP, or SSE transport |
 
 ## MCP And API-Visible Computed Payloads
 
@@ -364,14 +375,8 @@ workspace overlays, MCP responses, and CLI output.
 | `get_risk` | Per-file risk, trend, risk type, owners, co-change partners, test gaps, security signals, top hotspots, optional PR blast radius. | `{results: [{risk_summary, hotspot_score}], top_hotspots: [...]}` |
 | `get_dead_code` | Tiered, grouped, and summarized dead-code findings. | `{summary: {total_findings: 12}, tiers: {...}}` |
 | `get_dependency_path` | Dependency-path or bridge context between files/symbols. | `{path: ["src/a.py", "src/b.py"]}` |
-| `get_architecture_diagram` | Mermaid architecture diagram text. | `{mermaid_syntax: "graph TD\n..."}` |
-| `update_decision_records` | Decision create/update/list/delete payloads. | `{status: "ok", decision: {...}}` |
 | `get_symbol` | Exact symbol metadata and source slice. | `{name: "create_app", signature: "def create_app(...)"}` |
-| `get_callers_callees` | Caller/callee neighborhood for a symbol. | `{callers: [...], callees: [...]}` |
-| `get_graph_metrics` | Centrality percentiles, community, entry-point score, and graph metrics for a node. | `{pagerank_percentile: 92, community_label: "api"}` |
-| `get_community` | Community details, cohesion, members, and neighboring communities. | `{label: "auth", cohesion: 0.21, members: [...]}` |
 | `get_execution_flows` | Entry-point traces through call edges. | `{flows: [{entry_point, trace, crosses_community}]}` |
-| `annotate_file` | Persistent human notes on a wiki page. | `{status: "ok", human_notes: "Watch migration path."}` |
 | Blast radius API | Direct risks, transitive affected files, co-change warnings, reviewers, test gaps, overall score. | `{overall_risk_score: 7.25}` |
 | Knowledge map API | Top owners, knowledge silos, onboarding targets. | `{top_owners: [...], knowledge_silos: [...]}` |
 | Cost summary API | Grouped costs and totals. | `{groups: [...], total_cost_usd: 3.21}` |

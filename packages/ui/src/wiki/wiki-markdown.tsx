@@ -41,7 +41,13 @@ function ClientCodeBlock({ code, language }: { code: string; language: string })
     let cancelled = false;
     import("shiki")
       .then(({ codeToHtml }) =>
-        codeToHtml(code, { lang: language as never, theme: "vesper" }),
+        // Dual themes: tokens carry --shiki-light/--shiki-dark CSS vars and
+        // globals.css picks one per theme (see ".shiki span" rules there).
+        codeToHtml(code, {
+          lang: language as never,
+          themes: { light: "github-light", dark: "vesper" },
+          defaultColor: false,
+        }),
       )
       .then((result) => {
         if (!cancelled) setHtml(result);
@@ -113,7 +119,7 @@ function buildComponents(
     const text = typeof children === "string" ? children : extractText(children);
     const id = slugify(text);
     return (
-      <h1 id={id} className="mt-8 mb-4 text-xl font-semibold text-[var(--color-text-primary)] first:mt-0 scroll-mt-16">
+      <h1 id={id} className="mt-10 mb-4 font-serif text-3xl font-semibold tracking-tight text-[var(--color-text-primary)] first:mt-0 scroll-mt-16">
         {children}
       </h1>
     );
@@ -122,7 +128,7 @@ function buildComponents(
     const text = typeof children === "string" ? children : extractText(children);
     const id = slugify(text);
     return (
-      <h2 id={id} className="mt-6 mb-3 text-lg font-semibold text-[var(--color-text-primary)] scroll-mt-16">
+      <h2 id={id} className="mt-9 mb-3 font-serif text-2xl font-semibold tracking-tight text-[var(--color-text-primary)] scroll-mt-16">
         {children}
       </h2>
     );
@@ -131,27 +137,27 @@ function buildComponents(
     const text = typeof children === "string" ? children : extractText(children);
     const id = slugify(text);
     return (
-      <h3 id={id} className="mt-5 mb-2 text-base font-semibold text-[var(--color-text-primary)] scroll-mt-16">
+      <h3 id={id} className="mt-7 mb-2 font-serif text-xl font-semibold text-[var(--color-text-primary)] scroll-mt-16">
         {children}
       </h3>
     );
   },
   p: ({ children }) => (
-    <p className="mb-4 text-sm leading-7 text-[var(--color-text-secondary)]">
+    <p className="mb-4 text-base leading-[1.75] text-[var(--color-text-secondary)]">
       {children}
     </p>
   ),
   ul: ({ children }) => (
-    <ul className="mb-4 ml-4 space-y-1 list-disc text-sm text-[var(--color-text-secondary)]">
+    <ul className="mb-4 ml-4 space-y-1.5 list-disc text-base text-[var(--color-text-secondary)]">
       {children}
     </ul>
   ),
   ol: ({ children }) => (
-    <ol className="mb-4 ml-4 space-y-1 list-decimal text-sm text-[var(--color-text-secondary)]">
+    <ol className="mb-4 ml-4 space-y-1.5 list-decimal text-base text-[var(--color-text-secondary)]">
       {children}
     </ol>
   ),
-  li: ({ children }) => <li className="leading-6">{children}</li>,
+  li: ({ children }) => <li className="leading-7">{children}</li>,
   code: ({ className, children, ...props }) => {
     const langMatch = className?.match(/language-(\w+)/);
     const lang = langMatch?.[1];
@@ -162,7 +168,7 @@ function buildComponents(
       const trimmed = code.replace(/\n$/, "");
 
       if (lang === "mermaid") {
-        return <MermaidDiagram chart={trimmed} />;
+        return <MermaidDiagram chart={trimmed} securityLevel="loose" />;
       }
 
       return <ClientCodeBlock code={trimmed} language={lang} />;
@@ -178,7 +184,7 @@ function buildComponents(
         <Link
           href={resolved.href}
           title={`Go to ${text.trim()}`}
-          className="rounded bg-[var(--color-accent-muted)] px-1.5 py-0.5 text-xs font-mono text-[var(--color-accent-primary)] underline decoration-dotted underline-offset-2 hover:bg-[var(--color-accent-primary)] hover:text-white transition-colors"
+          className="rounded bg-[var(--color-accent-muted)] px-1.5 py-0.5 text-[0.85em] font-mono text-[var(--color-accent-primary)] underline decoration-dotted underline-offset-2 hover:bg-[var(--color-accent-primary)] hover:text-white transition-colors"
         >
           {children}
         </Link>
@@ -187,7 +193,7 @@ function buildComponents(
 
     return (
       <code
-        className="rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs font-mono text-[var(--color-accent-primary)]"
+        className="rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-[0.85em] font-mono text-[var(--color-accent-primary)]"
         {...props}
       >
         {children}
@@ -203,20 +209,25 @@ function buildComponents(
     </blockquote>
   ),
   table: ({ children }) => (
-    <div className="my-4 overflow-x-auto rounded border border-[var(--color-border-default)]">
+    <div className="my-4 overflow-x-auto overflow-hidden border border-[var(--color-border-default)]">
       <table className="w-full text-sm">{children}</table>
     </div>
   ),
   thead: ({ children }) => (
-    <thead className="bg-[var(--color-bg-elevated)]">{children}</thead>
+    <thead className="bg-[var(--color-bg-surface)] border-b border-[var(--color-border-default)]">{children}</thead>
   ),
   th: ({ children }) => (
-    <th className="px-4 py-2 text-left text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider">
+    <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-[var(--color-text-tertiary)]">
       {children}
     </th>
   ),
+  tr: ({ children }) => (
+    <tr className="border-t border-[var(--color-table-divider)] transition-colors hover:bg-[var(--color-bg-elevated)]">
+      {children}
+    </tr>
+  ),
   td: ({ children }) => (
-    <td className="px-4 py-2 text-sm text-[var(--color-text-secondary)] border-t border-[var(--color-border-default)]">
+    <td className="px-3 py-2.5 text-[var(--color-text-secondary)]">
       {children}
     </td>
   ),

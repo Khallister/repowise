@@ -2,6 +2,7 @@ import { GitCommit, User } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { CommitCategorySparkline } from "../git/commit-category-sparkline";
 import { CoChangeList } from "../git/co-change-list";
+import { ChangeHistoryCard } from "../git/change-history-card";
 import { formatRelativeTime, formatDate, formatAgeDays } from "../lib/format";
 import type { GitMetadata } from "@repowise-dev/types/git";
 
@@ -39,7 +40,7 @@ function AuthorAvatar({ name }: { name: string }) {
 
   return (
     <div
-      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[9px] font-semibold text-white ${color}`}
+      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white ${color}`}
       aria-label={name}
       title={name}
     >
@@ -166,6 +167,13 @@ export function GitHistoryPanel({ git }: GitHistoryPanelProps) {
           <CoChangeList partners={git.co_change_partners} />
         </div>
       )}
+
+      <ChangeHistoryCard
+        changeEntropyPct={git.change_entropy_pct ?? null}
+        priorDefectCount={git.prior_defect_count ?? null}
+        originalPath={git.original_path ?? null}
+        commitCountCapped={git.commit_count_capped ?? false}
+      />
 
       {commits.length > 0 && (
         <div>

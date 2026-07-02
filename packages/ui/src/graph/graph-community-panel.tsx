@@ -1,6 +1,6 @@
 "use client";
 
-import { X, ArrowRight } from "lucide-react";
+import { X, ArrowRight, Sparkles } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { ScrollArea } from "../ui/scroll-area";
 import { Skeleton } from "../ui/skeleton";
@@ -15,6 +15,12 @@ export interface GraphCommunityPanelProps {
   /** Loading flag from the consumer's data hook. */
   isLoading: boolean;
   onClose: () => void;
+  /** Optional: blossom this community's files on the canvas. When provided, an
+   *  "Expand on canvas" affordance is shown (the constellation single-click now
+   *  opens this panel instead of expanding, so the panel offers the expand). */
+  onExpandOnCanvas?: (() => void) | undefined;
+  /** Build a member href (typically the canonical file page). */
+  memberHref?: ((path: string) => string) | undefined;
 }
 
 export function GraphCommunityPanel({
@@ -22,6 +28,8 @@ export function GraphCommunityPanel({
   community,
   isLoading,
   onClose,
+  onExpandOnCanvas,
+  memberHref,
 }: GraphCommunityPanelProps) {
   return (
     <div className="absolute right-0 top-0 bottom-0 w-full sm:w-[360px] border-l border-[var(--color-border-default)] bg-[var(--color-bg-surface)] z-20 flex flex-col shadow-lg shadow-black/20">
@@ -45,6 +53,19 @@ export function GraphCommunityPanel({
         </button>
       </div>
 
+      {/* Expand-on-canvas affordance — mirrors the double-click blossom. */}
+      {onExpandOnCanvas && (
+        <div className="px-4 py-2 border-b border-[var(--color-border-default)]">
+          <button
+            onClick={onExpandOnCanvas}
+            className="flex w-full items-center justify-center gap-1.5 rounded-md border border-[var(--color-border-default)] px-2 py-1.5 text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-primary)] transition-colors"
+          >
+            <Sparkles className="h-3 w-3" />
+            Expand on canvas
+          </button>
+        </div>
+      )}
+
       {/* Content */}
       {isLoading ? (
         <div className="p-4 space-y-2">
@@ -58,7 +79,7 @@ export function GraphCommunityPanel({
           <div className="p-4 space-y-4">
             {/* Members */}
             <div>
-              <p className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
+              <p className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
                 Members ({community.member_count})
               </p>
               <div className="space-y-1">
@@ -72,9 +93,19 @@ export function GraphCommunityPanel({
                       className="flex items-center gap-2 py-1 px-1.5 rounded hover:bg-[var(--color-bg-elevated)] transition-colors"
                     >
                       <div className="min-w-0 flex-1">
-                        <p className="text-[11px] font-mono text-[var(--color-text-primary)] truncate" title={m.path}>
-                          {truncatePath(m.path)}
-                        </p>
+                        {memberHref ? (
+                          <a
+                            href={memberHref(m.path)}
+                            className="block text-xs font-mono text-[var(--color-text-primary)] truncate hover:text-[var(--color-accent-primary)] hover:underline"
+                            title={m.path}
+                          >
+                            {truncatePath(m.path)}
+                          </a>
+                        ) : (
+                          <p className="text-xs font-mono text-[var(--color-text-primary)] truncate" title={m.path}>
+                            {truncatePath(m.path)}
+                          </p>
+                        )}
                       </div>
                       {/* PageRank bar */}
                       <div className="w-16 h-1.5 rounded-full bg-[var(--color-bg-elevated)] overflow-hidden shrink-0">
@@ -102,7 +133,7 @@ export function GraphCommunityPanel({
             {/* Neighboring Communities */}
             {community.neighboring_communities.length > 0 && (
               <div>
-                <p className="text-[11px] font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
+                <p className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
                   Neighboring Communities
                 </p>
                 <div className="space-y-1">
@@ -113,11 +144,11 @@ export function GraphCommunityPanel({
                     >
                       <div className="flex items-center gap-1.5 min-w-0">
                         <ArrowRight className="h-3 w-3 shrink-0 text-[var(--color-text-tertiary)]" />
-                        <span className="text-[11px] text-[var(--color-text-primary)] truncate">
+                        <span className="text-xs text-[var(--color-text-primary)] truncate">
                           {n.label}
                         </span>
                       </div>
-                      <Badge variant="outline" className="text-[9px] shrink-0 h-4">
+                      <Badge variant="outline" className="text-[10px] shrink-0 h-4">
                         {n.cross_edge_count} edges
                       </Badge>
                     </div>

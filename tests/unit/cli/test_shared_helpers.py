@@ -8,6 +8,7 @@ implementation (no divergent copies) and pin the behavior of the pure helpers.
 from __future__ import annotations
 
 import types
+from typing import ClassVar
 
 import pytest
 
@@ -44,6 +45,9 @@ def test_resolve_embedder_explicit_flag_wins(monkeypatch: pytest.MonkeyPatch) ->
         ({"GOOGLE_API_KEY": "x"}, "gemini"),
         ({"OPENAI_API_KEY": "x"}, "openai"),
         ({"OPENROUTER_API_KEY": "x"}, "openrouter"),
+        ({"OLLAMA_BASE_URL": "http://localhost:11434"}, "mock"),
+        ({"OLLAMA_EMBEDDING_MODEL": "embeddinggemma"}, "ollama"),
+        ({"REPOWISE_EMBEDDER": "ollama"}, "ollama"),
         ({}, "mock"),
     ],
 )
@@ -55,6 +59,9 @@ def test_resolve_embedder_env_detection(
         "GOOGLE_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
+        "OLLAMA_BASE_URL",
+        "OLLAMA_EMBEDDING_MODEL",
+        "REPOWISE_EMBEDDER",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, val in env.items():
@@ -70,6 +77,15 @@ def test_build_embedder_falls_back_to_mock() -> None:
     assert isinstance(providers.build_embedder("mock"), MockEmbedder)
 
 
+def test_build_embedder_supports_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
+    from repowise.core.providers.embedding.ollama import OllamaEmbedder
+
+    monkeypatch.setenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+    embedder = providers.build_embedder("ollama")
+    assert isinstance(embedder, OllamaEmbedder)
+    assert embedder._model == "qwen3-embedding:0.6b"
+
+
 def test_build_vector_store_returns_a_store(tmp_path) -> None:
     from repowise.core.providers.embedding.base import MockEmbedder
 
@@ -80,9 +96,9 @@ def test_build_vector_store_returns_a_store(tmp_path) -> None:
 
 
 class _FakeKG:
-    nodes = [{"summary": "s"}, {"summary": ""}]
-    layers = [1, 2, 3]
-    tour = [1, 2]
+    nodes: ClassVar[list[dict[str, str]]] = [{"summary": "s"}, {"summary": ""}]
+    layers: ClassVar[list[int]] = [1, 2, 3]
+    tour: ClassVar[list[int]] = [1, 2]
     fingerprint = "abc123"
 
     def to_dict(self) -> dict:
