@@ -107,11 +107,13 @@ export function GraphFlow({
   const { repo } = useRepo(repoId);
   const resolvedRepoName = repoName ?? repo?.name;
   const { communities } = useCommunities(repoId);
-  // Execution flows only highlight a file-level trace, so defer the fetch until
-  // a full/file graph is actually needed (keeps the modules mount to
-  // /communities + /modules only).
+  // Flow traces highlight file-level nodes, but the picker must also work from
+  // the module overview: selecting a flow there makes the shell jump to the
+  // full graph (enterFullViewFromModule) and highlight the trace. Dead/hot
+  // scopes render file-level graphs too, so flows work there as well — only
+  // the constellation skips the fetch.
   const { flows: executionFlowsData } = useExecutionFlows(
-    needsFullGraph ? repoId : null,
+    viewMode !== "architecture" || needsFullGraph ? repoId : null,
     {
       top_n: 10,
       max_depth: 6,

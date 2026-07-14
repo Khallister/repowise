@@ -289,7 +289,7 @@ def run_partial_analysis(
             _hcfg = HealthConfig.load(repo_path)
             _analyzer_config = (
                 _hcfg.to_analyzer_config([pf.file_info.path for pf in parsed_files])
-                if (_hcfg.disabled_biomarkers or _hcfg.rules)
+                if _hcfg.has_overrides()
                 else None
             )
             partial_health_report = _health_analyzer.analyze(
@@ -319,6 +319,138 @@ def run_partial_analysis(
         log(f"[yellow]Dead code analysis skipped: {exc}[/yellow]")
 
     return partial_health_report, dead_code_report
+
+
+async def refresh_knowledge_graph(
+    repo_path: Any,
+    parsed_files: list,
+    graph_builder: Any,
+    repo_structure: Any,
+    git_meta_map: dict,
+    dead_code_report: Any,
+    *,
+    prior_fingerprint: str | None,
+    log: LogFn | None = None,
+) -> Any | None:
+    """Rebuild the KG skeleton + curation when the graph shape changed.
+
+    The knowledge graph (layers, tour, entry points, curated node meta) was
+    historically rebuilt only by the full init pipeline, so every incremental
+    ``repowise update`` carried the init-time KG forward verbatim and agents
+    read a stale orientation snapshot (#669). This reruns the deterministic
+    skeleton + curation passes against the freshly rebuilt graph, then carries
+    forward the prior artifact's LLM-enriched layer names and node summaries
+    by stable id — so index-only updates stay LLM-free without regressing
+    enrichment. LLM re-enrichment stays with the caller (docs mode only).
+
+    Returns the refreshed result, or ``None`` when the graph fingerprint is
+    unchanged (the persisted artifact is already current) or the rebuild
+    failed (keep the prior artifact rather than export a broken one).
+    """
+    log = log or _noop_log
+    try:
+        from repowise.core.analysis.knowledge_graph import (
+            KnowledgeGraphResult,
+            build_knowledge_graph_skeleton,
+            compute_kg_fingerprint,
+            should_skip_kg_rebuild,
+        )
+
+        kg_json_path = Path(repo_path) / ".repowise" / "knowledge-graph.json"
+        new_fingerprint = compute_kg_fingerprint(graph_builder)
+        if should_skip_kg_rebuild(prior_fingerprint, new_fingerprint, kg_json_path):
+            return None
+
+        tech_stack: list[dict] = []
+        try:
+            from repowise.core.generation.editor_files.tech_stack import detect_tech_stack
+
+            tech_stack = [
+                {"name": t.name, "version": t.version, "category": t.category}
+                for t in detect_tech_stack(repo_path)
+            ]
+        except Exception:
+            pass  # tech stack is contextual metadata, not structural
+
+        prior_kg = KnowledgeGraphResult.from_file(kg_json_path)
+
+        kg = build_knowledge_graph_skeleton(
+            parsed_files=parsed_files,
+            graph_builder=graph_builder,
+            repo_structure=repo_structure,
+            tech_stack=tech_stack,
+            external_systems=[],
+            git_meta_map=git_meta_map,
+            dead_code_report=dead_code_report,
+            repo_path=Path(repo_path),
+        )
+        kg.fingerprint = new_fingerprint
+
+        from repowise.core.analysis.kg_curation import (
+            apply_summary_floor,
+            curate_knowledge_graph,
+            curation_enabled,
+        )
+
+        kg = curate_knowledge_graph(
+            kg,
+            parsed_files=parsed_files,
+            graph_builder=graph_builder,
+            repo_structure=repo_structure,
+            community_info=graph_builder.community_info(),
+            git_meta_map=git_meta_map,
+            enabled=curation_enabled(),
+            # Floor after the prior-artifact carry-forward below so carried
+            # page-derived summaries win over the deterministic floor.
+            defer_summary_floor=True,
+        )
+
+        if prior_kg is not None:
+            _carry_forward_kg_enrichment(kg, prior_kg)
+
+        # Summaries degrade to empty on failure, same as the init-path seam.
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            apply_summary_floor(kg, parsed_files)
+
+        log(
+            f"Knowledge graph refreshed: [cyan]{len(kg.layers)}[/cyan] layers, "
+            f"[cyan]{len(kg.tour)}[/cyan] tour steps"
+        )
+        return kg
+    except Exception as exc:
+        log(f"[yellow]Knowledge-graph refresh skipped: {exc}[/yellow]")
+        return None
+
+
+def _carry_forward_kg_enrichment(kg: Any, prior_kg: Any) -> None:
+    """Adopt the prior artifact's LLM-enriched prose onto the rebuilt KG.
+
+    Matching is by stable id, and only fields the deterministic passes left
+    empty are filled — structural changes always win over stale prose. Layer
+    descriptions exist only after LLM enrichment (curation names layers but
+    leaves descriptions empty), so a non-empty prior description is the
+    signal that the prior name/description pair is the enriched one.
+    """
+    prior_layers = {layer.get("id"): layer for layer in prior_kg.layers or []}
+    for layer in kg.layers or []:
+        prior = prior_layers.get(layer.get("id"))
+        if prior and prior.get("description") and not layer.get("description"):
+            layer["name"] = prior.get("name") or layer.get("name")
+            layer["description"] = prior["description"]
+
+    prior_summaries = {n.get("id"): n["summary"] for n in prior_kg.nodes or [] if n.get("summary")}
+    for node in kg.nodes or []:
+        if not node.get("summary"):
+            prior_summary = prior_summaries.get(node.get("id"))
+            if prior_summary:
+                node["summary"] = prior_summary
+
+    # With curation disabled the skeleton carries no tour and only the LLM
+    # path builds one — keep the prior tour rather than exporting none.
+    if not kg.tour and prior_kg.tour:
+        kg.tour = prior_kg.tour
 
 
 async def persist_partial_health(session: Any, repo_id: str, report: Any) -> None:
@@ -371,6 +503,7 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
     from repowise.core.ingestion.git_indexer import GitIndexer
     from repowise.core.persistence.crud import (
         get_latest_commit_committed_at,
+        update_repo_git_totals,
         upsert_git_commits_bulk,
     )
     from repowise.core.repo_config import load_repo_config
@@ -394,6 +527,19 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
     if rows:
         await upsert_git_commits_bulk(session, repo_id, rows)
 
+    # Refresh the repo-level whole-history totals so age / commit / contributor
+    # counts keep growing between full re-indexes (#730). Cheap git calls, and
+    # cheap to run every update since they don't touch the bounded sample.
+    totals = await asyncio.to_thread(indexer.capture_repo_totals)
+    await update_repo_git_totals(
+        session,
+        repo_id,
+        total_commit_count=totals.total_commit_count,
+        first_commit_at=totals.first_commit_at,
+        total_contributor_count=totals.total_contributor_count,
+        first_commit_author=totals.first_commit_author,
+    )
+
 
 async def persist_incremental_index(
     repo_path: Any,
@@ -403,14 +549,22 @@ async def persist_incremental_index(
     partial_health_report: Any,
     changed_paths: list[str],
     *,
+    current_graph_file_paths: set[str] | None = None,
     file_diffs: list[Any] | None = None,
+    knowledge_graph_result: Any | None = None,
+    parsed_files: list[Any] | None = None,
     log: LogFn | None = None,
+    degraded: list[str] | None = None,
 ) -> None:
-    """Persist an incremental index refresh (graph + git + dead-code + health).
+    """Persist an incremental index refresh (graph + symbols + git + dead-code + health).
 
     Upsert-only: unchanged files keep their existing rows, unlike
     ``persist_pipeline_result``'s delete-then-insert. State-file updates stay
     with the caller — this writes the DB only.
+
+    ``degraded`` (when supplied) collects a one-line entry for every
+    best-effort step that failed, so the caller can render an honest
+    completion report instead of silently claiming success.
     """
     from repowise.core.persistence import (
         create_engine,
@@ -423,6 +577,11 @@ async def persist_incremental_index(
 
     log = log or _noop_log
 
+    def _skip(step: str, exc: Exception) -> None:
+        log(f"[yellow]{step} skipped: {exc}[/yellow]")
+        if degraded is not None:
+            degraded.append(f"{step}: {exc}")
+
     url = resolve_db_url(repo_path)
     engine = create_engine(url)
     try:
@@ -432,6 +591,14 @@ async def persist_incremental_index(
         async with get_session(sf) as session:
             repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
             repo_id = repo.id
+
+            if current_graph_file_paths:
+                try:
+                    from repowise.core.pipeline.persist import _prune_stale_file_rows
+
+                    await _prune_stale_file_rows(session, repo_id, current_graph_file_paths, set())
+                except Exception as exc:
+                    _skip("Stale row prune", exc)
 
             # Tombstone pages for deleted/renamed files FIRST — a fresh page
             # for a file that no longer exists misleads every retrieval
@@ -445,7 +612,7 @@ async def persist_incremental_index(
 
                     await mark_tombstone_pages(session, repo_id, tombstone_candidates(file_diffs))
                 except Exception as exc:
-                    log(f"[yellow]Tombstone marking skipped: {exc}[/yellow]")
+                    _skip("Tombstone marking", exc)
 
             if git_meta_map:
                 try:
@@ -457,12 +624,12 @@ async def persist_incremental_index(
                     await upsert_git_metadata_bulk(session, repo_id, list(git_meta_map.values()))
                     await recompute_git_percentiles(session, repo_id)
                 except Exception as exc:
-                    log(f"[yellow]Git persist skipped: {exc}[/yellow]")
+                    _skip("Git persist", exc)
 
                 try:
                     await persist_incremental_commits(session, repo_id, repo_path)
                 except Exception as exc:
-                    log(f"[yellow]Commit capture skipped: {exc}[/yellow]")
+                    _skip("Commit capture", exc)
 
             if dead_code_report is not None:
                 try:
@@ -474,13 +641,13 @@ async def persist_incremental_index(
                         session, repo_id, dead_code_report.findings, file_paths=changed_paths
                     )
                 except Exception as exc:
-                    log(f"[yellow]Dead-code persist skipped: {exc}[/yellow]")
+                    _skip("Dead-code persist", exc)
 
             if partial_health_report is not None:
                 try:
                     await persist_partial_health(session, repo_id, partial_health_report)
                 except Exception as exc:
-                    log(f"[yellow]Health persist skipped: {exc}[/yellow]")
+                    _skip("Health persist", exc)
 
             # Re-persist graph_nodes so symbol-level PageRank /
             # betweenness / community ids stay in sync with the
@@ -493,6 +660,53 @@ async def persist_incremental_index(
 
                 await persist_graph_nodes(session, repo_id, graph_builder)
             except Exception as exc:
-                log(f"[yellow]Graph nodes persist skipped: {exc}[/yellow]")
+                _skip("Graph nodes persist", exc)
+
+            # Refresh wiki_symbols for the changed files. Historically the
+            # incremental path re-parsed but never persisted symbols, so their
+            # start/end bounds fossilized at the last full index and the
+            # get_answer hydrator served drifted signatures. Scoped to the
+            # changed set for cost.
+            try:
+                from repowise.core.pipeline.persist import persist_incremental_symbols
+
+                await persist_incremental_symbols(session, repo_id, parsed_files, changed_paths)
+            except Exception as exc:
+                _skip("Symbol persist", exc)
+
+            # Refresh graph_edges for the changed files. The full-init path was
+            # historically the only writer of edges, so adjacency froze at the
+            # last full index: new imports/calls stayed invisible and dropped
+            # ones lingered as false paths. Phase E flow-path traversal reads
+            # adjacency straight from this table, so it decayed on every update.
+            try:
+                from repowise.core.pipeline.persist import persist_incremental_edges
+
+                await persist_incremental_edges(
+                    session, repo_id, graph_builder, parsed_files, changed_paths
+                )
+            except Exception as exc:
+                _skip("Graph edges persist", exc)
+
+            if knowledge_graph_result is not None:
+                try:
+                    from repowise.core.pipeline.persist import persist_kg
+
+                    await persist_kg(knowledge_graph_result, session, repo_id)
+                except Exception as exc:
+                    _skip("Knowledge-graph persist", exc)
+
+            # One-shot drain of proposals from the removed code_comment
+            # harvest (#751). Runs on the index-only path too, because the
+            # post-commit hook's updates never reach the full decision
+            # persist. Confirmed/dismissed rows are kept.
+            try:
+                from repowise.core.persistence.crud import (
+                    purge_proposed_decisions_by_source,
+                )
+
+                await purge_proposed_decisions_by_source(session, repo_id, "code_comment")
+            except Exception as exc:
+                _skip("Decision purge", exc)
     finally:
         await engine.dispose()

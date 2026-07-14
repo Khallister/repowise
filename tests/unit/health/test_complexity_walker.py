@@ -382,3 +382,178 @@ def test_csharp_assertion_blocks():
     assert many.assertion_blocks[0][2] == 16
     few = _find(results, "TestFewAsserts")
     assert few is not None and few.assertion_blocks == []
+
+
+def test_dart_nesting_and_ccn():
+    results = _walk("dart/nested.dart", "dart")
+    deep = _find(results, "deeplyNested")
+    assert deep is not None
+    assert deep.max_nesting >= 4, f"expected >=4 nesting, got {deep.max_nesting}"
+    many = _find(results, "manyBranches")
+    assert many is not None
+    # 6 ifs + 2 boolean operators over the base path.
+    assert many.ccn >= 9, f"expected CCN >= 9, got {many.ccn}"
+    shallow = _find(results, "shallow")
+    assert shallow is not None and shallow.max_nesting == 0
+    assert shallow.param_count == 1
+
+
+def test_dart_class_facts():
+    # Dart has no wrapper node for ``this.member`` access, so LCOM4 sits at
+    # its "no signal" safety valve (1) for every class — the class facts
+    # under test are method grouping and size.
+    classes = _walk_classes("dart/classes.dart", "dart")
+    cohesive = classes.get("Cohesive")
+    wide = classes.get("Wide")
+    assert cohesive is not None and wide is not None
+    assert cohesive.method_count == 3
+    assert wide.method_count == 5
+    assert cohesive.lcom4 == 1
+    assert wide.lcom4 == 1
+
+
+def test_dart_assertion_blocks():
+    results = _walk("dart/assertions.dart", "dart")
+    many = _find(results, "testManyAsserts")
+    assert many is not None
+    assert many.assertion_blocks, "expected a run of assert statements"
+    assert many.assertion_blocks[0][2] == 5
+    few = _find(results, "testFewAsserts")
+    assert few is not None and few.assertion_blocks == []
+
+
+def test_scala_nesting_and_ccn():
+    results = _walk("scala/nested.scala", "scala")
+    deep = _find(results, "deeplyNested")
+    assert deep is not None
+    assert deep.max_nesting >= 4, f"expected >=4 nesting, got {deep.max_nesting}"
+    many = _find(results, "manyBranches")
+    assert many is not None
+    # 6 ifs + 2 boolean operators over the base path.
+    assert many.ccn >= 9, f"expected CCN >= 9, got {many.ccn}"
+    shallow = _find(results, "shallow")
+    assert shallow is not None and shallow.max_nesting == 0
+    assert shallow.param_count == 1
+
+
+def test_scala_match_and_guards():
+    results = _walk("scala/nested.scala", "scala")
+    guarded = _find(results, "matchGuards")
+    assert guarded is not None
+    # 4 cases + 2 guards (guards make the match non-flat, so arms count).
+    assert guarded.ccn == 7, f"expected CCN 7, got {guarded.ccn}"
+    flat = _find(results, "flatMatch")
+    assert flat is not None
+    # A flat match counts once for the dispatch, not per arm.
+    assert flat.ccn == 2, f"expected CCN 2, got {flat.ccn}"
+    for_guard = _find(results, "forGuard")
+    assert for_guard is not None
+    # for-comprehension (loop) + inline guard; the guard is flat (no nesting).
+    assert for_guard.ccn == 3, f"expected CCN 3, got {for_guard.ccn}"
+    assert for_guard.max_nesting == 1
+
+
+def test_scala_class_cohesion():
+    classes = _walk_classes("scala/classes.scala", "scala")
+    cohesive = classes.get("Cohesive")
+    splintered = classes.get("Splintered")
+    assert cohesive is not None and splintered is not None
+    assert cohesive.lcom4 == 1
+    assert splintered.lcom4 == 3
+    assert splintered.method_count == 5
+    assert splintered.field_count == 2
+    # ``object`` and ``trait`` bodies group methods like a class body.
+    registry = classes.get("Registry")
+    assert registry is not None and registry.method_count == 2
+    shape = classes.get("Shape")
+    assert shape is not None and shape.method_count == 1
+
+
+def test_scala_assertion_blocks():
+    results = _walk("scala/assertions.scala", "scala")
+    many = _find(results, "testManyAsserts")
+    assert many is not None
+    assert many.assertion_blocks, "expected a run of assert calls"
+    assert many.assertion_blocks[0][2] == 5
+    few = _find(results, "testFewAsserts")
+    assert few is not None and few.assertion_blocks == []
+
+
+def test_ruby_nesting_and_ccn():
+    results = _walk("ruby/nested.rb", "ruby")
+    deep = _find(results, "deeply_nested")
+    assert deep is not None
+    # if > while > if > if — keyword tokens must not double-count.
+    assert deep.ccn == 5, f"expected CCN 5, got {deep.ccn}"
+    assert deep.max_nesting == 4, f"expected nesting 4, got {deep.max_nesting}"
+    many = _find(results, "many_branches")
+    assert many is not None
+    # modifier-if + if + 2 elsif + && + || over the base path; elsif chains
+    # and the one-line modifier stay flat.
+    assert many.ccn == 7, f"expected CCN 7, got {many.ccn}"
+    assert many.max_nesting == 1, f"expected nesting 1, got {many.max_nesting}"
+    wordy = _find(results, "wordy")
+    assert wordy is not None and wordy.ccn == 3  # ``and`` / ``or`` count too
+    shallow = _find(results, "shallow")
+    assert shallow is not None and shallow.max_nesting == 0
+    assert shallow.param_count == 1
+    mods = _find(results, "modifier_loops")
+    assert mods is not None
+    assert mods.ccn == 3  # until_modifier + while_modifier
+    assert mods.max_nesting == 0  # one-line modifiers are flat
+
+
+def test_ruby_blocks_are_not_closures():
+    # ``.each do … end`` / ``.map { … }`` bodies roll up into the method:
+    # no nesting, no extra entries — the block-heavy-code decision.
+    results = _walk("ruby/nested.rb", "ruby")
+    blocky = _find(results, "block_heavy")
+    assert blocky is not None
+    assert blocky.ccn == 1 and blocky.max_nesting == 0
+    assert not any("anonymous" in r.name for r in results)
+
+
+def test_ruby_case_and_rescue():
+    results = _walk("ruby/nested.rb", "ruby")
+    flat = _find(results, "flat_case")
+    assert flat is not None
+    # A flat case counts once for the dispatch, not per ``when`` arm.
+    assert flat.ccn == 2, f"expected CCN 2, got {flat.ccn}"
+    heavy = _find(results, "heavy_case")
+    assert heavy is not None
+    # 3 when arms + the nested if.
+    assert heavy.ccn == 5, f"expected CCN 5, got {heavy.ccn}"
+    pat = _find(results, "pattern_match")
+    assert pat is not None
+    assert pat.ccn == 2, f"expected CCN 2, got {pat.ccn}"  # flat case/in
+    risky = _find(results, "risky_io")
+    assert risky is not None
+    assert risky.ccn == 3, f"expected CCN 3, got {risky.ccn}"  # 2 rescue arms
+    implicit = _find(results, "implicit_rescue")
+    assert implicit is not None
+    assert implicit.ccn == 2  # method-level rescue counts like a catch
+
+
+def test_ruby_class_metrics_and_lcom4_no_signal():
+    classes = _walk_classes("ruby/classes.rb", "ruby")
+    cohesive = classes.get("Cohesive")
+    splintered = classes.get("Splintered")
+    assert cohesive is not None and splintered is not None
+    assert splintered.method_count == 5
+    assert splintered.max_method_ccn == 2
+    # LCOM4 sits at the "no signal" valve for Ruby (receiver-less @ivar
+    # idiom): even a splintered class must NOT read as low-cohesion.
+    assert cohesive.lcom4 == 1
+    assert splintered.lcom4 == 1
+    util = classes.get("Util")
+    assert util is not None and util.method_count == 2  # def + def self.
+
+
+def test_ruby_assertion_blocks():
+    results = _walk("ruby/assertions.rb", "ruby")
+    many = _find(results, "test_many_asserts")
+    assert many is not None
+    assert many.assertion_blocks, "expected a run of assert calls"
+    assert many.assertion_blocks[0][2] == 5
+    few = _find(results, "test_few_asserts")
+    assert few is not None and few.assertion_blocks == []

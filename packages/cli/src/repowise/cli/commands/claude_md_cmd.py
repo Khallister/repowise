@@ -157,6 +157,35 @@ async def _generate(
 # Workspace generation
 # ---------------------------------------------------------------------------
 
+_MAX_CONTRACT_LINKS = 12
+
+
+def _curate_contract_links(links: list[dict]) -> list[dict]:
+    """Reduce raw contract links to the cross-repo rows worth a CLAUDE.md line.
+
+    Raw links include intra-repo pairs (a repo's own model/migration files
+    "providing" tables its own modules consume) and one row per provider file
+    for the same (contract, consumer) — in a real workspace that rendered 30+
+    near-duplicate ``data::repositories`` rows before the first genuinely
+    cross-repo contract. Keep provider_repo != consumer_repo only, collapse
+    duplicate (contract, consumer) pairs preferring a non-migration provider,
+    and cap the table.
+    """
+    best: dict[tuple, dict] = {}
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        if link.get("provider_repo") == link.get("consumer_repo"):
+            continue
+        key = (link.get("contract_id"), link.get("consumer_repo"), link.get("consumer_file"))
+        current = best.get(key)
+        is_migration = "alembic/versions/" in (link.get("provider_file") or "")
+        if current is None or (
+            "alembic/versions/" in (current.get("provider_file") or "") and not is_migration
+        ):
+            best[key] = link
+    return list(best.values())[:_MAX_CONTRACT_LINKS]
+
 
 def _generate_workspace(
     start_path: Path,
@@ -174,14 +203,13 @@ def _generate_workspace(
         WORKSPACE_DATA_DIR,
         WorkspaceConfig,
     )
-    from repowise.core.workspace.cross_repo import CROSS_REPO_EDGES_FILENAME
     from repowise.core.workspace.contracts import CONTRACTS_FILENAME
+    from repowise.core.workspace.cross_repo import load_overlay
 
     ws_root = find_workspace_root(start_path)
     if ws_root is None:
         raise click.ClickException(
-            "No .repowise-workspace.yaml found. "
-            "Run 'repowise init <workspace-dir>' first."
+            "No .repowise-workspace.yaml found. Run 'repowise init <workspace-dir>' first."
         )
 
     ws_config = WorkspaceConfig.load(ws_root)
@@ -192,14 +220,14 @@ def _generate_workspace(
     # ------------------------------------------------------------------
     co_changes: list[dict] = []
     package_deps: list[dict] = []
-    edges_file = data_dir / CROSS_REPO_EDGES_FILENAME
-    if edges_file.exists():
-        try:
-            overlay = json.loads(edges_file.read_text(encoding="utf-8"))
-            co_changes = overlay.get("co_changes", [])
-            package_deps = overlay.get("package_deps", [])
-        except Exception:
-            pass  # non-fatal; workspace data may not exist yet
+    overlay_summaries: dict[str, dict] = {}
+    overlay = load_overlay(ws_root)  # None when absent, corrupt, or stale-versioned
+    if overlay is not None:
+        from dataclasses import asdict
+
+        co_changes = [asdict(c) for c in overlay.co_changes]
+        package_deps = [asdict(d) for d in overlay.package_deps]
+        overlay_summaries = overlay.repo_summaries
 
     # Sort co-changes by frequency descending so the top entries are most useful
     co_changes = sorted(co_changes, key=lambda c: c.get("frequency", 0), reverse=True)
@@ -213,7 +241,7 @@ def _generate_workspace(
     if contracts_file.exists():
         try:
             contracts_data = json.loads(contracts_file.read_text(encoding="utf-8"))
-            contract_links = contracts_data.get("contract_links", [])
+            contract_links = _curate_contract_links(contracts_data.get("contract_links", []))
             # Build counts by type from raw contracts list
             for contract in contracts_data.get("contracts", []):
                 ctype = contract.get("contract_type") or contract.get("type", "unknown")
@@ -229,25 +257,9 @@ def _generate_workspace(
         abs_path = (ws_root / entry.path).resolve()
         file_count, symbol_count = _query_repo_counts(abs_path)
 
-        # Hotspot count: try to read from the overlay's repo_summaries if available
-        hotspot_count = 0
-        if edges_file.exists():
-            try:
-                overlay_data = json.loads(edges_file.read_text(encoding="utf-8"))
-                repo_sum = overlay_data.get("repo_summaries", {}).get(entry.alias, {})
-                hotspot_count = repo_sum.get("hotspot_count", 0)
-            except Exception:
-                pass
-
-        # Entry points: read from overlay repo_summaries if present, else empty
-        entry_points: list[str] = []
-        if edges_file.exists():
-            try:
-                overlay_data = json.loads(edges_file.read_text(encoding="utf-8"))
-                repo_sum = overlay_data.get("repo_summaries", {}).get(entry.alias, {})
-                entry_points = repo_sum.get("entry_points", [])
-            except Exception:
-                pass
+        repo_sum = overlay_summaries.get(entry.alias, {})
+        hotspot_count = repo_sum.get("hotspot_count", 0)
+        entry_points = repo_sum.get("entry_points", [])
 
         repo_summaries.append(
             WorkspaceRepoSummary(

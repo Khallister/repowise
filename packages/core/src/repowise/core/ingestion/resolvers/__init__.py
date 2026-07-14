@@ -17,12 +17,15 @@ from .go import resolve_go_import
 from .haskell import resolve_haskell_import
 from .java import resolve_java_import
 from .kotlin import resolve_kotlin_import
+from .lean import resolve_lean_import
 from .luau import resolve_luau_import
 from .php import resolve_php_import
 from .python import resolve_python_import
 from .ruby import resolve_ruby_import
 from .rust import resolve_rust_import
 from .scala import resolve_scala_import
+from .shell import resolve_shell_import
+from .sql import resolve_dbt_import
 from .swift import resolve_swift_import
 from .typescript import resolve_ts_js_import
 
@@ -45,13 +48,18 @@ _RESOLVERS: dict[str, ResolverFn] = {
     "swift": resolve_swift_import,
     "scala": resolve_scala_import,
     "php": resolve_php_import,
+    # source ./lib.sh + the $SCRIPT_DIR/$(dirname "$0") idioms.
+    "shell": resolve_shell_import,
     # Lightweight regex-tier resolvers (import_support="partial")
     "elixir": resolve_elixir_import,
     "dart": resolve_dart_import,
     "clojure": resolve_clojure_import,
     "haskell": resolve_haskell_import,
+    "lean": resolve_lean_import,
     "erlang": resolve_erlang_import,
     "fsharp": resolve_fsharp_import,
+    # dbt ref()/source(), gated on dbt_project.yml via the model index.
+    "sql": resolve_dbt_import,
 }
 
 

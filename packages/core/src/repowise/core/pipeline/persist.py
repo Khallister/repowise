@@ -80,6 +80,42 @@ async def mark_tombstone_pages(
     return marked
 
 
+async def mark_stale_pages(session: Any, repo_id: str, paths: list[str]) -> int:
+    """Decay weakly-affected file pages to ``freshness_status='stale'``.
+
+    ``ChangeDetector.get_affected_pages`` returns ``decay_only`` — pages hit
+    by the change cascade but beyond the regeneration budget (budget
+    overflow, co-change partners, 2-hop rename fallout). They keep serving
+    their existing content, but the stale bit makes the coverage view and
+    ``get_stale_pages`` truthful so the next docs run (or a reader) knows
+    they lag the code. Only ``fresh`` pages are downgraded — tombstoned or
+    already-stale pages keep their stronger status, and pages regenerated in
+    this run are never in ``decay_only`` by construction.
+
+    Returns the number of pages marked.
+    """
+    if not paths:
+        return 0
+    from sqlalchemy import update
+
+    from repowise.core.persistence.models import Page
+
+    page_ids = [f"file_page:{path}" for path in paths]
+    res = await session.execute(
+        update(Page)
+        .where(
+            Page.repository_id == repo_id,
+            Page.id.in_(page_ids),
+            Page.freshness_status == "fresh",
+        )
+        .values(freshness_status="stale")
+    )
+    marked = int(res.rowcount or 0)
+    if marked:
+        logger.info("pages_decayed_stale", repo_id=repo_id, count=marked)
+    return marked
+
+
 def _derive_entry_point_scores(graph_builder: Any) -> dict[str, float]:
     """Best-effort entry-point scores from the builder's execution-flow report.
 
@@ -213,6 +249,127 @@ async def persist_graph_nodes(
         )
     except Exception as exc:  # materialization is non-load-bearing
         logger.warning("graph_node_membership_materialize_skipped", error=str(exc))
+
+
+def _changed_file_symbols(
+    parsed_files: list[Any] | None, changed_paths: list[str]
+) -> tuple[list[str], list[Any]]:
+    """``(reconcile_paths, symbols)`` for files that both changed and parsed.
+
+    Restricting to the intersection means a changed file that failed to parse
+    this run keeps its existing symbol rows (mirrors the graph, which skips
+    unparsed files) rather than having them wrongly pruned on a transient
+    failure. Mutates ``sym.file_path`` where the parser left it unset, same as
+    the full persist path.
+    """
+    changed = set(changed_paths or [])
+    reconcile_paths: list[str] = []
+    symbols: list[Any] = []
+    for pf in parsed_files or []:
+        path = pf.file_info.path
+        if path not in changed:
+            continue
+        reconcile_paths.append(path)
+        for sym in pf.symbols:
+            if not getattr(sym, "file_path", None):
+                sym.file_path = path
+            symbols.append(sym)
+    return reconcile_paths, symbols
+
+
+async def persist_incremental_symbols(
+    session: Any,
+    repo_id: str,
+    parsed_files: list[Any] | None,
+    changed_paths: list[str],
+) -> None:
+    """Refresh ``wiki_symbols`` for changed+parsed files on an incremental update.
+
+    The incremental update path re-parses changed files but never persisted
+    their symbols, so wiki_symbols bounds fossilized at the last full index and
+    the get_answer hydrator served drifted signatures/bodies. This upserts the
+    changed files' fresh symbols and prunes symbols that vanished from a
+    still-existing file. Scoped to the changed set for cost — the repo-wide
+    ``batch_upsert_symbols`` reloads every symbol row.
+    """
+    if not parsed_files:
+        return
+    from repowise.core.persistence.crud import reconcile_symbols_for_files
+
+    reconcile_paths, symbols = _changed_file_symbols(parsed_files, changed_paths)
+    if not reconcile_paths:
+        return
+    await reconcile_symbols_for_files(session, repo_id, reconcile_paths, symbols)
+
+
+def _changed_file_edges(
+    graph_builder: Any,
+    parsed_files: list[Any] | None,
+    changed_paths: list[str],
+) -> tuple[list[str], list[dict]]:
+    """``(reconcile_paths, edges)`` for edges emanating from changed+parsed files.
+
+    An edge is attributed to the file that owns its *source* node: a file node
+    is the path itself; a symbol node carries ``file_path``. Restricting to
+    files that both changed and parsed this run mirrors ``_changed_file_symbols``
+    — a changed file that failed to parse keeps its existing edges rather than
+    having them wrongly wiped on a transient failure.
+    """
+    changed = set(changed_paths or [])
+    parsed = {pf.file_info.path for pf in parsed_files or []}
+    reconcile = changed & parsed
+    if not reconcile:
+        return [], []
+
+    graph = graph_builder.graph()
+    owner: dict[str, str | None] = {}
+    for node_id in graph.nodes:
+        data = graph.nodes[node_id]
+        owner[node_id] = (
+            node_id if data.get("node_type", "file") == "file" else data.get("file_path")
+        )
+
+    edges: list[dict] = []
+    for u, v, data in graph.edges(data=True):
+        if owner.get(u) not in reconcile:
+            continue
+        edges.append(
+            {
+                "source_node_id": u,
+                "target_node_id": v,
+                "imported_names_json": json.dumps(data.get("imported_names", [])),
+                "edge_type": data.get("edge_type", "imports"),
+                "confidence": data.get("confidence", 1.0),
+            }
+        )
+    return sorted(reconcile), edges
+
+
+async def persist_incremental_edges(
+    session: Any,
+    repo_id: str,
+    graph_builder: Any,
+    parsed_files: list[Any] | None,
+    changed_paths: list[str],
+) -> None:
+    """Refresh ``graph_edges`` for changed files on an incremental update.
+
+    Sibling of :func:`persist_incremental_symbols`. The full-init path was the
+    only one that ever wrote ``graph_edges``; ``repowise update`` rebuilt the
+    graph but never repersisted edges, so adjacency froze at the last full
+    index. Phase E flow-path answers and any graph expansion read adjacency
+    straight from this table, so they decayed on every incremental update. This
+    delete-then-inserts the changed files' outgoing edges (dropping edges those
+    files no longer have). Scoped to the changed set for cost.
+    """
+    if graph_builder is None or not parsed_files:
+        return
+    from repowise.core.persistence.crud import reconcile_edges_for_files
+
+    reconcile_paths, edges = _changed_file_edges(graph_builder, parsed_files, changed_paths)
+    if not reconcile_paths:
+        return
+    await reconcile_edges_for_files(session, repo_id, reconcile_paths, edges)
 
 
 # Chunk size for IN (...) deletes — stays under SQLite's host-parameter limit.
@@ -494,6 +651,7 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     ``(repo_id, sha)`` — safe to call incrementally and on resume.
     """
     from repowise.core.persistence.crud import (
+        update_repo_git_totals,
         upsert_git_commits_bulk,
         upsert_git_metadata_bulk,
     )
@@ -501,10 +659,26 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     if result.git_metadata_list:
         await upsert_git_metadata_bulk(session, repo_id, result.git_metadata_list)
 
+    summary = getattr(result, "git_summary", None)
+
     # Per-commit rows + change-risk ride on the git summary.
-    commit_rows = getattr(getattr(result, "git_summary", None), "commit_rows", None)
+    commit_rows = getattr(summary, "commit_rows", None)
     if commit_rows:
         await upsert_git_commits_bulk(session, repo_id, commit_rows)
+
+    # Whole-history totals (true age / commit / contributor counts) also ride on
+    # the summary — stamp them on the Repository row so the stats page reads them
+    # instead of deriving them from the bounded ``git_commits`` sample (#730).
+    totals = getattr(summary, "repo_totals", None)
+    if totals is not None:
+        await update_repo_git_totals(
+            session,
+            repo_id,
+            total_commit_count=totals.total_commit_count,
+            first_commit_at=totals.first_commit_at,
+            total_contributor_count=totals.total_contributor_count,
+            first_commit_author=totals.first_commit_author,
+        )
 
 
 async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
@@ -540,9 +714,7 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         # Resolved coverage rows, when a report was ingested this run.
         coverage_files = getattr(hr, "coverage_files", None)
         if coverage_files:
-            head_sha = getattr(result, "head_commit", None) or getattr(
-                result, "commit_sha", None
-            )
+            head_sha = getattr(result, "head_commit", None) or getattr(result, "commit_sha", None)
             await save_coverage_files(
                 session,
                 repo_id,
@@ -589,6 +761,16 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
             harvested = page.metadata.get("harvested_decisions")
             if harvested:
                 decision_dicts.extend(harvested)
+
+    # One-shot drain of proposals from the removed code_comment harvest;
+    # without this, DBs indexed before its removal keep a flooded review
+    # queue forever (#751). Confirmed/dismissed rows are kept.
+    try:
+        from repowise.core.persistence.crud import purge_proposed_decisions_by_source
+
+        await purge_proposed_decisions_by_source(session, repo_id, "code_comment")
+    except Exception as _purge_err:
+        logger.debug("decision_purge_skipped", error=str(_purge_err))
 
     if decision_dicts:
         # Reuse the run's shared vector store for semantic (paraphrase) dedup
@@ -685,35 +867,45 @@ async def persist_generation(result: Any, session: Any, repo_id: str) -> None:
     # ---- Knowledge graph layers, tour steps & curated meta ------------------
     kg = getattr(result, "knowledge_graph_result", None)
     if kg is not None:
-        from repowise.core.persistence.crud import (
-            file_node_meta_from_kg_nodes,
-            upsert_kg_layers,
-            upsert_kg_node_meta,
-            upsert_kg_project_meta,
-            upsert_kg_tour_steps,
+        await persist_kg(kg, session, repo_id)
+
+
+async def persist_kg(kg: Any, session: Any, repo_id: str) -> None:
+    """Persist knowledge-graph layers, tour steps, and curated meta.
+
+    Full-replace semantics, safe to call incrementally — shared by the full
+    pipeline (:func:`persist_generation`) and the incremental update path so
+    a refreshed KG lands through the same writers.
+    """
+    from repowise.core.persistence.crud import (
+        file_node_meta_from_kg_nodes,
+        upsert_kg_layers,
+        upsert_kg_node_meta,
+        upsert_kg_project_meta,
+        upsert_kg_tour_steps,
+    )
+
+    if hasattr(kg, "layers") and kg.layers:
+        await upsert_kg_layers(session, repo_id, kg.layers)
+    if hasattr(kg, "tour") and kg.tour:
+        await upsert_kg_tour_steps(session, repo_id, kg.tour)
+
+    # Project-level curated meta (ranked entry points from the curation pass).
+    project = getattr(kg, "project", None)
+    if isinstance(project, dict) and project.get("entry_points"):
+        await upsert_kg_project_meta(
+            session,
+            repo_id,
+            entry_points=project["entry_points"],
+            entry_candidates=project.get("entry_candidates", []),
         )
 
-        if hasattr(kg, "layers") and kg.layers:
-            await upsert_kg_layers(session, repo_id, kg.layers)
-        if hasattr(kg, "tour") and kg.tour:
-            await upsert_kg_tour_steps(session, repo_id, kg.tour)
-
-        # Project-level curated meta (ranked entry points from the curation pass).
-        project = getattr(kg, "project", None)
-        if isinstance(project, dict) and project.get("entry_points"):
-            await upsert_kg_project_meta(
-                session,
-                repo_id,
-                entry_points=project["entry_points"],
-                entry_candidates=project.get("entry_candidates", []),
-            )
-
-        # Per-node curated meta (type/summary/tags) for file nodes, stored with
-        # the "file:" prefix stripped so the architecture view can match its
-        # node ids (plain repo-relative paths) directly.
-        file_node_meta = file_node_meta_from_kg_nodes(getattr(kg, "nodes", None) or [])
-        if file_node_meta:
-            await upsert_kg_node_meta(session, repo_id, file_node_meta)
+    # Per-node curated meta (type/summary/tags) for file nodes, stored with
+    # the "file:" prefix stripped so the architecture view can match its
+    # node ids (plain repo-relative paths) directly.
+    file_node_meta = file_node_meta_from_kg_nodes(getattr(kg, "nodes", None) or [])
+    if file_node_meta:
+        await upsert_kg_node_meta(session, repo_id, file_node_meta)
 
 
 async def persist_pipeline_result(

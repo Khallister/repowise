@@ -24,6 +24,7 @@ from repowise.server.mcp_server._helpers import (
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server.tool_search_symbols import (
+    _qual_norm,
     search_paths_single,
     search_symbols_single,
 )
@@ -63,6 +64,75 @@ def _embedded_identifiers(query: str) -> list[str]:
     return _IDENT_TOKEN_RE.findall(query)
 
 
+def _identifier_candidates(query: str, mode: str) -> list[str]:
+    """Identifier tokens the query is asking after, for the exact-match signal.
+
+    A single-token query IS the identifier (symbol mode); a natural-language
+    query carrying identifiers (hybrid mode) exposes them the same way
+    ``_resolve_mode`` used to route here. Concept/path queries name none.
+    """
+    if mode == "symbol":
+        q = query.strip()
+        return [q] if q else []
+    if mode == "hybrid":
+        return _embedded_identifiers(query)
+    return []
+
+
+def _has_exact_symbol(candidates: list[str], symbols: list[dict]) -> bool:
+    """True when some returned symbol's name/qualified-name equals a candidate.
+
+    Reuses the scorer's separator-normalisation so an agent's ``Class.method``
+    matches a ``Class::method`` qualified_name in the index. This is the score
+    cliff made explicit: an exact hit and a fuzzy neighbour look identical in
+    the result list otherwise, and the agent anchors on whatever ranks first.
+    """
+    if not candidates or not symbols:
+        return False
+    wanted = {c.strip().lower() for c in candidates if c.strip()}
+    wanted |= {_qual_norm(c) for c in candidates if c.strip()}
+    for s in symbols:
+        name = (s.get("name") or "").strip().lower()
+        qn = _qual_norm(s.get("qualified_name"))
+        if (name and name in wanted) or (qn and qn in wanted):
+            return True
+    return False
+
+
+def _prose_dominates(query: str, identifiers: list[str]) -> bool:
+    """True when natural-language tokens outnumber the identifier tokens a query
+    carries: the query reads as prose that merely *mentions* a symbol, not a
+    symbol lookup dressed in a few words. Drives hybrid ordering below."""
+    ident_count = len(identifiers)
+    if ident_count == 0:
+        return False
+    total = len(re.findall(r"[A-Za-z0-9_]+", query))
+    return (total - ident_count) > ident_count
+
+
+def _interleave_hybrid(query: str, symbols: list[dict], concepts: list[dict],
+                       limit: int, exact: bool) -> list[dict]:
+    """Order one hybrid result window from the two incomparable score scales.
+
+    Symbol SQL scores (~43, +100 on an exact-name hit) and concept relevance
+    (0 to 1) can't be merge-sorted, so we interleave by block. Default: symbols
+    lead, reserving up to half the window for concept pages so a flood of symbol
+    matches can't truncate every page out.
+
+    The exception is the score-scale trap. When NO returned symbol matches the
+    query's identifier exactly AND the query is mostly prose, leading with fuzzy
+    symbol hits buries the page the caller actually wants: the generic ``.get``
+    methods that outscore the ``answer.py`` page for "how does retrieval feed
+    synthesis in get_answer". There, concept pages lead and the fuzzy symbols
+    fall to the tail (nothing is dropped, only reordered within the window).
+    """
+    if not exact and concepts and _prose_dominates(query, _embedded_identifiers(query)):
+        reserved = min(len(symbols), limit // 2)
+        return (concepts[: max(1, limit - reserved)] + symbols)[:limit]
+    reserved = min(len(concepts), limit // 2)
+    return (symbols[: max(1, limit - reserved)] + concepts)[:limit]
+
+
 # Decision records are short, dense title-statements; they win cosine
 # similarity against long file-page embeddings on any query containing
 # design nouns ("store", "SQLite", "cap", "prune") and crowd file pages
@@ -70,6 +140,14 @@ def _embedded_identifiers(query: str) -> list[str]:
 # why-shaped — rationale questions are get_why's territory, but a caller
 # who phrases one here clearly wants the decision pages ranked honestly.
 _DECISION_DOWNWEIGHT = 0.6
+
+# Deterministic template pages (the Phase G coverage tail) are factual but
+# thin — they exist so every source file is retrievable, not to out-argue a
+# rich LLM page. A mild multiplicative down-weight breaks ties toward the LLM
+# page when both match a conceptual query, without burying a deterministic
+# page that is genuinely the best hit (its file has no LLM page). A stronger
+# demotion would re-bury the coverage the tail pages add.
+_DETERMINISTIC_DOWNWEIGHT = 0.9
 
 _WHY_SHAPED_RE = re.compile(
     r"^\s*(why|when\s+did|when\s+was|who\s+decided|who\s+chose|what\s+was\s+the\s+(reason|rationale))\b"
@@ -90,6 +168,23 @@ def _downweight_decisions(output: list[dict], query: str) -> None:
     for item in output:
         if item.get("page_type") == "decision_record" and item.get("relevance_score"):
             item["relevance_score"] = round(item["relevance_score"] * _DECISION_DOWNWEIGHT, 4)
+
+
+def _downweight_deterministic(output: list[dict], det_ids: set) -> None:
+    """Scale down deterministic-template pages' relevance in place.
+
+    A thin projection page should not displace a rich LLM page when both
+    match a conceptual query. The multiplicative factor only breaks ties —
+    a deterministic page that is clearly the best hit (its file has no LLM
+    page) still surfaces, preserving the coverage the tail adds.
+    """
+    if not det_ids:
+        return
+    for item in output:
+        if item.get("page_id") in det_ids and item.get("relevance_score"):
+            item["relevance_score"] = round(
+                item["relevance_score"] * _DETERMINISTIC_DOWNWEIGHT, 4
+            )
 
 
 def _sort_demoting_decisions(output: list[dict], query: str) -> None:
@@ -240,20 +335,25 @@ def _filter_by_kind(output: list[dict], kind: str | None) -> list[dict]:
 
 async def _load_page_info(
     session, output: list[dict], *, with_git: bool = False
-) -> tuple[dict, set, dict]:
-    """Batch-load target paths, tombstones, and optionally git metadata.
+) -> tuple[dict, set, dict, set]:
+    """Batch-load target paths, tombstones, deterministic markers, and git.
 
-    Returns ``(page_info, tombstoned, git_map)`` where ``page_info`` maps
-    page_id -> target_path, ``tombstoned`` is the set of tombstoned page_ids,
-    and ``git_map`` maps file_path -> GitMetadata (empty unless ``with_git``).
+    Returns ``(page_info, tombstoned, git_map, det_ids)`` where ``page_info``
+    maps page_id -> target_path, ``tombstoned`` is the set of tombstoned
+    page_ids, ``git_map`` maps file_path -> GitMetadata (empty unless
+    ``with_git``), and ``det_ids`` is the set of page_ids for deterministic
+    template pages (the coverage tail — ``provider_name == "template"``).
     """
     page_ids = [item["page_id"] for item in output]
     res = await session.execute(
-        select(Page.id, Page.target_path, Page.freshness_status).where(Page.id.in_(page_ids))
+        select(Page.id, Page.target_path, Page.freshness_status, Page.provider_name).where(
+            Page.id.in_(page_ids)
+        )
     )
     rows = res.all()
     page_info = {row[0]: row[1] for row in rows}
     tombstoned = {row[0] for row in rows if row[2] == "tombstone"}
+    det_ids = {row[0] for row in rows if row[3] == "template"}
 
     git_map: dict[str, GitMetadata] = {}
     if with_git:
@@ -263,7 +363,7 @@ async def _load_page_info(
                 select(GitMetadata).where(GitMetadata.file_path.in_(target_paths))
             )
             git_map = {g.file_path: g for g in git_res.scalars().all()}
-    return page_info, tombstoned, git_map
+    return page_info, tombstoned, git_map, det_ids
 
 
 def _apply_freshness_boost(item: dict, gm: GitMetadata | None) -> None:
@@ -369,18 +469,23 @@ async def _search_single_repo(
 
     _downweight_decisions(output, query)
     output = await _rescue_all_decision_window(ctx, output, query, fetch_limit)
-    _sort_demoting_decisions(output, query)
 
-    # Attach target_path and drop excluded hits per repo (so federated search
-    # honours each repo's own exclude_patterns) before aggregation. Runs on
-    # the over-fetched list so the kind filter below has real headroom.
+    # Attach target_path + deterministic markers and drop excluded hits per
+    # repo (so federated search honours each repo's own exclude_patterns)
+    # before ranking. Runs on the over-fetched list so the kind filter below
+    # has real headroom. Load precedes the sort so both the decision demotion
+    # and the deterministic down-weight see the page metadata they key on.
+    det_ids: set = set()
     if output:
         async with get_session(ctx.session_factory) as session:
-            page_info, tombstoned, _ = await _load_page_info(session, output)
+            page_info, tombstoned, _, det_ids = await _load_page_info(session, output)
         output = [item for item in output if item["page_id"] not in tombstoned]
         for item in output:
             item["target_path"] = page_info.get(item["page_id"], "")
         output = filter_dicts_by_key(output, "target_path", _get_exclude_spec(ctx.path))
+
+    _downweight_deterministic(output, det_ids)
+    _sort_demoting_decisions(output, query)
 
     output = _filter_by_kind(output, kind)
     return output[:limit], method
@@ -411,20 +516,43 @@ async def _federated_search(
     return {"results": output, "_meta": _build_meta()}
 
 
+def _result_paths(results: list[dict]) -> list[str]:
+    """File paths a result set serves, for target-scoped freshness.
+
+    Symbol hits carry ``file``; concept/page hits carry ``target_path``.
+    An empty result set returns ``[]`` (meaning "no file content served",
+    which suppresses the repo-level stale warning by design).
+    """
+    paths: list[str] = []
+    for item in results:
+        p = item.get("file") or item.get("target_path")
+        if isinstance(p, str) and p:
+            paths.append(p)
+    return paths
+
+
 def _grep_hint_for(query: str) -> str | None:
-    """Build a Grep nudge for identifier-shaped queries, else ``None``."""
+    """Zero-result recovery hint for identifier-shaped queries, else ``None``.
+
+    Only attached when the search produced nothing (see call sites) — a
+    populated result set needs no escape hatch. Points back into the tool
+    surface first; Grep is named only for the one job it genuinely wins:
+    an exhaustive literal sweep of every usage (e.g. before a rename).
+    """
     if _looks_like_exact_token(query):
         return (
-            f"Query {query!r} looks like an exact identifier. Grep will find "
-            "literal usages faster and without thematic drift. This tool ran "
-            "the search anyway — verify before relying on the results."
+            f"No indexed match for identifier {query!r}. Retry with "
+            'mode="symbol" (or check spelling/casing); if you need every '
+            "literal usage for an exhaustive sweep such as a rename, Grep "
+            "is the right tool for that."
         )
     if idents := _embedded_identifiers(query):
         shown = ", ".join(repr(t) for t in idents[:3])
         return (
-            f"Query names identifier(s) {shown} — for their exact "
-            "definition/usages, Grep is faster and never drifts "
-            "thematically. Semantic results below are concept-level."
+            f"Query names identifier(s) {shown} but nothing matched. Search "
+            'the identifier alone with mode="symbol", then pipe the hit '
+            "into get_symbol for its body. For an exhaustive every-usage "
+            "sweep, Grep the literal name."
         )
     return None
 
@@ -512,28 +640,52 @@ async def _structured_search(
     symbols.sort(key=lambda x: -(x.get("score") or 0.0))
     files.sort(key=lambda x: -(x.get("score") or 0.0))
 
+    # Whether any returned symbol matches the query's identifier(s) exactly.
+    # Computed once here so the hybrid interleave and the exact-match note below
+    # agree on the same signal.
+    candidates = _identifier_candidates(query, mode)
+    exact = _has_exact_symbol(candidates, symbols) if candidates else False
+
     if mode == "symbol":
         results = symbols[:limit]
     elif mode == "path":
         results = files[:limit]
-    else:  # hybrid — symbol matches first, then concept pages for new files
+    else:  # hybrid: interleave symbol matches and concept pages for new files
         sym_files = {s.get("file") for s in symbols}
         concepts = [c for c in concepts if c.get("target_path") not in sym_files]
         # Federation appends per-repo concept lists in repo order — re-rank by
         # relevance so a strong page in repo B isn't buried under repo A's weak
         # ones. (Single-repo: already sorted upstream; this is a no-op.)
         concepts.sort(key=lambda x: -(x.get("relevance_score") or 0.0))
-        # Reserve up to half the window for concept pages so hybrid stays
-        # hybrid: a flood of symbol matches must not truncate every page out.
-        reserved = min(len(concepts), limit // 2)
-        results = (symbols[: max(1, limit - reserved)] + concepts)[:limit]
+        results = _interleave_hybrid(query, symbols, concepts, limit, exact)
 
     repository = None
     if not multi:
         async with get_session(contexts[0].session_factory) as session:
             repository = await _get_repo(session)
 
-    response: dict = {"results": results, "mode": mode, "_meta": _build_meta(repository=repository)}
+    response: dict = {
+        "results": results,
+        "mode": mode,
+        "_meta": _build_meta(repository=repository, targets=_result_paths(results)),
+    }
+    # Exact-match honesty: an identifier-shaped query whose target names no
+    # indexed symbol still returns fuzzy neighbours. Say so, or the agent
+    # anchors on a wrong hit that looks authoritative (their Alamofire
+    # 44-overload read-spiral). Emit the boolean either way; a note only when
+    # there is no exact hit to distinguish from the fuzz. ``candidates`` /
+    # ``exact`` were computed above so ordering and this note stay consistent.
+    if candidates:
+        response["exact_match"] = exact
+        if not exact:
+            shown = ", ".join(repr(c) for c in candidates[:3])
+            response["note"] = (
+                f"No indexed symbol exactly matches {shown}. The results are "
+                "fuzzy neighbours ranked by token overlap — confirm a hit names "
+                "what you meant before relying on it. If you expected an exact "
+                "symbol, recheck spelling/casing, or Grep the literal name for "
+                "an exhaustive usage sweep."
+            )
     if grep_hint and not results:
         response["grep_hint"] = grep_hint
     return response
@@ -581,7 +733,7 @@ async def search_codebase(
         # kind is filtered per-repo inside _search_single_repo, before each
         # repo's limit cut, so the fused list is already kind-pure and full.
         federated = await _federated_search(query, limit, page_type, kind)
-        if grep_hint:
+        if grep_hint and not federated.get("results"):
             federated["grep_hint"] = grep_hint
         return federated
 
@@ -614,7 +766,9 @@ async def search_codebase(
     # Batch-lookup page target paths for the kind filter + git freshness boost
     if output:
         async with get_session(ctx.session_factory) as session:
-            page_info, tombstoned, git_map = await _load_page_info(session, output, with_git=True)
+            page_info, tombstoned, git_map, det_ids = await _load_page_info(
+                session, output, with_git=True
+            )
         # Tombstoned pages document deleted/renamed files — never results.
         output = [item for item in output if item["page_id"] not in tombstoned]
 
@@ -631,7 +785,10 @@ async def search_codebase(
             gm = git_map.get(target_path) if target_path else None
             _apply_freshness_boost(item, gm)
 
-        # Re-sort by boosted relevance, decisions hard-demoted on non-why queries
+        # Down-weight thin deterministic pages so they don't displace a rich
+        # LLM page, then re-sort by adjusted relevance with decisions hard-
+        # demoted on non-why queries.
+        _downweight_deterministic(output, det_ids)
         _sort_demoting_decisions(output, query)
 
     output = _filter_by_kind(output, kind)
@@ -640,7 +797,10 @@ async def search_codebase(
     # Derive confidence_score from relative position in the result set.
     _assign_confidence(output, "relevance_score", "confidence_score")
 
-    response: dict = {"results": output, "_meta": _build_meta(repository=repository)}
-    if grep_hint:
+    response: dict = {
+        "results": output,
+        "_meta": _build_meta(repository=repository, targets=_result_paths(output)),
+    }
+    if grep_hint and not output:
         response["grep_hint"] = grep_hint
     return response

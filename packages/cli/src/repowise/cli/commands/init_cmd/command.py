@@ -66,6 +66,7 @@ from repowise.cli.ui import (
     quick_repo_scan,
     should_offer_fast_mode,
 )
+from repowise.core.generation.languages import SUPPORTED_LANGUAGES
 from repowise.core.generation.styles import DEFAULT_STYLE, list_styles, resolve_style
 from repowise.core.reasoning import REASONING_MODES
 
@@ -82,6 +83,56 @@ from .reporting import show_analysis_summary, show_completion
 from .workspace import _workspace_init
 
 
+def _record_init_outcome(
+    *,
+    result: Any,
+    effective_index_only: bool,
+    run_mode: str,
+    provider: Any,
+    embedder_name_resolved: str,
+) -> None:
+    """Attach an anonymous shape-of-the-index outcome to the ``command_run`` event.
+
+    Coarse buckets + enums only (file-count bucket, docs mode, run mode, top
+    language, provider/embedder names) — no repo names, paths, or exact counts.
+    Best-effort: never let telemetry break the command's happy path.
+    """
+    try:
+        from repowise.cli.platform import telemetry
+
+        outcome: dict[str, Any] = {
+            "outcome": "success",
+            "index_only": bool(effective_index_only),
+            "run_mode": run_mode,
+            "file_count_bucket": telemetry.bucket_count(getattr(result, "file_count", 0) or 0),
+            "symbol_count_bucket": telemetry.bucket_count(getattr(result, "symbol_count", 0) or 0),
+        }
+
+        lang_dist = getattr(
+            getattr(result, "repo_structure", None), "root_language_distribution", None
+        )
+        if isinstance(lang_dist, dict) and lang_dist:
+            outcome["top_language"] = max(lang_dist.items(), key=lambda kv: kv[1])[0]
+
+        if not effective_index_only and provider is not None:
+            outcome["docs_mode"] = True
+            outcome["provider"] = getattr(provider, "provider_name", None)
+            outcome["model"] = getattr(provider, "model_name", None)
+            pages = getattr(result, "generated_pages", None) or []
+            outcome["pages_bucket"] = telemetry.bucket_count(len(pages))
+            det = sum(1 for p in pages if getattr(p, "provider_name", "") == "template")
+            outcome["deterministic_pages_bucket"] = telemetry.bucket_count(det)
+        else:
+            outcome["docs_mode"] = False
+
+        if embedder_name_resolved:
+            outcome["embedder"] = embedder_name_resolved
+
+        telemetry.add_command_outcome(**{k: v for k, v in outcome.items() if v is not None})
+    except Exception:
+        return
+
+
 def _run_generation_phase(
     *,
     repo_path: Path,
@@ -93,6 +144,7 @@ def _run_generation_phase(
     resolved_reasoning: str,
     onboarding: bool,
     tier1_top_n: int | None,
+    tier2_tail_enabled: bool,
     harvest_decisions: bool,
     wiki_style: str,
     coverage_pct: float | None,
@@ -126,6 +178,7 @@ def _run_generation_phase(
         reasoning=resolved_reasoning,
         enable_onboarding=onboarding,
         tier1_top_n=tier1_top_n,
+        tier2_tail_enabled=tier2_tail_enabled,
         harvest_decisions=harvest_decisions,
         wiki_style=wiki_style,
     )
@@ -187,6 +240,17 @@ def _run_generation_phase(
         )
         return False, True
 
+    # Persist the tiering knobs so `repowise update` regenerates with the same
+    # coverage settings (save_config later round-trips and preserves these).
+    # save_config_partial skips None, so a no-cap tier1 stays unwritten.
+    from repowise.cli.helpers import save_config_partial
+
+    save_config_partial(
+        repo_path,
+        tier1_top_n=tier1_top_n,
+        tier2_tail_enabled=tier2_tail_enabled,
+    )
+
     run_repo_generation(
         repo_path=repo_path,
         result=result,
@@ -213,7 +277,7 @@ def _run_generation_phase(
     default=None,
     help=(
         "LLM provider name (anthropic, openai, openrouter, gemini, "
-        "deepseek, ollama, litellm, codex_cli, opencode, mock)."
+        "deepseek, kimi, ollama, litellm, codex_cli, opencode, mock)."
     ),
 )
 @click.option("--model", default=None, help="Model identifier override.")
@@ -398,6 +462,52 @@ def _run_generation_phase(
         "an interactive full run you'll be prompted; otherwise comprehensive."
     ),
 )
+@click.option(
+    "--language",
+    "language_opt",
+    type=click.Choice(sorted(SUPPORTED_LANGUAGES)),
+    default=None,
+    metavar="CODE",
+    help=(
+        "Output language for generated wiki pages (e.g. en, zh, ru, hi). "
+        "Code, file paths, and symbol names stay untranslated. Saved to "
+        "config so `update` keeps the language. Default: en."
+    ),
+)
+@click.option(
+    "--seed-from",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=str),
+    help=(
+        "Seed the index from an existing base-branch checkout to skip indexing "
+        "unmodified files. Rarely needed: inside a linked git worktree the base "
+        "checkout is detected and seeded automatically."
+    ),
+)
+@click.option(
+    "--no-seed",
+    is_flag=True,
+    default=False,
+    help="Disable worktree auto-seeding and run a full init even inside a linked worktree.",
+)
+@click.option(
+    "--no-cost-tracking",
+    is_flag=True,
+    default=False,
+    help="Skip DB-backed LLM cost tracking for this run.",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Show the full changed-file list and per-phase internals.",
+)
+@click.option(
+    "--progress",
+    type=click.Choice(["rich", "json"]),
+    default="rich",
+    help="Progress output style.",
+)
 def init_command(
     path: str | None,
     provider_name: str | None,
@@ -418,6 +528,8 @@ def init_command(
     commit_limit: int | None,
     follow_renames: bool,
     no_claude_md: bool,
+    seed_from: str | None,
+    no_seed: bool,
     agents_md: bool | None,
     codex_setup: bool | None,
     distill_hook: bool | None,
@@ -429,6 +541,10 @@ def init_command(
     coverage_report: tuple[str, ...],
     harvest_decisions: bool,
     wiki_style: str | None,
+    language_opt: str | None,
+    no_cost_tracking: bool,
+    verbose: bool,
+    progress: str,
 ) -> None:
     """Generate wiki documentation for a codebase.
 
@@ -454,6 +570,70 @@ def init_command(
     from repowise.core.workspace import scan_for_repos
 
     scan = scan_for_repos(repo_path, include_submodules=include_submodules)
+
+    # ---- Worktree seeding ----
+    # Explicit --seed-from wins. Otherwise, an unindexed linked worktree
+    # auto-seeds from its base checkout (derived via --git-common-dir, no
+    # path needed) when that base holds a healthy index. --no-seed forces a
+    # cold init; any failed validation falls back to full init with a notice.
+    from repowise.cli.worktree import (
+        base_is_seedable,
+        detect_worktree_base,
+        seed_index_from_base,
+    )
+
+    seed_base: Path | None = None
+    if seed_from:
+        seed_base = Path(seed_from).resolve()
+        if seed_base == repo_path.resolve():
+            raise click.ClickException("--seed-from cannot be the same as the target directory.")
+    elif not no_seed and not (repo_path / ".repowise" / "state.json").exists():
+        detected = detect_worktree_base(repo_path)
+        if detected is not None and base_is_seedable(detected):
+            seed_base = detected
+            console.print(
+                f"[dim]\\[worktree][/dim] Linked worktree of {detected} detected; "
+                f"seeding its index."
+            )
+
+    if seed_base is not None:
+        seed_root = scan.root if getattr(scan, "root", None) else repo_path
+        seeded = seed_index_from_base(
+            root=seed_root,
+            repo_paths=[r.path for r in scan.repos],
+            seed_base=seed_base,
+            include_submodules=include_submodules,
+        )
+        if seeded:
+            console.print(
+                "[green]Worktree index seeded successfully. Delegating to update...[/green]"
+            )
+            from repowise.cli.commands.update_cmd.command import run_update
+
+            is_workspace = len(scan.repos) > 1 and not no_workspace
+
+            # Delegate to update
+            run_update(
+                path=str(repo_path),
+                provider_name=provider_name,
+                model=model,
+                since=None,
+                reasoning=reasoning,
+                cascade_budget=None,
+                dry_run=dry_run,
+                workspace=is_workspace,
+                no_workspace=no_workspace,
+                repo_alias=None,
+                index_only=index_only,
+                docs_flag=None,
+                full=force,
+                agents_md=agents_md,
+                concurrency=concurrency,
+                no_cost_tracking=no_cost_tracking,
+                verbose=verbose,
+                progress=progress,
+            )
+            return
     if len(scan.repos) > 1 and not no_workspace:
         _workspace_init(
             scan=scan,
@@ -485,6 +665,7 @@ def init_command(
             # Apply the chosen style uniformly across the workspace's repos
             # (no per-repo interactive prompt in the multi-repo flow).
             wiki_style=resolve_style(wiki_style).name,
+            language=language_opt,
             run_mode=run_mode,
         )
         return
@@ -510,13 +691,20 @@ def init_command(
     # ---- Interactive mode (TTY, no explicit flags) ----
     # --yes forces non-interactive even on a TTY (mirrors the workspace path),
     # so a scripted `init -y` never blocks on the mode-selection menu.
-    is_interactive = (
-        sys.stdin.isatty() and provider_name is None and not index_only and not yes
-    )
+    is_interactive = sys.stdin.isatty() and provider_name is None and not index_only and not yes
 
     # Tiered doc generation cap (set in advanced mode); None = every selected
     # file page is a full-LLM tier-1 page (unchanged behaviour).
     tier1_top_n: int | None = None
+
+    # Deterministic coverage tail (Phase G): document every remaining source
+    # file with a free, no-LLM page. On by default; only the advanced menu
+    # can turn it off.
+    tier2_tail_enabled: bool = True
+
+    # Output language picked in the advanced-mode generation section; None
+    # until chosen. Resolved below: flag > this > config.yaml > English.
+    language_choice: str | None = None
 
     # The two orthogonal axes the interactive menu resolves: whether docs are
     # generated and whether we entered the advanced-config prompts. Initialized
@@ -570,6 +758,7 @@ def init_command(
                 prompt_reasoning=False,
                 generate_docs=generate_docs,
                 wiki_style=wiki_style,
+                language=language_opt,
             )
             # Indexing knobs (always present).
             commit_limit = adv["commit_limit"]
@@ -586,10 +775,13 @@ def init_command(
                 embedder_name = adv.get("embedder") or embedder_name
                 test_run = adv["test_run"]
                 tier1_top_n = adv.get("tier1_top_n")
+                tier2_tail_enabled = adv.get("tier2_tail_enabled", True)
                 onboarding = adv.get("onboarding", onboarding)
                 harvest_decisions = adv.get("harvest_decisions", harvest_decisions)
                 if adv.get("wiki_style"):
                     wiki_style = adv["wiki_style"]
+                if adv.get("language"):
+                    language_choice = adv["language"]
             # Fast mode (picked in the indexing section) is a no-LLM index, so it
             # forces index-only even if the user had asked for docs.
             if run_mode == "fast":
@@ -602,9 +794,7 @@ def init_command(
             if (
                 run_mode != "fast"
                 and should_offer_fast_mode(scan_info)
-                and interactive_fast_mode_offer(
-                    console, scan_info, default_fast=not generate_docs
-                )
+                and interactive_fast_mode_offer(console, scan_info, default_fast=not generate_docs)
             ):
                 run_mode = "fast"
                 index_only = True
@@ -639,7 +829,8 @@ def init_command(
 
     # Merge exclude_patterns from config.yaml and --exclude/-x flags
     config = load_config(repo_path)
-    language = config.get("language", "en")
+    # Output language: CLI flag > advanced-mode choice > config.yaml > English.
+    language = language_opt or language_choice or config.get("language", "en")
     resolved_reasoning = resolve_reasoning(reasoning, config)
     exclude_patterns: list[str] = list(config.get("exclude_patterns") or []) + list(exclude)
 
@@ -841,6 +1032,7 @@ def init_command(
             resolved_reasoning=resolved_reasoning,
             onboarding=onboarding,
             tier1_top_n=tier1_top_n,
+            tier2_tail_enabled=tier2_tail_enabled,
             harvest_decisions=harvest_decisions,
             wiki_style=wiki_style,
             coverage_pct=coverage_pct,
@@ -881,6 +1073,12 @@ def init_command(
     # default is omitted to keep config files tidy — only an override is recorded.
     if wiki_style != DEFAULT_STYLE:
         save_config_partial(repo_path, wiki_style=wiki_style)
+
+    # Persist the output language so `repowise update` regenerates changed
+    # pages in the same language. Written only when the run's language differs
+    # from what config.yaml already holds; the default stays unrecorded.
+    if language != config.get("language", "en"):
+        save_config_partial(repo_path, language=language)
 
     # ---- Post-run: config, state, MCP, editor project files ----
     if commit_limit is not None:
@@ -959,6 +1157,14 @@ def init_command(
         effective_index_only=effective_index_only,
         run_mode=run_mode,
         provider=provider,
+    )
+
+    _record_init_outcome(
+        result=result,
+        effective_index_only=effective_index_only,
+        run_mode=run_mode,
+        provider=provider,
+        embedder_name_resolved=embedder_name_resolved,
     )
 
     # Offer to install post-commit hook (both index-only and full modes)

@@ -19,6 +19,7 @@ from repowise.server.mcp_server.tool_answer.config import (
     _BACKEND_PATH_PREFIXES,
     _BACKEND_QUESTION_TOKENS,
     _COVERAGE_FLOOR,
+    _DETERMINISTIC_DOWNWEIGHT,
     _DOMAIN_PENALTY,
     _GATED_EXCERPT_CHARS,
     _GATED_RETURN_HITS,
@@ -35,6 +36,7 @@ def serialize_hits(
     limit: int | None = None,
     summary_chars: int | None = None,
     symbols_for_expanded: bool = True,
+    lean_symbols: bool = False,
 ) -> list[dict]:
     """Agent-facing view of retrieval hits — content only, no plumbing.
 
@@ -47,7 +49,11 @@ def serialize_hits(
     ``summary_chars`` truncates summaries (medium-confidence diet);
     ``symbols_for_expanded=False`` drops symbol enrichment from hits that
     only entered via 1-hop graph expansion (they are routing material, not
-    answer material).
+    answer material). ``lean_symbols=True`` keeps each symbol pipeable
+    (name/kind/signature/lines) but drops docstrings and excerpts — for the
+    gated low-confidence path, where the hits are candidates to pick between,
+    not answer material, and ``best_guesses`` + ``code_rationale`` already
+    carry the choosing signal.
     """
     out: list[dict] = []
     for h in hits[: limit if limit is not None else len(hits)]:
@@ -66,9 +72,15 @@ def serialize_hits(
             entry["score"] = round(h["score"], 3)
         expanded = "graph_expand" in (h.get("_sources") or ())
         if h.get("symbols") and (symbols_for_expanded or not expanded):
-            entry["key_symbols"] = [
-                {k: v for k, v in s.items() if not k.startswith("_")} for s in h["symbols"]
-            ]
+            if lean_symbols:
+                keep = ("name", "kind", "signature", "start_line", "end_line")
+                entry["key_symbols"] = [
+                    {k: s[k] for k in keep if s.get(k) is not None} for s in h["symbols"]
+                ]
+            else:
+                entry["key_symbols"] = [
+                    {k: v for k, v in s.items() if not k.startswith("_")} for s in h["symbols"]
+                ]
         out.append(entry)
     return out
 
@@ -205,6 +217,24 @@ def _apply_domain_penalty(hits: list[dict], question: str) -> None:
         if tp and any(tp.startswith(p) for p in bad_prefixes):
             h["score"] = h.get("score", 0.0) * _DOMAIN_PENALTY
             h["_domain_penalty"] = f"{domain} question; cross-domain path"
+            touched = True
+    if touched:
+        hits.sort(key=lambda h: h["score"], reverse=True)
+
+
+def _downweight_deterministic(hits: list[dict]) -> None:
+    """Down-weight deterministic-template hits in place, then re-sort by score.
+
+    The ``_deterministic`` marker is attached during hydration
+    (``provider_name == "template"``). A thin coverage-tail page should not
+    displace a rich LLM page when both match a conceptual question; the
+    multiplicative factor only breaks ties, so a deterministic page that is
+    clearly the best hit (its file has no LLM page) still ranks first.
+    """
+    touched = False
+    for h in hits:
+        if h.get("_deterministic") and h.get("score"):
+            h["score"] = h["score"] * _DETERMINISTIC_DOWNWEIGHT
             touched = True
     if touched:
         hits.sort(key=lambda h: h["score"], reverse=True)

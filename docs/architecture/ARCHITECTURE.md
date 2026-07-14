@@ -14,10 +14,10 @@ For per-package detail (installation, full API reference, all CLI flags, file ma
 
 | Package | README | What it covers |
 |---------|--------|----------------|
-| `packages/core` | [`packages/core/README.md`](../packages/core/README.md) | Ingestion, generation, persistence, providers — all key classes with code examples |
-| `packages/cli` | [`packages/cli/README.md`](../packages/cli/README.md) | All 10 CLI commands with every flag documented |
-| `packages/server` | [`packages/server/README.md`](../packages/server/README.md) | All REST API endpoints, 11 MCP tools, webhook setup, scheduler jobs |
-| `packages/web` | [`packages/web/README.md`](../packages/web/README.md) | Every frontend file with purpose — API client, hooks, components, pages |
+| `packages/core` | [`packages/core/README.md`](../../packages/core/README.md) | Ingestion, generation, persistence, providers — all key classes with code examples |
+| `packages/cli` | [`packages/cli/README.md`](../../packages/cli/README.md) | All 10 CLI commands with every flag documented |
+| `packages/server` | [`packages/server/README.md`](../../packages/server/README.md) | All REST API endpoints, 11 MCP tools, webhook setup, scheduler jobs |
+| `packages/web` | [`packages/web/README.md`](../../packages/web/README.md) | Every frontend file with purpose — API client, hooks, components, pages |
 
 ---
 
@@ -1015,7 +1015,7 @@ repowise decision add        # interactive capture
 repowise decision list       # tabular list with filters
 repowise decision show <id>  # full detail
 repowise decision confirm    # proposed → active
-repowise decision dismiss    # delete proposed
+repowise decision dismiss    # dismiss proposed (sticky tombstone)
 repowise decision deprecate  # active → deprecated
 repowise decision health     # health summary
 ```
@@ -1485,7 +1485,7 @@ and the vector store embed (LanceDB or pgvector) can overlap with the next file'
 
 ## 15. Editor File Generation
 
-See [`docs/EDITOR_FILES.md`](EDITOR_FILES.md) for the complete reference covering
+See [`architecture/editor-files.md`](editor-files.md) for the complete reference covering
 architecture, all data sources, how the marker-merge system works, and how to add
 support for a new editor file (cursor.md, copilot-instructions.md, etc.).
 
@@ -1615,7 +1615,7 @@ Key files:
 Full configuration with defaults (`.repowise/config.yaml`):
 
 ```yaml
-provider: anthropic          # anthropic | openai | openrouter | gemini | deepseek | ollama | litellm | codex_cli | opencode | mock
+provider: anthropic          # anthropic | openai | openrouter | gemini | deepseek | kimi | ollama | litellm | codex_cli | opencode | mock
 model: claude-sonnet-4-5    # passed through to the provider
 embedding_provider: anthropic
 embedding_model: voyage-3

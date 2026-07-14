@@ -18,7 +18,10 @@ export interface ScoreBreakdownCategoryFinding {
 
 export interface ScoreBreakdownCategory {
   category: BiomarkerCategory | string;
-  cap: number;
+  /** Cap the scorer actually enforced. Optional only because payloads from
+   *  older servers predate the field; when present it always wins over the
+   *  glossary's `CATEGORY_CAP` fallback. */
+  cap?: number | null;
   raw_deduction: number;
   applied_deduction: number;
   capped: boolean;
@@ -58,16 +61,25 @@ export function ScoreBreakdown({
               return b.applied_deduction - a.applied_deduction;
             }
             const capA =
-              CATEGORY_CAP[a.category as BiomarkerCategory] ?? a.cap;
+              a.cap ?? CATEGORY_CAP[a.category as BiomarkerCategory] ?? 0;
             const capB =
-              CATEGORY_CAP[b.category as BiomarkerCategory] ?? b.cap;
+              b.cap ?? CATEGORY_CAP[b.category as BiomarkerCategory] ?? 0;
             return capB - capA;
           })
           .map((c) => {
           const label =
             CATEGORY_LABEL[c.category as BiomarkerCategory] ?? c.category;
-          const cap = CATEGORY_CAP[c.category as BiomarkerCategory] ?? c.cap;
-          const pct = Math.min(100, (c.applied_deduction / Math.max(cap, 0.01)) * 100);
+          // Prefer the server-supplied cap: it is the value the scorer
+          // actually enforced, so a cap retune in scoring.py renders
+          // correctly without a UI release. The glossary constant is only a
+          // fallback for older-server payloads that predate the `cap` field.
+          const cap = c.cap ?? CATEGORY_CAP[c.category as BiomarkerCategory];
+          const pct = Math.min(
+            100,
+            (Math.abs(c.applied_deduction) /
+              Math.max(Math.abs(cap ?? c.applied_deduction), 0.01)) *
+              100,
+          );
           return (
             <div
               key={c.category}
@@ -77,14 +89,27 @@ export function ScoreBreakdown({
                 <span className="font-medium text-[var(--color-text-primary)]">
                   {label}
                 </span>
-                <span className="tabular-nums text-[var(--color-text-tertiary)]">
-                  −{c.applied_deduction.toFixed(2)} / cap −{cap.toFixed(1)}
-                  {c.capped ? <span className="ml-1 text-[var(--color-warning)]" title="Capped">(capped)</span> : null}
+                <span
+                  className="cursor-help tabular-nums text-[var(--color-text-tertiary)]"
+                  title="The cap is the most this category is allowed to subtract from the 10-point score, no matter how many findings it has."
+                >
+                  −{c.applied_deduction.toFixed(2)}
+                  {cap != null ? <> / cap −{cap.toFixed(1)}</> : null}
+                  {c.capped ? <span className="ml-1 text-[var(--color-warning)]" title="Raw deductions exceeded the cap; only the cap was subtracted.">(capped)</span> : null}
                 </span>
               </div>
               <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-bg-muted)]">
                 <div
-                  className="h-full bg-[var(--color-error)]/70"
+                  className={
+                    cap != null
+                      ? "h-full bg-[var(--color-error)]/70"
+                      : "h-full bg-[var(--color-text-tertiary)]/40"
+                  }
+                  title={
+                    cap == null
+                      ? "No defined cap for this category — bar scale is approximate."
+                      : undefined
+                  }
                   style={{ width: `${pct}%` }}
                 />
               </div>

@@ -64,6 +64,15 @@ _DB_NAMES: frozenset[str] = frozenset({
     # is already listed under the Go section above.
     "diesel", "sea-orm", "sea_orm", "tokio-postgres", "tokio_postgres",
     "rusqlite", "deadpool-postgres", "deadpool_postgres", "scylla", "bb8",
+    # Dart / Flutter (pub package names; ``package:sqflite/...`` resolves via
+    # the interior segment).
+    "sqflite", "postgres", "mysql1", "mongo_dart", "drift",
+    # Scala (root package as imported: ``import slick.jdbc...`` -> ``slick``,
+    # ``import doobie._`` -> ``doobie``; Quill imports as ``io.getquill``).
+    "slick", "doobie", "scalikejdbc", "anorm", "io.getquill",
+    # Ruby (require-feature names; ``pg`` / ``mysql2`` / ``redis`` above are
+    # shared with the Node ecosystem).
+    "activerecord", "active_record", "sequel", "mongoid", "sqlite3", "mongo",
 })
 
 _NETWORK_NAMES: frozenset[str] = frozenset({
@@ -82,6 +91,16 @@ _NETWORK_NAMES: frozenset[str] = frozenset({
     "system.net.http", "grpc.net.client", "restsharp", "flurl",
     # Rust (HTTP / gRPC client crates as imported).
     "reqwest", "hyper", "isahc", "surf", "ureq", "awc", "tonic",
+    # Dart / Flutter (``package:http`` doubles as Node's stdlib ``http`` —
+    # both are network boundaries).
+    "http", "dio", "chopper",
+    # Scala (root packages / progressive dotted prefixes: ``import
+    # sttp.client3._`` -> ``sttp``; ``import org.http4s...`` -> ``org.http4s``;
+    # ``import akka.http.scaladsl...`` -> ``akka.http``).
+    "sttp", "org.http4s", "akka.http", "play.api.libs.ws",
+    # Ruby (require-feature names; ``require "net/http"`` resolves via its
+    # ``http`` segment above).
+    "httparty", "faraday", "rest-client", "rest_client", "typhoeus", "excon",
 })
 
 _FILESYSTEM_NAMES: frozenset[str] = frozenset({
@@ -95,6 +114,16 @@ _FILESYSTEM_NAMES: frozenset[str] = frozenset({
     "io/ioutil",
     # .NET
     "system.io",
+    # Dart (``dart:io`` hosts File/Directory; Process is method-gated in the
+    # perf dialect rather than classified wholesale as subprocess).
+    "dart:io",
+    # Scala (``import scala.io.Source`` -> the ``scala.io`` dotted prefix;
+    # lihaoyi's os-lib root package ``os`` is deliberately NOT seeded; the
+    # bare name would collide with Python's stdlib ``os`` cross-ecosystem, so
+    # the Scala perf dialect method-gates it instead).
+    "scala.io",
+    # Ruby (require-feature names)
+    "fileutils", "tempfile",
 })
 
 _SUBPROCESS_NAMES: frozenset[str] = frozenset({
@@ -104,6 +133,8 @@ _SUBPROCESS_NAMES: frozenset[str] = frozenset({
     "child_process", "node:child_process", "execa", "cross-spawn", "shelljs",
     # Go (os/exec resolves via the interior segment ``exec``)
     "os/exec",
+    # Ruby (require-feature names)
+    "open3", "pty",
 })
 
 _LOCK_NAMES: frozenset[str] = frozenset({

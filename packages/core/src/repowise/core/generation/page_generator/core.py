@@ -42,7 +42,7 @@ from .decision_harvest import (
 )
 from .helpers import _extract_summary, _now_iso
 from .pertype import PerTypeGenerationMixin
-from .prompts import _LANGUAGE_NAMES, SYSTEM_PROMPTS
+from .prompts import SUPPORTED_LANGUAGES, SYSTEM_PROMPTS
 from .validation import _validate_symbol_references
 
 if TYPE_CHECKING:
@@ -103,6 +103,12 @@ class PriorPage:
     Lives in :class:`PageGenerator` keyed by ``page_id``. When the freshly
     rendered prompt produces a matching ``source_hash`` under the same
     ``model_name``, the LLM call is skipped and ``content`` is reused.
+
+    ``content_hash`` (see :meth:`PageGenerator._reuse_content_hash`) is the
+    preferred reuse key when both sides have one: it stays stable across
+    runs even when the rendered prompt drifts (RAG context is rebuilt and
+    populated concurrently each run, so ``source_hash`` alone almost never
+    matches on a reindex).
     """
 
     source_hash: str
@@ -111,6 +117,7 @@ class PriorPage:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
+    content_hash: str = ""
 
 
 class PageGenerator(PerTypeGenerationMixin):
@@ -131,7 +138,7 @@ class PageGenerator(PerTypeGenerationMixin):
         config: GenerationConfig,
         jinja_env: jinja2.Environment | None = None,
         vector_store: Any | None = None,
-        language: str = "en",
+        language: str | None = None,
         prior_pages: dict[str, PriorPage] | None = None,
         repo_path: Path | str | None = None,
     ) -> None:
@@ -139,7 +146,8 @@ class PageGenerator(PerTypeGenerationMixin):
         self._assembler = assembler
         self._config = config
         self._vector_store = vector_store
-        self._language = language
+        # Output language: explicit arg wins, else the config's, else English.
+        self._language = language if language is not None else getattr(config, "language", "en")
         # Resolve the wiki style once. "comprehensive" (default) is inert, so this
         # is a no-op for repos that never opt in. ``repo_path`` lets a user-defined
         # ``.repowise/styles/<name>`` style resolve (Phase 5).
@@ -152,6 +160,13 @@ class PageGenerator(PerTypeGenerationMixin):
         # table.
         self._prior_pages: dict[str, PriorPage] = prior_pages or {}
         self._reuse_count: int = 0
+        # One-line summary of the FAQ-weighted budget tilt for this run, set by
+        # the orchestrator when session demand was found (else None). The CLI
+        # surfaces it after generation so the usage-weighting is visible.
+        self.faq_demand_summary: str | None = None
+        # Lazily computed by _generation_fingerprint(); every input it folds
+        # is fixed for the generator's lifetime.
+        self._gen_fingerprint: str | None = None
 
         if jinja_env is None:
             templates_dir = Path(__file__).parent.parent / "templates"
@@ -284,8 +299,13 @@ class PageGenerator(PerTypeGenerationMixin):
                     except Exception as e:
                         log.debug("rag.search_failed", path=parsed.file_info.path, error=str(e))
         user_prompt = self._render("file_page.j2", ctx=ctx)
+        content_hash = self._reuse_content_hash(parsed)
         response = await self._call_provider(
-            "file_page", user_prompt, str(uuid.uuid4()), target_path=parsed.file_info.path
+            "file_page",
+            user_prompt,
+            str(uuid.uuid4()),
+            target_path=parsed.file_info.path,
+            content_hash=content_hash,
         )
         # Phase-2 harvest: pull any trailing decision block out of the page
         # before it is wrapped + stored. The gate verifies each quote against
@@ -307,6 +327,7 @@ class PageGenerator(PerTypeGenerationMixin):
             response,
             compute_source_hash(user_prompt),
             GENERATION_LEVELS["file_page"],
+            content_hash=content_hash,
         )
         if harvested:
             page.metadata["harvested_decisions"] = harvested
@@ -327,17 +348,30 @@ class PageGenerator(PerTypeGenerationMixin):
         self,
         parsed: ParsedFile,
         ctx: FilePageContext,
+        *,
+        tail: bool = False,
     ) -> GeneratedPage:
         """Render a deterministic (no-LLM) tier-2 file page.
 
-        Used for the long tail of selected files on large repos. The page is
-        built straight from the assembled context via a Jinja template, marked
-        as template-generated, and carries zero token cost. It is embedded for
-        search by the level runner like any other page. No provider call and
-        no hallucination check (the content is factual by construction).
+        Used for the long tail of selected files on large repos, and (with
+        ``tail=True``) for the Phase G coverage tail: code files the budget
+        dropped entirely, so the whole codebase is retrievable by concept
+        search. The page is built straight from the assembled context via a
+        Jinja template, marked as template-generated, and carries zero token
+        cost. It is embedded for search by the level runner like any other
+        page. No provider call and no hallucination check (the content is
+        factual by construction).
+
+        ``tail=True`` stamps ``doc_tier=3`` (vs 2 for the in-budget tail) so
+        serving/ranking and the UI can tell budget-tail coverage pages apart
+        and rank them below LLM pages; ``metadata["deterministic"]`` marks both.
         """
         content = self._render("file_page_tier2.j2", style_prefix=False, ctx=ctx)
         now = _now_iso()
+        # content_hash deliberately stays empty: the cross-run reuse gate keys
+        # on model_name (not provider_name), so stamping it here would let a
+        # later tier-1 (LLM) run reuse this deterministic template content as
+        # if the LLM had written it. Tier-2 pages are free to rebuild anyway.
         page = GeneratedPage(
             page_id=compute_page_id("file_page", parsed.file_info.path),
             page_type="file_page",
@@ -355,7 +389,8 @@ class PageGenerator(PerTypeGenerationMixin):
             created_at=now,
             updated_at=now,
         )
-        page.metadata["doc_tier"] = 2
+        page.metadata["doc_tier"] = 3 if tail else 2
+        page.metadata["deterministic"] = True
         _attach_file_provenance(page, ctx)
         return page
 
@@ -369,17 +404,31 @@ class PageGenerator(PerTypeGenerationMixin):
         user_prompt: str,
         request_id: str,
         target_path: str | None = None,
+        content_hash: str = "",
+        source_salt: str = "",
     ) -> GeneratedResponse:
-        """Call the provider with caching, optionally prefixing a language instruction."""
+        """Call the provider with caching, optionally prefixing a language instruction.
+
+        *source_salt* is folded into the source_hash used for cross-run reuse
+        without changing the prompt sent to the model. Onboarding pages pass a
+        generation-version salt so a builder/template upgrade forces a one-time
+        regen even when the rendered prompt is byte-identical. Empty for every
+        other page type, so their reuse hashes are unchanged.
+        """
         # Persistent cross-run cache: if the page exists from a prior run, was
-        # produced by the same model, and the prompt's source_hash matches,
-        # reuse the stored content without an LLM call.
+        # produced by the same model, and either the documented file's bytes
+        # (content_hash) or the prompt's source_hash matches, reuse the stored
+        # content without an LLM call. content_hash is checked first: the
+        # rendered prompt embeds RAG context rebuilt fresh each run, so the
+        # prompt hash alone misses on unchanged files.
         if self._config.cache_enabled and target_path is not None:
             page_id = compute_page_id(page_type, target_path)
             prior = self._prior_pages.get(page_id)
             if prior is not None and prior.model_name == self._provider.model_name:
-                current_hash = compute_source_hash(user_prompt)
-                if prior.source_hash == current_hash:
+                reuse = bool(content_hash) and prior.content_hash == content_hash
+                if not reuse:
+                    reuse = prior.source_hash == compute_source_hash(user_prompt + source_salt)
+                if reuse:
                     self._reuse_count += 1
                     log.debug(
                         "page_cache.persistent_hit",
@@ -440,13 +489,13 @@ class PageGenerator(PerTypeGenerationMixin):
         # newlines or extra instructions into the system prompt.
         raw = (self._language or "en").lower().strip()
         lang_code = "".join(ch for ch in raw if ch.isalnum() or ch == "_")
-        if lang_code not in _LANGUAGE_NAMES:
+        if lang_code not in SUPPORTED_LANGUAGES:
             if lang_code != "en":
                 log.warning("unknown_language_code", code=lang_code, fallback="en")
             lang_code = "en"
         if lang_code == "en":
             return base_system
-        lang_name = _LANGUAGE_NAMES[lang_code]
+        lang_name = SUPPORTED_LANGUAGES[lang_code]
         instruction = (
             f"Generate all documentation content in {lang_name}. "
             "Keep all code, file paths, and symbol names in their original form. "
@@ -468,6 +517,58 @@ class PageGenerator(PerTypeGenerationMixin):
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 
+    def _generation_fingerprint(self) -> str:
+        """Hash of every fixed input (besides the file itself) that shapes a
+        file page's content.
+
+        The prompt-hash reuse path caught changes to any of these for free —
+        they all end up in the rendered prompt or system prompt. The
+        content-hash path deliberately ignores the prompt, so it must fold
+        them explicitly or a template upgrade / language switch / style
+        switch / harvest toggle would silently keep serving old pages for
+        unchanged files:
+
+        * the file_page prompt template source (a repowise upgrade that
+          improves the template must regenerate),
+        * the file_page system prompt constant (same reason),
+        * the output language,
+        * the wiki-style fingerprint (empty for the default style),
+        * the decision-harvest flag (its directive changes what pages carry).
+
+        Graph/RAG/neighbor context is deliberately NOT folded — drifting on
+        every run is exactly what made prompt-hash reuse never fire.
+        """
+        if self._gen_fingerprint is None:
+            try:
+                template_src = self._jinja_env.loader.get_source(  # type: ignore[union-attr]
+                    self._jinja_env, "file_page.j2"
+                )[0]
+            except Exception:
+                template_src = ""
+            raw = "\x00".join(
+                [
+                    template_src,
+                    SYSTEM_PROMPTS.get("file_page", ""),
+                    self._language or "en",
+                    self._style.fingerprint,
+                    "harvest" if self._config.harvest_decisions else "",
+                ]
+            )
+            self._gen_fingerprint = hashlib.sha256(raw.encode()).hexdigest()
+        return self._gen_fingerprint
+
+    def _reuse_content_hash(self, parsed: ParsedFile) -> str:
+        """Return the cross-run reuse key for a page built from *parsed*:
+        SHA256 of the file's raw-bytes hash folded with the generation
+        fingerprint. Stable across runs while the file and the generation
+        settings are unchanged; changes when either does. Empty when the
+        parse didn't produce a content hash (never matches — always
+        regenerates)."""
+        if not parsed.content_hash:
+            return ""
+        raw = f"{parsed.content_hash}:{self._generation_fingerprint()}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
     def _build_generated_page(
         self,
         page_type: str,
@@ -476,6 +577,7 @@ class PageGenerator(PerTypeGenerationMixin):
         response: GeneratedResponse,
         source_hash: str,
         level: int,
+        content_hash: str = "",
     ) -> GeneratedPage:
         """Wrap a GeneratedResponse in a GeneratedPage."""
         now = _now_iso()
@@ -495,6 +597,7 @@ class PageGenerator(PerTypeGenerationMixin):
             target_path=target_path,
             created_at=now,
             updated_at=now,
+            content_hash=content_hash,
         )
         # Record the effective style as page provenance (D10). Only for active
         # styles, so default ("comprehensive") pages keep byte-identical metadata.

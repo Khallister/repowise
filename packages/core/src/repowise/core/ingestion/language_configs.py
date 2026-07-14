@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from .extractors.visibility import (
     csharp_visibility,
+    dart_visibility,
     go_visibility,
     java_visibility,
     kotlin_visibility,
@@ -277,6 +278,35 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         parent_extraction="nesting",
         parent_class_types=frozenset({"class_declaration", "protocol_declaration"}),
     ),
+    "dart": LanguageConfig(
+        symbol_node_types={
+            "class_definition": "class",
+            "mixin_declaration": "class",
+            "enum_declaration": "enum",
+            "extension_declaration": "class",
+            "function_signature": "function",
+            "getter_signature": "function",
+            "setter_signature": "function",
+            "type_alias": "type_alias",
+        },
+        import_node_types=[
+            "import_specification",
+            "library_export",
+            "part_directive",
+            "part_of_directive",
+        ],
+        export_node_types=[],
+        visibility_fn=dart_visibility,
+        parent_extraction="nesting",
+        parent_class_types=frozenset(
+            {
+                "class_definition",
+                "mixin_declaration",
+                "extension_declaration",
+                "enum_declaration",
+            }
+        ),
+    ),
     "scala": LanguageConfig(
         symbol_node_types={
             "class_definition": "class",
@@ -320,6 +350,18 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "type_definition": "type_alias",
         },
         import_node_types=["function_call"],
+        export_node_types=[],
+        visibility_fn=public_by_default,
+        parent_extraction="none",
+        parent_class_types=frozenset(),
+    ),
+    "shell": LanguageConfig(
+        # Both `foo() {}` and `function foo {}` parse as function_definition.
+        # Shell has no classes, so no parent tracking.
+        symbol_node_types={
+            "function_definition": "function",
+        },
+        import_node_types=["command"],  # `source` / `.` — see queries/shell.scm
         export_node_types=[],
         visibility_fn=public_by_default,
         parent_extraction="none",

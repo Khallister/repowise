@@ -97,9 +97,7 @@ def _build_pipeline_coverage(
         elif cfg.paths:
             report_paths = [repo_path / p for p in cfg.paths if (repo_path / p).is_file()]
         elif cfg.auto_discover:
-            report_paths = discover_artifacts(
-                repo_path, globs=cfg.artifacts or None
-            )
+            report_paths = discover_artifacts(repo_path, globs=cfg.artifacts or None)
         else:
             return {}, [], None
 
@@ -204,7 +202,7 @@ async def _run_health_analysis(
         analyzer_config: dict[str, object] | None = None
         if repo_path is not None:
             cfg = HealthConfig.load(repo_path)
-            if cfg.disabled_biomarkers or cfg.rules:
+            if cfg.has_overrides():
                 file_paths = [pf.file_info.path for pf in parsed_files]
                 analyzer_config = cfg.to_analyzer_config(file_paths)
 
@@ -256,13 +254,19 @@ async def _run_decision_extraction(
 ) -> Any | None:
     """Extract architectural decisions from source and git history."""
     try:
-        from repowise.core.analysis.decision_extractor import DecisionExtractor
+        from repowise.core.analysis.decision_extractor import (
+            DecisionExtractor,
+            enabled_source_names,
+        )
+        from repowise.core.repo_config import load_repo_config
 
-        # Eight sources run concurrently inside extract_all(); drive a
-        # determinate bar so users see live progress.
-        decision_steps = 8
+        # Sources run concurrently inside extract_all(); drive a determinate
+        # bar so users see live progress. ``decisions.sources`` in the repo
+        # config can disable individual sources (#751).
+        repo_cfg = load_repo_config(repo_path)
+        enabled = enabled_source_names(repo_cfg)
         if progress:
-            progress.on_phase_start("decisions", decision_steps)
+            progress.on_phase_start("decisions", len(enabled))
 
         extractor = DecisionExtractor(
             repo_path=repo_path,
@@ -277,9 +281,34 @@ async def _run_decision_extraction(
                 progress.on_item_done("decisions")
 
         report = await asyncio.wait_for(
-            extractor.extract_all(on_step=_decision_step),
+            extractor.extract_all(on_step=_decision_step, enabled_sources=enabled),
             timeout=DECISION_EXTRACTION_TIMEOUT_SECS,
         )
+
+        # Session-sourced decisions: a repo indexed for the first time on a
+        # machine with existing agent-session history gets them at init, not
+        # only from the first update. Appended after extract_all's substring
+        # gate on purpose: the miner enforces its own grounding contract, and
+        # re-gating without a source_text would wipe its verification. A
+        # server-side index has no transcript directory and no-ops here.
+        try:
+            from repowise.core.sessions.miners.decisions import (
+                mine_session_decisions,
+                session_mining_enabled,
+            )
+
+            if llm_client is not None and session_mining_enabled(repo_cfg):
+                session_decisions = await asyncio.wait_for(
+                    mine_session_decisions(repo_path, provider=llm_client),
+                    timeout=DECISION_EXTRACTION_TIMEOUT_SECS,
+                )
+                if session_decisions:
+                    report.decisions.extend(session_decisions)
+                    report.by_source["session"] = len(session_decisions)
+                    report.total_found = len(report.decisions)
+        except Exception as exc:
+            if progress:
+                progress.on_message("warning", f"Session decision mining skipped: {exc}")
 
         if progress:
             bs = report.by_source
@@ -293,8 +322,8 @@ async def _run_decision_extraction(
                 f"{bs.get('pr', 0)} PR · "
                 f"{bs.get('git_archaeology', 0)} git · "
                 f"{bs.get('comment', 0)} comments · "
-                f"{bs.get('code_comment', 0)} code-comments · "
-                f"{bs.get('readme_mining', 0)} docs",
+                f"{bs.get('readme_mining', 0)} docs · "
+                f"{bs.get('session', 0)} session",
             )
 
         _phase_done(progress, "decisions")

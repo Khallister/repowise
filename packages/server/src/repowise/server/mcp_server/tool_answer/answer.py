@@ -15,7 +15,18 @@ search → context → read loop with one tool call that returns:
                                    follow-up); present only when the answer
                                    names a function/method/class that was
                                    hydrated
+      "more_definitions":  list    only on an answer-by-union (homonym) reply
+                                   whose bodies overflowed the char budget:
+                                   {file, name, line, symbol_id, hint} entries
+                                   the agent fetches with get_symbol, not Read
     }
+
+Answer-by-union: when the question names a symbol with N>=2 definitions no
+qualifier disambiguates (``_severity_for`` x 4), the tool returns the UNION of
+their bodies in ``symbol_bodies`` (grounding="exact_symbol", confidence="high")
+rather than a best_guesses pointer list (the pointer list is what triggers the
+agent's get_symbol/get_context drill). A qualified miss (``Parent.leaf`` matching
+no def) returns not-found instead of guessing a same-named symbol elsewhere.
 
 When no LLM provider is configured, the tool degrades to retrieval-only
 mode (returns ranked hits + snippets, confidence="low") so C1 / index-only
@@ -62,6 +73,7 @@ from repowise.server.mcp_server._answer_pipeline import (
 )
 from repowise.server.mcp_server._answer_pipeline import hydrate_hits as _hydrate_hits
 from repowise.server.mcp_server._code_rationale import mine_rationale as _mine_rationale
+from repowise.server.mcp_server._flow_path import expand_via_flow_path as _expand_via_flow_path
 from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
     _get_repo,
@@ -90,10 +102,14 @@ from repowise.server.mcp_server.tool_answer.config import (
     _SYSTEM_PROMPT,
     _USER_TEMPLATE,
 )
+from repowise.server.mcp_server.tool_answer.data_shape import (
+    _is_data_shape_question,
+    mine_data_shape,
+)
 from repowise.server.mcp_server.tool_answer.retrieval import (
     _apply_domain_penalty,
     _candidate_justification,
-    _enrich_gated_excerpts,
+    _downweight_deterministic,
     _intersection_boost,
     _rerank_by_coverage,
 )
@@ -107,6 +123,8 @@ from repowise.server.mcp_server.tool_answer.symbols import (
     _extract_value_answer,
     _hydrate_symbols_for_hits,
     _read_symbol_source,
+    build_homonym_union_bodies,
+    union_defers_to_synthesis,
 )
 from repowise.server.mcp_server.tool_answer.synthesis import (
     _hash_question,
@@ -138,6 +156,25 @@ def _cache_entry_expired(created_at) -> bool:
 
     ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=UTC)
     return (datetime.now(UTC) - ts) > timedelta(days=_ANSWER_CACHE_TTL_DAYS)
+
+
+def _is_readable_path(target: str) -> bool:
+    """Whether a fallback_target is a file the agent can actually Read.
+
+    Non-file graph nodes (community/SCC nodes, architectural layers) can ride in
+    on retrieval hits with a ``target_path`` like ``"scc-607"`` or
+    ``"layer:application"``: internal ids with no path separator and no file
+    extension. An agent handed one in ``fallback_targets`` will try to Read it and
+    dead-end, so keep only path-shaped entries (2026-07-10 dogfood finding).
+    """
+    t = (target or "").strip()
+    if not t:
+        return False
+    if "/" in t or "\\" in t:
+        return True
+    dot = t.rfind(".")
+    ext = t[dot + 1 :] if dot != -1 else ""
+    return bool(ext) and ext.isalnum() and len(ext) <= 6
 
 
 def _gather_code_rationale(ctx, hits: list[dict], fallback_targets: list[str], question: str):
@@ -184,11 +221,10 @@ def _gather_code_rationale(ctx, hits: list[dict], fallback_targets: list[str], q
 def _drop_already_surfaced(rationale: list[dict], *surfaced: list[dict]) -> list[dict]:
     """Drop mined rationale comments already shown elsewhere in the response.
 
-    Track B harvests rationale comments into ``code_comment`` decision records at
-    index time; Track A mines them live here. Once both ship, the same comment
-    can appear twice — once as material already in the payload (a ``symbol_bodies``
-    block whose body contains the comment, a quote, or a line-ranged citation /
-    decision) and once as a ``code_rationale`` entry. Suppress the duplicate:
+    The same comment can reach the payload twice — once as material already in
+    the response (a ``symbol_bodies`` block whose body contains the comment, a
+    quote, a line-ranged citation, or a legacy ``code_comment`` decision) and
+    once as a live-mined ``code_rationale`` entry. Suppress the duplicate:
     drop any mined comment whose ``(path, line-range)`` overlaps an entry already
     surfaced. Entries without a ``(path, lines)`` pair are ignored.
     """
@@ -209,14 +245,139 @@ def _drop_already_surfaced(rationale: list[dict], *surfaced: list[dict]) -> list
             path
             and isinstance(lines, (list, tuple))
             and len(lines) == 2
-            and any(
-                p == path and not (lines[1] < s or lines[0] > e)
-                for p, s, e in occupied
-            )
+            and any(p == path and not (lines[1] < s or lines[0] > e) for p, s, e in occupied)
         ):
             continue
         kept.append(r)
     return kept
+
+
+def _gather_body_candidates(
+    hits: list[dict], answer_text: str
+) -> list[tuple[int, int, int, str, dict]]:
+    """Rank the definitions to inline in ``symbol_bodies``, most-relevant first.
+
+    Returns ``(tier, kind_rank, start_line, path, symbol)`` tuples, pre-sorted so
+    the leading entries are the bodies the agent is most likely to want:
+
+      * Tier 0 — the exact symbol the question named, resolved by symbol
+        anchoring (survives the fuzzy hydration cap a parent class name floods).
+      * Tier 1 — a question-matched hydrated symbol the answer names.
+
+    Within a tier a function/method outranks a class container (so "explain the
+    extract_all method of DecisionExtractor" serves extract_all, not the
+    1,300-line class head), then document order. Only definitions the answer
+    text actually names qualify; constants stay in ``quotes``.
+    """
+    candidates: list[tuple[int, int, int, str, dict]] = []
+    for h in hits[:_ENRICH_TOP_N_HITS]:
+        path = h.get("target_path")
+        if not path:
+            continue
+        for s in h.get("_anchor_symbols") or []:
+            name = s.get("name")
+            if not name or name not in answer_text:
+                continue
+            kind = s.get("kind")
+            kind_rank = 0 if kind in ("function", "method") else 1
+            candidates.append((0, kind_rank, s.get("start_line") or 0, path, s))
+        for s in h.get("symbols") or []:
+            name = s.get("name")
+            if not name or len(name) < 3 or not s.get("_matched"):
+                continue
+            if name not in answer_text:
+                continue
+            kind = s.get("kind")
+            if kind not in ("function", "method", "class", "interface"):
+                continue
+            kind_rank = 0 if kind in ("function", "method") else 1
+            candidates.append((1, kind_rank, s.get("start_line") or 0, path, s))
+    candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+    return candidates
+
+
+def _build_data_shape_payload(grounded: dict, t0: float, repository) -> dict:
+    """Shape a grounded data-shape result into a get_answer response.
+
+    ``grounded`` is :func:`mine_data_shape`'s return. Cite the exact source
+    lines the fields were lifted from; a docstring shape is authoritative
+    (confidence high, no verification Read), a usage-mined shape is medium.
+    """
+    ident = grounded["identifier"]
+    fields = grounded["fields"]
+    sources = grounded["sources"]
+    also_accessed = grounded.get("also_accessed") or []
+    citations = sorted({s["file"] for s in sources})
+    field_list = ", ".join(f"`{f}`" for f in fields)
+    doc_src = next((s for s in sources if s["kind"] == "docstring"), None)
+    if grounded["grounding"] == "docstring":
+        where = f"{doc_src['file']}:{doc_src['line']}" if doc_src else citations[0]
+        if also_accessed:
+            # The doc lists the declared shape, but consumers read alias key(s)
+            # it omits (a legacy fallback). Surface them: telling the agent "no
+            # Read needed" while hiding a key it must handle would be a
+            # confidently-incomplete answer.
+            alias_list = ", ".join(f"`{a['field']}`" for a in also_accessed)
+            first_alias = also_accessed[0]
+            answer = (
+                f"Each entry in `{ident}` has {len(fields)} documented field(s): "
+                f"{field_list} (documented shape at {where}). Consumers also read "
+                f"{alias_list} as a fallback (e.g. {first_alias['file']}:"
+                f"{first_alias['line']}) - an alias the docstring omits, so handle "
+                f"{alias_list} too if you touch this."
+            )
+            note = (
+                "Grounded in the documented field shape, plus alias key(s) "
+                "consumers read beside a documented field that the docstring "
+                "omits (see data_shape.also_accessed). The documented fields are "
+                "authoritative; the aliases are real keys the code defends against."
+            )
+        else:
+            answer = (
+                f"Each entry in `{ident}` has {len(fields)} field(s): {field_list}. "
+                f"This is the documented shape at {where}; cite it directly, no "
+                "verification Read needed."
+            )
+            note = (
+                "Grounded in the documented field shape mined from source (the "
+                "quoted keys in the docstring/comment at the cited line). "
+                "data_shape.sources lists every field's origin line."
+            )
+    else:
+        first = sources[0]
+        answer = (
+            f"Each entry in `{ident}` is accessed with {len(fields)} key(s): "
+            f"{field_list}. These are the keys consumers actually pull off the "
+            f"parsed value (e.g. {first['file']}:{first['line']}); this is mined "
+            "from usage, not a declared schema, so verify if you need the full set."
+        )
+        note = (
+            "Grounded in the key accesses mined from consumer source (no "
+            "documented shape was found). Medium confidence: these are the keys "
+            "the code reads, which may be a subset of the stored fields."
+        )
+    payload: dict = {
+        "answer": answer,
+        "citations": citations,
+        "confidence": grounded["confidence"],
+        "grounding": "data_shape",
+        "data_shape": {
+            "identifier": ident,
+            "fields": fields,
+            "sources": sources,
+            **({"also_accessed": also_accessed} if also_accessed else {}),
+        },
+        "fallback_targets": citations,
+        "retrieval": [],
+        "note": note,
+        "_meta": _build_meta(
+            timing_ms=(time.perf_counter() - t0) * 1000,
+            hint=_answer_hint(grounded["confidence"], len(citations)),
+            repository=repository,
+            targets=citations,
+        ),
+    }
+    return payload
 
 
 @mcp.tool()
@@ -263,6 +424,22 @@ async def get_answer(
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
         repo_id = repository.id
+
+    # --- Data-shape fast path ----------------------------------------------
+    # "what fields does each entry in <blob> contain" is answered by mining the
+    # field set straight from source (a documented {...} shape, else consistent
+    # key accesses) instead of gating to a best_guesses pointer list — the exact
+    # payload that triggers the agent's Read/get_symbol drill. Runs before the
+    # cache and retrieval: it's deterministic from live source, cheap, and reads
+    # the field set directly (retrieval scatters across every file that touches
+    # the blob and misses the one file that documents it). Returns None (falls
+    # through) unless the fields are genuinely grounded, so it can never invent a
+    # shape.
+    ds_ids = _extract_question_identifiers(question)
+    if _is_data_shape_question(question, ds_ids):
+        grounded = await asyncio.to_thread(mine_data_shape, getattr(ctx, "path", None), ds_ids)
+        if grounded is not None:
+            return _build_data_shape_payload(grounded, t0, repository)
 
     # --- Cache lookup --------------------------------------------------------
     # Scope: ignore the (rare) `scope` argument in the cache key for now;
@@ -346,6 +523,7 @@ async def get_answer(
                         len(payload.get("retrieval", [])),
                     ),
                     repository=repository,
+                    targets=[p for p in cached_paths if isinstance(p, str) and p],
                 )
                 return payload
 
@@ -381,6 +559,11 @@ async def get_answer(
     # candidate set so it's a tie-breaker, not a wholesale reordering.
     with contextlib.suppress(Exception):
         await _apply_pagerank_bias(hits, ctx)
+    # Deterministic coverage-tail pages are factual but thin — down-weight them
+    # so a projection can't displace a rich LLM page when both match. A tie-
+    # breaker, applied after the score biases and before symbol/flow anchoring
+    # (which can still promote a deterministic page the question names directly).
+    _downweight_deterministic(hits)
     # Graph expansion: 1-hop walk from the top hits to rescue near-misses
     # where retrieval landed in the right module but on the wrong file
     # (consumer instead of orchestrator). Adds up to 3 neighbors with a
@@ -395,10 +578,19 @@ async def get_answer(
     # Fuzzy retrieval misses deep-path definitions even when the symbol is
     # indexed; this makes "explain X" one-shot-complete instead of degrading
     # to best_guesses on plausible-but-wrong neighbors.
+    homonyms: dict = {"union": {}, "qualified_miss": []}
     if question_ids:
         with contextlib.suppress(Exception):
+            _anchor_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
             async with get_session(ctx.session_factory) as session:
-                hits = await _anchor_symbol_hits(session, repo_id, question_ids, hits)
+                hits, homonyms = await _anchor_symbol_hits(
+                    session,
+                    repo_id,
+                    question_ids,
+                    hits,
+                    repo_root=_anchor_root,
+                    session_factory=ctx.session_factory,
+                )
     # Concept anchoring: when a why/value question pins a literal number to a
     # described behaviour (no named symbol), grep source COMMENTS for the file
     # that justifies the number and anchor it as a dominant hit. Rescues the
@@ -407,6 +599,20 @@ async def get_answer(
     if _is_why_question(question) or _is_value_question(question):
         with contextlib.suppress(Exception):
             hits = await _concept_anchor_hits(getattr(ctx, "path", None), question, hits)
+    # Flow-path expansion: when the question anchors 2+ endpoints (a named
+    # symbol's file, a module it names), lead with the dependency/call path
+    # between them. Plain 1-hop expansion (above) rescues "right module wrong
+    # file" ranking misses; it does NOT reach a far endpoint 2-4 hops away that
+    # the question names but retrieval never ranked. This threads that path over
+    # imports + projected calls edges and injects its files so both endpoints
+    # surface in one call. Runs before the cap so an injected endpoint can take a
+    # top-5 slot.
+    flow_paths: list[list[str]] = []
+    with contextlib.suppress(Exception):
+        async with get_session(ctx.session_factory) as session:
+            hits, flow_paths = await _expand_via_flow_path(
+                session, repo_id, hits, question, question_ids
+            )
     # Always cap retrieval hits at 5 for the response payload.
     hits = hits[:5]
 
@@ -421,7 +627,100 @@ async def get_answer(
                     session, repo_id, hits, ctx, question_ids=question_ids
                 )
 
-    fallback_targets = [h["target_path"] for h in hits if h.get("target_path")]
+    # --- Qualified-miss guard ----------------------------------------------
+    # The question qualified a symbol (``Parent.leaf``) but the exact-name scan
+    # found the leaf only under OTHER parents. Return not-found rather than
+    # synthesizing from a same-named symbol elsewhere: a precise query must
+    # never degrade to a confidently-wrong answer (CodeGraph #173).
+    if homonyms.get("qualified_miss"):
+        missed = homonyms["qualified_miss"]
+        return {
+            "answer": "",
+            "citations": [],
+            "confidence": "low",
+            "note": (
+                f"No indexed definition matches the qualified name(s) {missed}. "
+                "The base name is defined elsewhere, but not under the "
+                "class/module you named, so this is not returning a same-named "
+                "symbol from another file, to avoid a confidently-wrong answer. "
+                'Re-check the qualifier, or call search_codebase mode="symbol" '
+                "on the base name to see every definition."
+            ),
+            "fallback_targets": [],
+            "retrieval": [],
+            "_meta": _build_meta(
+                timing_ms=(time.perf_counter() - t0) * 1000,
+                hint=_answer_hint("low", 0),
+                repository=repository,
+                targets=[],
+            ),
+        }
+
+    # --- Answer-by-union (homonym exact-name lookup) -----------------------
+    # The question named a symbol with N>=2 defs no qualifier disambiguates
+    # (``_severity_for`` x 4). Instead of bailing to a best_guesses pointer list
+    # (the exact thing that triggers the agent's get_symbol/get_context drill),
+    # inline the UNION of the candidate bodies (char-budgeted, Read-parity) so
+    # the agent picks the one it wants from material already in-hand. This is
+    # the fix for the retrieval-MISS class: those defs are never in the fuzzy
+    # candidate set, so the exact-name scan is the only thing that surfaces them.
+    # Defer to synthesis when the union is incidental: a prose question that
+    # merely mentions a many-def generic method (``to_dict``, ``provider_name``)
+    # would otherwise dump every unrelated body as a confidence=high answer,
+    # burying what was actually asked. A bare symbol lookup, or a small genuine
+    # parallel-impl set (``_severity_for`` x4), still answers by union.
+    union_groups = homonyms.get("union") or {}
+    if union_groups and union_defers_to_synthesis(question, question_ids, union_groups):
+        union_groups = {}
+    if union_groups:
+        repo_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
+        union_bodies, more_defs = build_homonym_union_bodies(repo_root, union_groups)
+        if union_bodies:
+            names = sorted(union_groups)
+            total = sum(len(v) for v in union_groups.values())
+            cited = sorted({b["path"] for b in union_bodies})
+            note = (
+                f"{total} definition(s) of {', '.join(names)} exist (exact-name "
+                f"index scan; this is the complete set). {len(union_bodies)} "
+                "inlined below in symbol_bodies as live source; use them "
+                "directly, no verification Read."
+            )
+            if more_defs:
+                note += (
+                    f" {len(more_defs)} more are in more_definitions; call "
+                    "get_symbol with the listed id, do NOT Read."
+                )
+            payload: dict = {
+                "answer": (
+                    f"`{', '.join(names)}` has {total} definition(s) in this repo; "
+                    "all are inlined in symbol_bodies below. They are distinct "
+                    "implementations, so pick the one for your context."
+                ),
+                "citations": cited,
+                "confidence": "high",
+                "grounding": "exact_symbol",
+                "symbol_bodies": union_bodies,
+                "fallback_targets": [b["path"] for b in union_bodies],
+                "retrieval": [],
+                "note": note,
+                "_meta": _build_meta(
+                    timing_ms=(time.perf_counter() - t0) * 1000,
+                    hint=_answer_hint("high", len(union_bodies)),
+                    repository=repository,
+                    targets=cited,
+                ),
+            }
+            if more_defs:
+                payload["more_definitions"] = more_defs
+            return payload
+        # Bodies unreadable (no repo root / files gone) — fall through to the
+        # normal retrieval/gate path rather than returning an empty union.
+
+    fallback_targets = [
+        h["target_path"]
+        for h in hits
+        if h.get("target_path") and _is_readable_path(h["target_path"])
+    ]
 
     if not hits:
         return {
@@ -431,13 +730,17 @@ async def get_answer(
             "fallback_targets": [],
             "retrieval": [],
             "note": (
-                "No wiki hits for this question. Fall back to "
-                "search_codebase or Grep to locate candidate files."
+                "No wiki hits for this question. Rephrase around the code "
+                'concept, or use search_codebase (mode="symbol" for an '
+                'identifier, mode="path" for a file name); if the question '
+                "names a file, call get_context on it directly. Grep only "
+                "if those come back empty too."
             ),
             "_meta": _build_meta(
                 timing_ms=(time.perf_counter() - t0) * 1000,
                 hint=_answer_hint("low", 0),
                 repository=repository,
+                targets=[],
             ),
         }
 
@@ -468,9 +771,6 @@ async def get_answer(
             dominant = (top_score / second_score) >= _DOMINANCE_RATIO
 
         if not dominant:
-            # Enrich top hits with substantive excerpts so the agent has
-            # real material to ground in (not one-line summaries).
-            await _enrich_gated_excerpts(hits, ctx)
             # Structured candidate set: a decision-shaped list with a
             # one-line justification per file. Beats the prior flat
             # ``fallback_targets`` list because the agent can pick ONE file
@@ -488,6 +788,13 @@ async def get_answer(
             # Mine source comments for rationale the wiki/decision corpus
             # missed — turns "go Read these 5 files" into a cited why.
             code_rationale = _gather_code_rationale(ctx, hits, fallback_targets, question)
+            # A miss should be cheap to READ, not just cheap to ignore. The old
+            # gated payload also carried a full per-hit key_symbols dump — the
+            # single largest block by volume — that duplicated best_guesses and
+            # went unused (2026-07-11 dogfood). best_guesses (file + one-line
+            # why + score) and code_rationale carry the choosing signal; the
+            # symbol dump does not. Drop it, and skip the excerpt-enrichment DB
+            # round-trip that only fed it (a small latency win on the miss path).
             gated: dict = {
                 "answer": "",
                 "citations": [],
@@ -498,10 +805,14 @@ async def get_answer(
                     f"Read {best_guesses[0]['file']} first — it scored highest "
                     "but retrieval was ambiguous, so verify before answering."
                     if best_guesses
-                    else "Fall back to search_codebase or Grep."
+                    else (
+                        'Retry search_codebase with mode="symbol" or '
+                        'mode="path" on the key terms; Grep only if those '
+                        "miss too."
+                    )
                 ),
                 "fallback_targets": fallback_targets,
-                "retrieval": _serialize_hits(hits, limit=_GATED_RETURN_HITS),
+                "retrieval": [],
                 "note": (
                     "Multiple plausible candidates — synthesis skipped to "
                     "avoid anchoring on a wrong frame. Each best_guess entry "
@@ -518,6 +829,7 @@ async def get_answer(
                 timing_ms=(time.perf_counter() - t0) * 1000,
                 hint=_answer_hint("low", len(hits)),
                 repository=repository,
+                targets=fallback_targets,
             )
             return gated
 
@@ -563,6 +875,7 @@ async def get_answer(
                     timing_ms=(time.perf_counter() - t0) * 1000,
                     hint=_answer_hint("high", len(hits)),
                     repository=repository,
+                    targets=[extraction["file"], *fallback_targets],
                 ),
             }
 
@@ -585,6 +898,7 @@ async def get_answer(
                 timing_ms=(time.perf_counter() - t0) * 1000,
                 hint=_answer_hint("low", len(hits)),
                 repository=repository,
+                targets=fallback_targets,
             ),
         }
 
@@ -632,6 +946,7 @@ async def get_answer(
                 timing_ms=(time.perf_counter() - t0) * 1000,
                 hint=_answer_hint("low", len(hits)),
                 repository=repository,
+                targets=fallback_targets,
             ),
         }
 
@@ -683,40 +998,16 @@ async def get_answer(
     # from get_symbol's `verified` contract. When the indexed body is longer
     # than the hydrator's line cap, a `continuation` names the exact range
     # read for the remainder (mirrors get_symbol).
-    # Gather eligible definitions across the top hits, ranked so the most
-    # relevant body leads. Tier 0 = the exact symbol the question named, as
-    # resolved by symbol anchoring (survives the fuzzy hydration cap that a
-    # parent class name otherwise floods). Tier 1 = question-matched hydrated
-    # symbols. Within a tier, a function/method outranks a class container, so
-    # "explain the extract_all method of DecisionExtractor" serves extract_all,
-    # not the 1,300-line class head. Then document order.
-    _body_candidates: list[tuple[int, int, int, str, dict]] = []
-    for h in hits[:_ENRICH_TOP_N_HITS]:
-        path = h.get("target_path")
-        if not path:
-            continue
-        for s in h.get("_anchor_symbols") or []:
-            name = s.get("name")
-            if not name or name not in answer_text:
-                continue
-            kind = s.get("kind")
-            kind_rank = 0 if kind in ("function", "method") else 1
-            _body_candidates.append((0, kind_rank, s.get("start_line") or 0, path, s))
-        for s in h.get("symbols") or []:
-            name = s.get("name")
-            if not name or len(name) < 3 or not s.get("_matched"):
-                continue
-            if name not in answer_text:
-                continue
-            kind = s.get("kind")
-            if kind not in ("function", "method", "class", "interface"):
-                continue
-            kind_rank = 0 if kind in ("function", "method") else 1
-            _body_candidates.append((1, kind_rank, s.get("start_line") or 0, path, s))
-    _body_candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+    _body_candidates = _gather_body_candidates(hits, answer_text)
 
     symbol_bodies: list[dict] = []
     _seen_bodies: set[tuple[str, str]] = set()
+    # True once a tier-0 body (the exact symbol the question named, resolved by
+    # symbol anchoring) is inlined. Its full live body IS the ground truth, so a
+    # response carrying it is content-grounded even when synthesis hedges — the
+    # confidence gate below reads this to avoid the "low, go Read" label that
+    # contradicts a payload already holding the answer (2026-07-11 dogfood).
+    served_named_body = False
     repo_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
     for _tier, _kind_rank, start, path, s in _body_candidates:
         if len(symbol_bodies) >= _INLINE_BODY_MAX_SYMBOLS:
@@ -748,6 +1039,8 @@ async def get_answer(
             entry["continuation"] = f"{path}:{end_served + 1}-{sym_end}"
         symbol_bodies.append(entry)
         _seen_bodies.add((path, name))
+        if _tier == 0:
+            served_named_body = True
 
     # Compute confidence from the dominance ratio (top hit vs second hit).
     # The dominance ratio is a more reliable separator than absolute BM25
@@ -776,7 +1069,14 @@ async def get_answer(
     # payload (~10k chars) through the conversation cache for no benefit.
     hedged = _answer_is_hedged(answer_text)
     if hedged:
-        confidence = "low"
+        # A hedge means the synthesised PROSE is weak — but when the exact
+        # symbol the question named is inlined in symbol_bodies (tier-0 anchor,
+        # full live body), the answer's ground truth is already in-hand. Labeling
+        # that "low" contradicts the payload and fires the "go Read" hint the
+        # body makes unnecessary, so the agent bails to Read when it never needed
+        # to. Hold such a response at medium; the note below redirects the agent
+        # from the hedged prose to the served body.
+        confidence = "medium" if served_named_body else "low"
 
     # Third gate — identifier-citation gate: when the question explicitly
     # names identifiers (classes / methods / snake_case / CamelCase) and
@@ -853,7 +1153,7 @@ async def get_answer(
         payload = {
             "answer": answer_text,
             "citations": citations,
-            "confidence": "low",
+            "confidence": confidence,
             "retrieval_quality": retrieval_quality,
             "fallback_targets": fallback_targets[:3],
             "retrieval": [],
@@ -867,10 +1167,22 @@ async def get_answer(
         # fallback_targets file, which is the whole point of anchoring.
         if symbol_bodies:
             payload["symbol_bodies"] = symbol_bodies
-            payload["note"] = (
-                "Synthesis hedged, but symbol_bodies carries the live body of "
-                "the symbol(s) you named — read that to answer."
-            )
+            if served_named_body:
+                # The exact symbol the question named is inlined below as live
+                # source. That is the answer; the hedge is about the surrounding
+                # prose, not the body. Say so, and mark the response grounded so
+                # the agent cites the body instead of re-reading the file.
+                payload["grounding"] = "symbol_body"
+                payload["note"] = (
+                    "Synthesis hedged on the prose, but symbol_bodies carries "
+                    "the full live body of the symbol(s) you named — cite that "
+                    "directly, no verification Read needed."
+                )
+            else:
+                payload["note"] = (
+                    "Synthesis hedged, but symbol_bodies carries the live body "
+                    "of the symbol(s) you named — read that to answer."
+                )
         # The hedge often means the rationale isn't in the wiki at all — it's a
         # code comment. Mine the candidate source for it before sending the
         # agent off to Read.
@@ -889,8 +1201,11 @@ async def get_answer(
         # confidence the citations + answer suffice — carrying five enriched
         # hits through the conversation cache buys nothing. At medium the
         # agent verifies the top candidates: two truncated hits, no symbol
-        # enrichment for graph-expansion neighbors. Low keeps the full
-        # block — that's when routing material earns its bytes.
+        # enrichment for graph-expansion neighbors. Low keeps a grounding
+        # block, but lean: the top hits with snippets, symbols pipeable but
+        # stripped of docstrings/excerpts — the full per-hit key_symbols dump
+        # was the largest block by volume and went mostly unused on a
+        # low-confidence answer (2026-07-11 dogfood).
         if confidence == "high":
             retrieval_view: list[dict] = []
         elif confidence == "medium":
@@ -898,7 +1213,7 @@ async def get_answer(
                 hits, limit=2, summary_chars=160, symbols_for_expanded=False
             )
         else:
-            retrieval_view = _serialize_hits(hits)
+            retrieval_view = _serialize_hits(hits, limit=_GATED_RETURN_HITS, lean_symbols=True)
         payload = {
             "answer": answer_text,
             "citations": citations,
@@ -940,11 +1255,7 @@ async def get_answer(
                 "retrieved excerpt — the 'why' may be conflated with a different "
                 "mechanism. Downgraded to medium; verify against "
                 f"{fallback_targets[0] if fallback_targets else 'the cited source'}"
-                + (
-                    " or the code_rationale comments below."
-                    if code_rationale
-                    else "."
-                )
+                + (" or the code_rationale comments below." if code_rationale else ".")
             )
             payload["next_action_hint"] = (
                 f"Verify the rationale before citing: the asserted frame term(s) "
@@ -964,17 +1275,17 @@ async def get_answer(
         # and the literal rationale is the comment we already mined. Surface it so
         # the win is the answer AND the cited comment in one call (no re-read),
         # unless a gate above already attached code_rationale.
-        if "code_rationale" not in payload and any(
-            h.get("_concept_anchored") for h in hits
-        ):
-            concept_rationale = _gather_code_rationale(
-                ctx, hits, fallback_targets, question
-            )
-            concept_rationale = _drop_already_surfaced(
-                concept_rationale, symbol_bodies, quotes
-            )
+        if "code_rationale" not in payload and any(h.get("_concept_anchored") for h in hits):
+            concept_rationale = _gather_code_rationale(ctx, hits, fallback_targets, question)
+            concept_rationale = _drop_already_surfaced(concept_rationale, symbol_bodies, quotes)
             if concept_rationale:
                 payload["code_rationale"] = concept_rationale
+
+    # Flow-path lead: when the question anchored 2+ endpoints, surface the
+    # dependency/call chain the answer traverses so the agent sees the path in
+    # the same call instead of reconstructing it hop by hop.
+    if flow_paths:
+        payload["flow_path"] = [" -> ".join(p) for p in flow_paths[:2]]
 
     # Persist to cache (upsert). Best-effort: cache failures must never block
     # the response — but they must be LOGGED, not suppressed. A plain INSERT
@@ -1014,5 +1325,6 @@ async def get_answer(
         timing_ms=(time.perf_counter() - t0) * 1000,
         hint=_answer_hint(confidence, len(hits)),
         repository=repository,
+        targets=[*citations, *fallback_targets],
     )
     return payload

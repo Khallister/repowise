@@ -9,6 +9,165 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.31.0] — 2026-07-12
+
+### Added
+- **Coverage-backed test intelligence.** repowise now ingests per-test coverage to build a test-to-code map, and puts it to work two ways: a missing-test signal proven by that map (real gaps, not just heuristics), and a new `repowise impacted-tests` command that takes a diff and lists only the tests that actually exercise the changed code, so you can run the smallest relevant subset instead of the whole suite. (#789, #790, #792, #793)
+- **Decisions mined from your agent sessions.** A shared agent-transcript layer lets repowise mine durable architectural decisions out of Claude Code / agent session transcripts, then deliver them relevance-ranked at session start and at edit time with a usage-feedback loop. Agent co-authorship is detected and decision scope is derived from it. (#774, #775, #776, #803)
+- **Flow-shaped answers.** `get_answer` can now trace how something gets from one named endpoint to another by walking the graph path between them and narrating the flow. (#804)
+- **Shell parsed to a real AST.** Shell scripts now parse into functions, source edges, and complexity like every other supported language, instead of being treated as opaque text. (#768)
+- **Lean MCP-only Docker image.** A new `Dockerfile.mcp` builds a slim MCP-server-only image for MCP hosts and server directories. (#800)
+
+### Changed
+- **`get_answer` is grounded in what it serves.** Synthesis is grounded in the exact body the answer returns, data-shape questions are grounded in the field set mined from source (including alias keys the shape omits), homonym symbols are answered by union across their definitions, and low-confidence misses are slimmed. `get_symbol(id=...)` is forgiven and a hedged answer is re-grounded on the served body. (#778, #779, #780, #772, #783)
+- **Performance findings move the health score.** Open performance-risk findings are now deducted from the performance score, so the number reflects outstanding perf debt. (#801)
+- **Decision sources gated and stickier.** The code-comment decision harvest is gone, decision sources are gated, and dismissals stick so a dismissed suggestion stays dismissed. (#773)
+- **FAQ-weighted docs budget.** Generation tilts documentation depth toward the modules people actually ask about. (#781)
+- **Hardier MCP surface.** Session-survival hardening for the tool surface, plus a response budget clamped under the live MCP host token cap, keeps the server responsive under strict hosts. (#767, #771)
+- **Prose search leads with concept pages.** Hybrid search now leads prose queries with concept and wiki pages instead of raw symbol hits. (#797)
+- **Contributors strip explains agent authorship.** The contributors view now spells out the agent-authored share of commits. (#799)
+
+### Fixed
+- **Incremental updates persist graph and symbol data.** `repowise update` now persists `graph_edges` and `wiki_symbols` on incremental runs (both were dropped before), and edge upserts keep the maximum confidence instead of overwriting it. (#795, #806, #807)
+- **`get_answer` verifies live slices.** Symbol bounds are verified before serving a live slice, and non-path node ids are kept out of `fallback_targets`. (#796, #769)
+- **Honest search and symbol signals.** Zero-exact search and filename-only `get_symbol` carry honesty signals instead of implying a confident hit. (#770)
+- **Execution-flow picker on the module overview.** The module overview gained an execution-flow picker with hierarchical-layout guardrails so large graphs stay readable. (#805)
+
+### Documentation
+- New hooks guide plus a "learns from your usage" section explaining the adoption feedback loop. (#784)
+- Full AGPL-3.0 license text so GitHub detects the license correctly. (#794)
+
+---
+
+## [0.30.0] — 2026-07-10
+
+### Added
+- **First-class output-language support.** `repowise init --language <code>` (15 languages: en, ru, es, fr, de, zh, ja, ko, it, pt, nl, pl, tr, ar, hi) sets the natural language for generated wiki pages; advanced interactive mode now asks for it too (English default). The choice persists to `.repowise/config.yaml` so `update` regenerates changed pages in the same language, and the workspace init, workspace generate, and server regenerate paths now honor it instead of silently defaulting to English. Code, file paths, and symbol names stay untranslated. Previously this was config-file-only (#99). (#756)
+- **Worktrees just work.** `repowise init` and `repowise update` inside a linked git worktree now auto-detect the base checkout and seed the worktree's index from it, then catch up incrementally; no flags needed. `--seed-from <base>` remains as an explicit override and `--no-seed` forces a cold init. See [WORKTREES.md](WORKTREES.md). (#655 introduced the manual flag; #747 makes it automatic.)
+- **Ruby and Scala promoted to Full health tier.** Both languages now get the full complexity node map and performance-risk dialect, so health scores and perf findings match the depth Python/TypeScript/Go already had. (#745, #749)
+- **Git stats awards.** The contributor stats view gained biggest-commit, longest-streak, most-imported-file, and dependency awards. (#752)
+- **Workspace socket-contract detection.** Cross-repo analysis now detects socket-based service contracts alongside HTTP ones. (#710)
+- **Anonymous feedback panel.** The dashboard gained a lightweight feedback panel — no account or email required. (#763)
+- **Claude Code integration: session context + safer distill.** The augment hook now emits a per-session context block with live index freshness on session start, the distill rewrite hook learned two safe shell-syntax carve-outs, and `repowise doctor` checks hook registration. (#743)
+
+### Changed
+- **Unchanged wiki pages are reused across runs.** Cross-run page reuse now keys on the documented file's content plus the generation settings (template, language, style) instead of the exact rendered prompt — which embedded per-run retrieval context and practically never matched. A re-run over a repo where a handful of files changed now regenerates only those pages; changing the model, output language, or wiki style still regenerates everything it should. (#757)
+- **One dataflow parse per file.** The health pass's dataflow consumers (the Extract Method detector and the perf advisory-to-asserted promotion) now share a single lazily parsed per-file analysis instead of each re-reading and re-parsing the file, making the health pass measurably faster on large repos with identical output. The new per-function dataflow summary and point-lookup APIs this introduces are the foundation for upcoming dataflow-backed surfaces. (#755)
+- **Leaner MCP surface for agents.** An agent-lean tool profile with tool-search gating and registry-pinned docs, plus payload-precision trims across tools, cut the token cost of the MCP surface without removing capability. (#742, #744)
+- **Graph view cleanups.** The module view no longer collapses into a single blob, external nodes are hidden by default, and node info panels are layer-aware. (#754)
+
+### Fixed
+- **Pages skipped by the update budget are labelled stale.** `repowise update` marks weakly-affected pages it chose not to regenerate as stale instead of leaving them claiming to be fresh, and `total_pages` is recomputed from the store. (#748)
+- **Dataflow CFG no longer flags reachable code as unreachable.** (#760)
+- **TypeScript object-literal shorthand properties count as reads**, fixing spurious unused-symbol findings. (#759)
+- **Cross-repo co-change is a bounded session-share signal**, preventing one shared session from dominating workspace coupling scores. (#758)
+- **Seeded worktree indexes no longer split in two.** Seeding now re-points the copied index at the worktree, so the first update reuses the seeded pages instead of minting a second repository entry and regenerating everything under it. (#747)
+- **`[workspace]` notices render again.** The one-line workspace auto-detect notice was being swallowed by console markup and printed without its prefix. (#747)
+
+### Documentation
+- User-facing docs restructured and refreshed (quickstart, user guide, CLI reference, config). (#741)
+- Plugin: the Claude Code plugin bundles the new SessionStart context hook. (#743)
+
+---
+
+## [0.29.0] — 2026-07-09
+
+### Added
+- **Leverage-weighted health signals.** `get_health` now surfaces NLOC-weighting and per-file leverage, so the score points at where a fix buys the most. (#719)
+- **Wider agent-authorship detection.** Git indexing recognizes agent-written commits across more provenance channels. (#731)
+
+### Changed
+- **Leaner `get_overview` by default.** The `get_overview` MCP payload is compact by default, cutting the token cost of orienting an agent. (#729)
+- **Health scores reflect corrected findings.** Removing the false findings below raises some file and repo health scores — this is expected and desirable, not a regression. Broad `except Exception` catches are now detected completely (they were previously under-counted), so a few files surface additional — but honest — findings.
+
+### Fixed
+- **Honest exception-handling rationale.** A broad `except Exception` is no longer described as catching `KeyboardInterrupt`/`SystemExit` — only a genuine bare `except:` or `except BaseException:` carries that warning, and `except Exception` gets its own rationale. Go blank-identifier discards are only flagged when the discarded value sits in the error position, and Rust panic macros and `.unwrap()`/`.expect()` inside test code are no longer flagged as recoverable-error crashes. (#733)
+- **Accurate complexity counting.** `elif` / `else if` chains no longer read as deep nesting (a flat guard chain is flat); parameter counts ignore the bare `*` / `/` separators; comprehension filters now count toward complexity; and docstring- and comment-only lines no longer inflate a function's or class's measured length. (#734)
+- **Fewer false performance findings.** I/O-in-loop, defer-in-loop, blocking-I/O-under-lock and related markers no longer fire on a closure that is merely defined — not run — inside a loop or lock; a parenthesized `await` is recognized as awaited; `deque.insert(0, …)` is no longer flagged as quadratic; name-shadowing collisions in the Python and TypeScript detectors are resolved; and a semaphore-bounded goroutine worker pool is no longer called unbounded. (#735)
+- **Truthful structural findings.** A god-class finding cites the complexity of the actual brain method rather than the class-wide maximum; an `UPDATE`/`DELETE` bounded by a `LIMIT` is no longer said to touch every row; a flat `match`/`case` dispatch table is no longer flagged as a large method; and hidden-coupling severity is no longer overstated from a handful of shared commits. (#736)
+- **Cleaner, more private MCP output.** Contributor email addresses are never shown in overview output (display names only); extreme churn renders as a multiplier instead of a runaway percentage; search snippets no longer repeat a title-only decision; comment-derived decisions rank below real architecture decisions; file counts are labeled; and decision titles truncate on a word boundary with an ellipsis. (#737)
+- **Atomic update lock.** `repowise update`'s lock file is now written atomically with its contents, closing a creation race. (#720)
+
+---
+
+## [0.28.1] — 2026-07-08
+
+### Changed
+- **Performance map colors by findings.** The performance code map now colors by open findings and detector coverage instead of the bounded score, so hot spots read at a glance. (#716)
+
+### Fixed
+- **Graph overlays show their nodes.** The full dependency graph reserves part of its node budget for dead-code files, hotspots, and execution-flow members instead of selecting purely by PageRank — the Dead/Hot overlays and flow highlighting no longer come up empty on large repos. The view says how many flagged files are in view ("12 of 37 dead files"), and empty overlays explain whether the repo has none or they fell outside the loaded set. (#714)
+- **Graph controls explain themselves.** The hierarchical layout says why it won't run above 500 nodes instead of silently doing nothing; the Execution Flows panel gained a close button and Escape handling, and warns when a selected flow has out-of-view nodes; the Dead/Hot toggle pair became an exclusive All / Hot / Dead control. (#714)
+- **Honest health drawer and stats labels.** Missing structural metrics render "not measured" instead of 0; score-breakdown bars scale against real category caps with a tooltip explaining the cap; the lines-of-code and agent-authorship stats now say exactly what they measure. (#715)
+- **Decisions page polish.** Missing decision dates render a dash instead of "Invalid Date"; the decision graph bounds its layout so large decision sets can't hang the page; Confirm/Dismiss/Deprecate explain what they do; and a new "Enforce this decision" button generates a paste-ready agent prompt that audits governed code for compliance. (#715)
+- **Honest performance coverage.** Dead performance markers are wired up and performance coverage is reported honestly. (#711)
+
+---
+
+## [0.28.0] — 2026-07-07
+
+### Added
+- **Lean 4 support.** A lightweight regex tier brings symbol extraction to Lean 4 codebases. (#600)
+
+### Changed
+- **Reliable incremental updates.** `repowise update` was reworked this cycle. Incremental runs now rebuild the knowledge graph, so an updated index stays as fresh as a full one instead of serving a stale graph (#702). The store is persisted and locked atomically with honest failure reporting, so an interrupted update rolls back cleanly rather than leaving a torn store behind (#706). The workspace and single-repo update paths were reconciled onto one code path (#703).
+
+### Fixed
+- **Cleaner code-health flagging.** Resolved false-flag presentation in Code Health across grouping, dominant-cause attribution, and floor magnitude. (#700)
+- **Contributors counted once.** GitHub noreply emails are folded together, so one person no longer shows up as two contributors. (#701)
+- **Fewer Go dead-code false positives.** Same-file type references are rescued from unused-export false positives in Go. (#629)
+
+### Documentation
+- **No-key quickstart.** Published a verified no-API-key quickstart in the README and on repowise.dev. (#627)
+
+---
+
+## [0.27.0] — 2026-07-05
+
+### Added
+- **VS Code extension 0.3.0.** The editor experience grew up this cycle. Refactoring plans can now be handed straight to an AI agent, and the extension exposes native chat tools so agents can query Repowise from inside the editor (#694). The SCM view gained change intelligence, per-file change risk, and symbol hover detail, alongside more reliable server discovery (#664, #691). The listing now leads with a hero walkthrough GIF and screenshots, and the extension icon reads correctly on dark themes (#696, #697).
+- **Dart support.** A Dart AST tier brings symbol extraction plus health and performance markers to Dart codebases. (#689)
+- **SQL and dbt intelligence.** Indexing now extracts SQL DDL symbols and dbt lineage (#683), models app-to-database contracts, and surfaces SQL-specific health markers (#687).
+- **Java and Rust dataflow.** The Extract Method dataflow layer now understands def/use chains in Java and Rust, extending refactoring analysis to those languages. (#686)
+- **`repowise login`, `logout`, and `whoami`.** New CLI commands to connect the CLI to your Repowise account. (#690)
+- **Storage footprint in `status`.** `repowise status` now reports the on-disk size of the index. (#681)
+- **Add-repo wizard.** The web app gained a guided add-repo flow with a cost preflight and a live first-index experience, plus first-run polish across the app icon, explore cards, and a collapsible workspace nav (#692, #685).
+- **Accurate coverage tab.** The Coverage tab now paginates, sorts, and reports coverage accurately on large repos. (#665)
+
+### Changed
+- **One consistent UI.** A design pass unified how the dashboard renders tables, stat tiles, row banding, loading skeletons, error states, and tooltips, so every view behaves the same way. (#695)
+- **Dataflow-verified performance findings.** Advisory performance findings are now verified against the dataflow layer, cutting false positives, with refactoring config wired through. (#684)
+
+### Fixed
+- **Health sync honors repo excludes.** Workspace health sync now respects the repo's configured excludes. (#638)
+- **External dependencies no longer masquerade as files.** The Files view stops linking external dependency nodes as if they were source files. (#673)
+- **More robust parallelism.** Parse and betweenness process pools now use `spawn`, avoiding fork-related instability on some platforms. (#679)
+
+### Dependencies
+- Added `sqlglot` (SQL parsing) and `tree-sitter-dart` (Dart grammar).
+
+---
+
+## [0.26.0] — 2026-07-03
+
+### Added
+- **VS Code extension.** Repowise now runs inside your editor. The extension manages the local server lifecycle, walks you through install to first insight, and registers the Repowise MCP tools for agent mode (#643, #644). Low-health files surface as diagnostics with gutter heat, and editor-native signals include live range risk scoring, a refactoring lens, dead-code line spans, and inline docs (#642, #644). A sidebar Home dashboard shows index freshness, a theme switcher, and consolidated trees (#650), and the shared visualization panels (graph, C4, health, blast radius) render directly in webviews (#649, #653). A settings panel configures editor signals and the server connection (#654), and the latest pass adds panel navigation and quieter defaults for an editor-native feel (#660). Install it from the VS Code Marketplace or Open VSX.
+- **Continuous-zoom architecture view.** The server builds a zoom-map artifact that drives a smooth, execution-aware zoom across the architecture graph. (#626)
+- **Configurable Ollama embedding timeout.** The Ollama embedding request timeout can now be set via environment variable for slower local models. (#656)
+
+### Changed
+- **Sharper `get_answer` grounding.** The `get_answer` MCP tool gained a frame-grounding gate and anchors rationale to in-code comments, with retrieval tuning across `get_answer` and `get_context`. (#621, #622)
+- **Faster decision embeddings.** Decision embeddings are batched during persistence and reindex, cutting indexing work on decision-heavy repos. (#641)
+
+### Fixed
+- **Config languages no longer inflate language usage.** Configuration-file languages are hidden from the language-usage breakdown. (#623)
+- **Index freshness stamp stays current on no-op syncs.** An `update` that finds no changes still refreshes the freshness stamp, so agents don't distrust a current index. (#652)
+
+### Dependencies
+- Cleared high and critical CVEs across the npm and Python dependency trees. (#645)
+
+---
+
 ## [0.25.0] — 2026-06-27
 
 ### Added

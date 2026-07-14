@@ -16,6 +16,15 @@ import {
   computeElkModulePositions,
 } from "../elk-layout";
 
+// ELK runs on the main thread (elk.bundled.js, no worker), so a large graph
+// would freeze the tab mid-layout. 500 nodes keeps the compute comfortably
+// interactive; raising this ceiling means moving ELK into a web worker first.
+export const ELK_MAX_NODES = 500;
+
+export function elkSkipReason(order: number): string {
+  return `Hierarchical layout is limited to ${ELK_MAX_NODES} nodes — this view has ${order.toLocaleString()}. Switch to the Modules scope or narrow the view to use it.`;
+}
+
 export interface UseElkSigmaLayoutOptions {
   graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes> | null;
   sigma: Sigma | null;
@@ -25,7 +34,7 @@ export interface UseElkSigmaLayoutOptions {
   moduleNodes?: ModuleNodeResponse[] | undefined;
   moduleEdges?: ModuleEdgeResponse[] | undefined;
   viewMode: ViewMode;
-  onSkipped?: (reason: string) => void;
+  onSkipped?: ((reason: string) => void) | undefined;
 }
 
 export interface UseElkSigmaLayoutReturn {
@@ -96,8 +105,8 @@ export function useElkSigmaLayout(
 
   useEffect(() => {
     if (enabled && graph && graph.order > 0) {
-      if (graph.order > 500) {
-        options.onSkipped?.("Graph too large for hierarchical layout (>500 nodes)");
+      if (graph.order > ELK_MAX_NODES) {
+        options.onSkipped?.(elkSkipReason(graph.order));
         return;
       }
       compute();

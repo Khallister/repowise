@@ -7,6 +7,7 @@ every public name, so existing imports are unaffected.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import select
@@ -36,10 +37,17 @@ async def upsert_repository(
     default_branch: str = "main",
     settings: dict | None = None,
     head_commit: str | None = None,
+    repo_id: str | None = None,
 ) -> Repository:
     """Create or update a repository record.
 
     Lookup is by ``local_path`` (the canonical key for local repositories).
+
+    ``repo_id`` fixes the primary key when the row is *created*. The server
+    keeps a registry row for each repo in its primary database and the
+    canonical row in the repo-local ``wiki.db``; both must share one id so
+    per-repo session routing keyed by that id resolves consistently. Ignored
+    when a row for ``local_path`` already exists (the existing id wins).
 
     ``head_commit`` records the git commit the index was built against — the
     value the MCP ``_meta`` freshness check compares to the live HEAD. Callers
@@ -56,7 +64,7 @@ async def upsert_repository(
 
     if repo is None:
         repo = Repository(
-            id=_new_uuid(),
+            id=repo_id or _new_uuid(),
             name=name,
             local_path=local_path,
             url=url,
@@ -118,6 +126,41 @@ def _read_head_commit(local_path: str) -> str | None:
             return None
         return None
     return head or None
+
+
+async def update_repo_git_totals(
+    session: AsyncSession,
+    repo_id: str,
+    *,
+    total_commit_count: int | None = None,
+    first_commit_at: datetime | None = None,
+    total_contributor_count: int | None = None,
+    first_commit_author: str | None = None,
+) -> None:
+    """Store a repo's whole-history git totals, captured at index time (#730).
+
+    The per-commit ``git_commits`` table is bounded to the newest N commits, so
+    the stats page must read true project age / commit / contributor counts from
+    these repo-level fields instead of that sample. Each argument is applied
+    only when non-``None`` so a partial capture never blanks a value a previous
+    index stored. No-ops on a missing repo or all-``None`` input.
+    """
+    updates = {
+        "total_commit_count": total_commit_count,
+        "first_commit_at": first_commit_at,
+        "total_contributor_count": total_contributor_count,
+        "first_commit_author": first_commit_author,
+    }
+    if all(v is None for v in updates.values()):
+        return
+    repo = await session.get(Repository, repo_id)
+    if repo is None:
+        return
+    for attr, value in updates.items():
+        if value is not None:
+            setattr(repo, attr, value)
+    repo.updated_at = _now_utc()
+    await session.flush()
 
 
 async def get_repository(session: AsyncSession, repo_id: str) -> Repository | None:
@@ -231,7 +274,7 @@ async def update_job_status(
 
     if status == "running" and job.started_at is None:
         job.started_at = _now_utc()
-    if status in ("completed", "failed"):
+    if status in ("completed", "failed", "cancelled"):
         job.finished_at = _now_utc()
 
     await session.flush()

@@ -27,7 +27,6 @@ from repowise.core.persistence.database import (
 )
 from repowise.core.persistence.models import GenerationJob
 from repowise.core.persistence.search import FullTextSearch
-from repowise.core.persistence.vector_store import InMemoryVectorStore
 from repowise.core.providers.embedding.base import MockEmbedder
 from repowise.server import __version__
 from repowise.server.routers import (
@@ -41,6 +40,7 @@ from repowise.server.routers import (
     dead_code,
     decisions,
     external_systems,
+    feedback,
     files,
     git,
     graph,
@@ -189,16 +189,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     fts = FullTextSearch(engine)
     await fts.ensure_index()
 
-    # Vector store (InMemory default; LanceDB/pgvector configured via env)
+    # Reuse the repo-local LanceDB index written by CLI init/update. A fresh
+    # in-memory store is used only when this database cannot be associated with
+    # a repository or the optional LanceDB runtime is unavailable.
     embedder = _build_embedder()
-    vector_store = InMemoryVectorStore(embedder=embedder)
+    from repowise.server.search_helpers import build_primary_vector_store
+
+    vector_store, primary_vector_repo_id = await build_primary_vector_store(
+        session_factory,
+        db_url,
+        embedder,
+    )
 
     # Store on app state (before scheduler, so scheduler can reference app_state)
     app.state.engine = engine
     app.state.session_factory = session_factory
+    app.state.db_url = db_url
     app.state.fts = fts
     app.state.vector_store = vector_store
-    app.state.background_tasks: set = set()  # Strong refs to prevent GC of asyncio tasks
+    app.state.primary_vector_repo_id = primary_vector_repo_id
+    app.state.background_tasks = set()  # Strong refs to prevent GC of asyncio tasks
+    app.state.job_tasks = {}  # job_id → asyncio.Task (cancel endpoint)
+    app.state.job_cancel_tokens = {}  # job_id → CancellationToken
+    app.state.job_events = {}  # job_id → JobEventBuffer (SSE message frames)
 
     # Background scheduler (pass app.state so polling can launch jobs)
     scheduler = setup_scheduler(session_factory, app_state=app.state)
@@ -227,6 +240,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # repo_id → vector store (LanceDB-backed) for per-repo semantic search.
     # Populated lazily by the search router on first use, then cached.
     app.state.workspace_vector_stores = {}  # repo_id → VectorStore
+    if primary_vector_repo_id is not None:
+        app.state.workspace_vector_stores[primary_vector_repo_id] = vector_store
 
     try:
         from pathlib import Path as _Path
@@ -345,6 +360,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception:
         logger.debug("Workspace detection skipped", exc_info=True)
 
+    # Re-register per-repo databases for repos added via the API (their data
+    # lives in <repo>/.repowise/wiki.db; the primary DB only holds a registry
+    # row). Runs after workspace detection so already-registered workspace
+    # repos are skipped.
+    try:
+        from repowise.server.repo_db import rediscover_repo_dbs
+
+        rediscovered = await rediscover_repo_dbs(app.state)
+        if rediscovered:
+            logger.info("repo_dbs_rediscovered", extra={"count": rediscovered})
+            # Jobs interrupted by the restart live in those per-repo DBs; the
+            # earlier resets only covered the primary and workspace DBs.
+            stale = await reset_workspace_stale_jobs(app.state)
+            if stale:
+                logger.warning("reset_stale_jobs", extra={"count": stale})
+    except Exception:
+        logger.debug("repo_db_rediscovery_skipped", exc_info=True)
+
     logger.info("repowise_server_started", extra={"version": __version__})
     yield
 
@@ -425,5 +458,6 @@ def create_app() -> FastAPI:
     app.include_router(stats.router)
     app.include_router(files.router)
     app.include_router(external_systems.router)
+    app.include_router(feedback.router)
 
     return app

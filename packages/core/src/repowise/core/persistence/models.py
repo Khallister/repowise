@@ -49,6 +49,22 @@ class Repository(Base):
     local_path: Mapped[str] = mapped_column(Text, nullable=False)
     default_branch: Mapped[str] = mapped_column(String(255), nullable=False, default="main")
     head_commit: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Whole-history git totals captured at index time via cheap ``git rev-list``
+    # calls. The per-commit ``git_commits`` table is deliberately bounded to the
+    # newest N commits (churn/co-change need no more), so project age and total
+    # commit count must be read from these repo-level fields rather than derived
+    # from that sample — otherwise a multi-year repo reads as a few months old
+    # (issue #730). NULL until the first index writes them / for non-git repos.
+    total_commit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_commit_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # All-time unique authors (mailmap-folded) and the founding author's name.
+    # Contributor count shares the #730 bug when read off the bounded sample;
+    # the founder rides along free (the root commit is already loaded for the
+    # first-commit date). Both NULL until the first index writes them.
+    total_contributor_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_commit_author: Mapped[str | None] = mapped_column(String(255), nullable=True)
     settings_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
@@ -1046,6 +1062,59 @@ class CoverageFile(Base):
     ingested_commit_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     __table_args__ = (UniqueConstraint("repository_id", "file_path", name="uq_coverage_files"),)
+
+
+class TestCoverageEntry(Base):
+    """One ``(test, source file)`` coverage fact - the test-to-code map.
+
+    Where :class:`CoverageFile` stores per-file aggregate coverage (a file is
+    covered, merged across every test), this keeps the test dimension: a row
+    says test ``test_id`` covered ``covered_lines_json`` of ``source_file``.
+    It backs the reverse index "given changed lines, which tests hit them"
+    that run-only-affected-tests and coverage-backed missing-test signals
+    lean on.
+
+    Design: a table, not a graph edge. The first consumer is a CI lookup
+    keyed by changed source file + lines, which is a straight table query; a
+    projected graph edge (composing with blast-radius) is deferred until a
+    consumer needs graph composition.
+
+    Point-in-time only: rows are overwritten per ingest run (delete-then
+    -insert by ``repository_id``), no history - mirroring ``CoverageFile``.
+    Populated only from context-carrying reports; ``covered_lines_json`` is a
+    JSON int list (ceiling: fine at current scale, swap to a bitmap/RLE
+    encoding if O(tests x files) row size becomes a problem).
+    """
+
+    __tablename__ = "test_coverage"
+    # Not a pytest test class despite the ``Test`` prefix.
+    __test__ = False
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    # Raw test identifier from the report (coverage.py context
+    # ``module::qualname|phase`` or an lcov ``TN:`` name).
+    test_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Canonical repo key of the test's own source file, when resolvable.
+    test_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Canonical repo key of the covered source file.
+    source_file: Mapped[str] = mapped_column(Text, nullable=False)
+    covered_lines_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    source_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+    ingested_commit_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("repository_id", "test_id", "source_file", name="uq_test_coverage"),
+        # Reverse index (changed source file -> covering tests) is the hot path.
+        Index("ix_test_coverage_repo_source", "repository_id", "source_file"),
+        # Forward index (test -> files it covers).
+        Index("ix_test_coverage_repo_test", "repository_id", "test_id"),
+    )
 
 
 class AnswerCache(Base):

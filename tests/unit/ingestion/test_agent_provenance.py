@@ -12,9 +12,13 @@ import json
 import time
 from unittest.mock import MagicMock
 
-from repowise.core.ingestion.git_commit_index import load_commit_index
+from repowise.core.ingestion.git_commit_index import (
+    load_commit_index,
+    load_git_ai_note_agents,
+)
 from repowise.core.ingestion.git_indexer.agent_provenance import (
     AgentProvenanceClassifier,
+    _agent_from_git_ai_note,
 )
 from repowise.core.ingestion.git_indexer.commit_rows import build_commit_rows
 from repowise.core.ingestion.git_indexer.file_history import index_file
@@ -23,8 +27,30 @@ from repowise.core.ingestion.git_indexer.records import _CommitRec
 CLF = AgentProvenanceClassifier()
 
 
-def _classify(an="Dev", ae="dev@x.com", cn="Dev", ce="dev@x.com", msg="feat: thing"):
-    return CLF.classify(an, ae, cn, ce, msg)
+def _classify(
+    an="Dev", ae="dev@x.com", cn="Dev", ce="dev@x.com", msg="feat: thing", note_agent=None
+):
+    return CLF.classify(an, ae, cn, ce, msg, note_agent=note_agent)
+
+
+def _git_ai_note(*tools: str) -> str:
+    """A minimal git-ai note (v3.0.0): one session per tool, valid metadata."""
+    sessions = {
+        f"s_{i:014x}": {"agent_id": {"tool": t, "id": f"id{i}", "model": "m"}}
+        for i, t in enumerate(tools)
+    }
+    attestation = "src/a.py\n" + "\n".join(
+        f"  s_{i:014x}::t_{i:014x} {i + 1}-{i + 5}" for i in range(len(tools))
+    )
+    meta = json.dumps(
+        {
+            "schema_version": "authorship/3.0.0",
+            "base_commit_sha": "deadbeef",
+            "prompts": {},
+            "sessions": sessions,
+        }
+    )
+    return f"{attestation}\n---\n{meta}"
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +103,45 @@ def test_coauthor_trailer_is_tier3() -> None:
     assert (prov.agent, prov.autonomy_tier, prov.channel) == ("claude", 3, "coauthor_trailer")
 
 
+def test_coauthor_trailer_with_bot_noreply_email_is_tier3() -> None:
+    """A co-author trailer whose e-mail is a known bot noreply identity is
+    matched through the identity registry — no explicit pattern needed."""
+    msg = (
+        "chore: bump deps\n\n"
+        "Co-authored-by: gemini-code-assist[bot] "
+        "<176961590+gemini-code-assist[bot]@users.noreply.github.com>"
+    )
+    prov = _classify(msg=msg)
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("gemini", 3, "coauthor_trailer")
+
+
+def test_coauthor_trailer_with_vendor_domain_email_is_tier3() -> None:
+    msg = "fix: retry\n\nCo-authored-by: Codex <codex@openai.com>"
+    prov = _classify(msg=msg)
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("codex", 3, "coauthor_trailer")
+
+
+def test_agent_local_part_at_vendor_domain_author_is_tier1() -> None:
+    prov = _classify(an="Claude", ae="claude@anthropic.com")
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("claude", 1, "service_email")
+    prov = _classify(an="Claude", ae="claude-sonnet@anthropic.com")
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("claude", 1, "service_email")
+
+
+def test_vendor_domain_committer_over_human_author_is_tier2() -> None:
+    prov = _classify(cn="Claude", ce="claude@anthropic.com")
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("claude", 2, "service_committer")
+
+
+def test_human_at_vendor_domain_is_unlabelled() -> None:
+    """The vendor domain alone must never label a commit — the local part has
+    to name the agent."""
+    prov = _classify(an="Jane Doe", ae="jane@anthropic.com")
+    assert prov.agent is None
+    msg = "fix: typo\n\nCo-authored-by: Jane Doe <jane@anthropic.com>"
+    assert _classify(msg=msg).agent is None
+
+
 def test_tier_precedence_footer_beats_trailer() -> None:
     """A commit carrying both a T2 footer and a T3 trailer is T2 — first match
     in tier order wins."""
@@ -105,6 +170,45 @@ def test_mentioning_claude_in_prose_is_not_a_footer() -> None:
     assert prov.agent is None
 
 
+def test_vendor_domain_lookalike_locals_are_unlabelled() -> None:
+    """The vendor-domain channel is an exact allowlist on the local part —
+    a human at an agent vendor whose address merely CONTAINS an agent token
+    must never classify as an agent."""
+    for email in (
+        "jean-claude@anthropic.com",
+        "claudette@anthropic.com",
+        "somecursorfan@cursor.com",
+        "jules@openai.com",
+    ):
+        assert _classify(an="Someone", ae=email).agent is None, email
+
+
+def test_vendor_domain_allowlists_are_per_vendor_not_a_flat_set() -> None:
+    """codex is OpenAI's agent identity, not Anthropic's."""
+    assert _classify(an="X", ae="codex@anthropic.com").agent is None
+
+
+def test_coauthor_human_name_containing_agent_token_is_unlabelled() -> None:
+    msg = "feat: sonata\n\nCo-authored-by: Claude Debussy <claude.debussy@anthropic.com>"
+    assert _classify(msg=msg).agent is None
+
+
+def test_mixed_case_coauthor_trailer_matches() -> None:
+    msg = "fix: z\n\nCO-AUTHORED-BY: Claude <NoReply@Anthropic.com>"
+    prov = _classify(msg=msg)
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("claude", 3, "coauthor_trailer")
+
+
+def test_multi_coauthor_human_first_agent_second_is_detected() -> None:
+    msg = (
+        "feat: pairing\n\n"
+        "Co-authored-by: Jane Doe <jane@example.com>\n"
+        "Co-authored-by: Claude <noreply@anthropic.com>"
+    )
+    prov = _classify(msg=msg)
+    assert (prov.agent, prov.autonomy_tier) == ("claude", 3)
+
+
 def test_devin_service_trailer_matches() -> None:
     msg = (
         "feat: connector\n\n"
@@ -113,6 +217,110 @@ def test_devin_service_trailer_matches() -> None:
     )
     prov = _classify(msg=msg)
     assert (prov.agent, prov.autonomy_tier) == ("devin", 3)
+
+
+# ---------------------------------------------------------------------------
+# Assisted-by / Generated-by AI-attribution trailers
+# ---------------------------------------------------------------------------
+
+
+def test_generated_by_trailer_is_tier2() -> None:
+    prov = _classify(msg="feat: x\n\nGenerated-by: Claude")
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("claude", 2, "generated_by_trailer")
+
+
+def test_assisted_by_trailer_is_tier3() -> None:
+    prov = _classify(msg="feat: x\n\nAssisted-by: GitHub Copilot")
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("copilot", 3, "assisted_by_trailer")
+
+
+def test_assisted_by_chatgpt_normalizes() -> None:
+    assert _classify(msg="fix: y\n\nAssisted-by: ChatGPTv5").agent == "chatgpt"
+
+
+def test_assisted_by_bare_human_name_is_not_an_agent() -> None:
+    """The trailer key is an AI marker, but an unrecognized value must not mint
+    a phantom agent — a project misusing Assisted-by for a human stays human."""
+    prov = _classify(msg="feat: pairing\n\nAssisted-by: Jane Smith")
+    assert prov.agent is None
+
+
+def test_generated_by_beats_assisted_by_on_tier() -> None:
+    """A commit with both trailers is classified at the stronger T2."""
+    msg = "feat: x\n\nGenerated-by: Cursor\nAssisted-by: Claude"
+    assert _classify(msg=msg).autonomy_tier == 2
+
+
+# ---------------------------------------------------------------------------
+# Cursor commit-local signals
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_html_marker_is_detected() -> None:
+    assert _classify(msg="feat: x\n\n<!-- Cursor -->").agent == "cursor"
+
+
+def test_generated_with_cursor_footer_is_detected() -> None:
+    assert _classify(msg="feat: x\n\nGenerated with Cursor").agent == "cursor"
+
+
+# ---------------------------------------------------------------------------
+# git-ai authorship notes (refs/notes/ai)
+# ---------------------------------------------------------------------------
+
+
+def test_git_ai_note_single_tool() -> None:
+    assert _agent_from_git_ai_note(_git_ai_note("cursor")) == "cursor"
+
+
+def test_git_ai_note_tool_alias_maps_to_label() -> None:
+    assert _agent_from_git_ai_note(_git_ai_note("claude-code")) == "claude"
+
+
+def test_git_ai_note_dominant_tool_wins() -> None:
+    assert _agent_from_git_ai_note(_git_ai_note("cursor", "cursor", "claude")) == "cursor"
+
+
+def test_git_ai_note_tie_is_ambiguous() -> None:
+    assert _agent_from_git_ai_note(_git_ai_note("cursor", "claude")) is None
+
+
+def test_git_ai_note_malformed_is_no_signal() -> None:
+    assert _agent_from_git_ai_note("") is None
+    assert _agent_from_git_ai_note("no divider here") is None
+    assert _agent_from_git_ai_note("attestation\n---\nnot json") is None
+
+
+def test_git_ai_note_classified_tier2() -> None:
+    prov = _classify(note_agent="cursor")
+    assert (prov.agent, prov.autonomy_tier, prov.channel) == ("cursor", 2, "git_ai_note")
+
+
+def test_bot_author_beats_git_ai_note() -> None:
+    """T1 service-account authorship outranks a note (more autonomous)."""
+    prov = _classify(
+        an="Cursor Agent",
+        ae="cursoragent@cursor.com",
+        note_agent="claude",
+    )
+    assert (prov.agent, prov.autonomy_tier) == ("cursor", 1)
+
+
+def test_load_git_ai_note_agents_absent_ref_is_empty_no_log() -> None:
+    """The common path: ref absent → {} without ever spawning the notes walk."""
+    repo = MagicMock()
+    repo.git.for_each_ref.return_value = ""
+    assert load_git_ai_note_agents(repo, 100) == {}
+    repo.git.log.assert_not_called()
+
+
+def test_load_git_ai_note_agents_parses_present_ref() -> None:
+    repo = MagicMock()
+    repo.git.for_each_ref.return_value = "abc123 commit\trefs/notes/ai"
+    note = _git_ai_note("cursor")
+    repo.git.log.return_value = f"\x00sha_agent\x1f{note}\n\x00sha_human\x1f\n"
+    agents = load_git_ai_note_agents(repo, 100)
+    assert agents == {"sha_agent": "cursor"}
 
 
 # ---------------------------------------------------------------------------

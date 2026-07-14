@@ -165,9 +165,12 @@ positive. (Languages without an `expression_statement` wrapper — e.g.
 Kotlin, where the call node sits directly in the statement list — are
 handled too: the call node is matched as the statement itself.)
 
-Ships control-flow + assertion mappings for **all nine full-tier
-languages** — Python, TypeScript, JavaScript, Go, Java, Kotlin, Rust, C++,
-C# — plus the `tsx`/`jsx` aliases; class-level (LCOM4 / god-class)
-mappings for all of those except **Go** (methods attach to a type via an
-external receiver, so there is no single grouping node). Adding more
-languages — any tier — is purely additive in `languages.py`.
+Ships control-flow + assertion mappings for **all eleven full-tier
+languages** (Python, TypeScript, JavaScript, Go, Java, Kotlin, Rust, C++,
+C#, Scala, Ruby) plus the `tsx`/`jsx` aliases and Dart; class-level (LCOM4 /
+god-class) mappings for all of those except **Go** (methods attach to a type
+via an external receiver, so there is no single grouping node). Ruby maps
+`class_kinds` (size / god-class facts) but leaves `member_access_kinds`
+unmapped on purpose — receiver-less `@ivar` idiom — so its LCOM4 stays at the
+no-signal valve. Adding more languages — any tier — is purely additive in
+`languages.py`.

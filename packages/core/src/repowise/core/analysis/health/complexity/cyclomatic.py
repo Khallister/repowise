@@ -41,6 +41,61 @@ _BODY_FIELD_NAMES = (
     "block",
 )
 
+# The ``if``-shaped node types that can appear as an ``else if`` / ``elif``
+# chain continuation. Ternaries / ``if_element`` collection-``if`` are
+# deliberately excluded — only statement-level if chains flatten.
+_ELSE_IF_NODE_KINDS = frozenset(
+    {"if_statement", "if_expression", "elif_clause", "elsif", "if_let_expression"}
+)
+
+# Branch nodes that are a decision point (count toward CCN) but do NOT open a
+# nesting level: a comprehension filter (``[x for x in xs if a]``) and a match
+# ``case ... if guard:`` both parse as ``if_clause`` and sit inline, not as a
+# nested block; Scala's ``guard`` (for-comprehension filter / match-case guard)
+# is the same inline shape, and Ruby's one-line modifier forms (``return x if
+# cond`` / ``x += 1 until done`` / ``x rescue nil``) are too. Treating them as
+# flat keeps ``max_nesting`` / ``cognitive`` honest — they were only added to
+# ``branch_kinds`` / ``loop_kinds`` / ``catch_kinds`` for the CCN count.
+_FLAT_BRANCH_KINDS = frozenset(
+    {
+        "if_clause",
+        "guard",
+        "if_modifier",
+        "unless_modifier",
+        "while_modifier",
+        "until_modifier",
+        "rescue_modifier",
+    }
+)
+
+
+def _is_elif_continuation(node: Node) -> bool:
+    """True when *node* is an ``else if`` / ``elif`` chain continuation.
+
+    Such an arm is visually flat guard-clause dispatch but the grammar nests
+    each arm under the previous ``else`` / ``alternative`` slot. We recognise
+    the continuation so the walker charges it a branch point (CCN) without
+    opening a fresh nesting level — mirroring the flat-``switch``/``match``
+    special-case. The AST shape differs per grammar:
+
+    - Python: a dedicated ``elif_clause`` node (always a continuation).
+    - Ruby: a dedicated ``elsif`` node (always a continuation).
+    - TypeScript / Rust / C++: the else-if is wrapped in an ``else_clause``.
+    - Java / Go / C# / Dart / Kotlin: the else-if node is the sibling that
+      immediately follows the parent ``if``'s ``else`` token.
+    """
+    if node.type not in _ELSE_IF_NODE_KINDS:
+        return False
+    if node.type in ("elif_clause", "elsif"):
+        return True
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "else_clause":
+        return True
+    prev = node.prev_sibling
+    return prev is not None and prev.type == "else"
+
 
 def _count_boolean_ops_in_condition(node: Node, lmap: LanguageNodeMap) -> int:
     """Count ``&&`` / ``||`` / ``and`` / ``or`` operators in a condition.
@@ -55,7 +110,10 @@ def _count_boolean_ops_in_condition(node: Node, lmap: LanguageNodeMap) -> int:
     stack: list[Node] = [node]
     while stack:
         cur = stack.pop()
-        if cur is not node and cur.type in lmap.function_kinds:
+        if cur is not node and (cur.type in lmap.function_kinds or cur.type in lmap.lambda_kinds):
+            # Lambdas / arrow functions used as condition values (sort keys,
+            # predicates) are a separate scope; their boolean operators are not
+            # part of the enclosing branch's own decision logic.
             continue
         if _is_boolean_operator(cur, lmap):
             count += 1
@@ -224,17 +282,27 @@ def _walk_function_body(
         ):
             is_flat_match_arm = True
 
+        # ``node.is_named`` guards grammars (Ruby) whose keyword tokens share
+        # the node-type name of their parent node (an ``if`` node contains an
+        # unnamed ``if`` token of type ``"if"``): only the named node is the
+        # control-flow construct — without the guard every Ruby branch/loop
+        # would double-count.
         if is_flat_match_arm:
             # Flat match arms: no CCN increment, no nesting increment.
             pass
-        elif (
+        elif node.is_named and (
             node.type in lmap.branch_kinds
             or node.type in lmap.loop_kinds
             or node.type in lmap.case_kinds
             or node.type in lmap.catch_kinds
         ):
             ccn_increment = 1
-            nesting_increment = 1
+            # An ``else if`` / ``elif`` chain arm and a comprehension /
+            # case-guard filter are flat: charge the extra branch (ccn) but do
+            # not open a new nesting level for them. This parallels the
+            # flat-``switch``/``match`` special-case above.
+            if node.type not in _FLAT_BRANCH_KINDS and not _is_elif_continuation(node):
+                nesting_increment = 1
             # Side-channel: count compound boolean ops in this
             # construct's condition. Does not affect ccn/cognitive
             # (boolean operators are still tallied independently by
@@ -250,10 +318,10 @@ def _walk_function_body(
                         enclosing_construct=_enclosing_construct(node, lmap),
                     )
                 )
-        elif node.type in lmap.try_kinds:
+        elif node.is_named and node.type in lmap.try_kinds:
             # TRY opens a nesting level but does not branch on its own.
             nesting_increment = 1
-        elif node.type in lmap.switch_kinds:
+        elif node.is_named and node.type in lmap.switch_kinds:
             # Detect flat match: all arms are simple single-expression arms.
             if _is_flat_match(node, lmap):
                 flat_match_ids.add(node.id)

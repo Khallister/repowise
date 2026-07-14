@@ -428,6 +428,91 @@ async def test_inline_body_truncation_emits_continuation(setup_mcp, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# Hedge + served named-symbol body — a hedge downgrades the PROSE, but when the
+# exact symbol the question named is inlined as a live body, the answer's ground
+# truth is already served. The response must not read "low, go Read" (which
+# contradicts the payload); it holds at medium with grounding="symbol_body".
+# ---------------------------------------------------------------------------
+
+
+def _patch_anchor(monkeypatch, answer_mod, anchored: dict):
+    """Force symbol anchoring to attach ``anchored`` to the top hit, as if the
+    question named an indexed symbol whose defining file got promoted."""
+
+    async def _fake_anchor(session, repo_id, question_ids, hits, **kwargs):
+        if hits:
+            hits[0]["_anchor_symbols"] = [anchored]
+        return hits, {"union": {}, "qualified_miss": []}
+
+    monkeypatch.setattr(answer_mod, "_anchor_symbol_hits", _fake_anchor)
+
+
+@pytest.mark.asyncio
+async def test_hedged_but_named_body_served_holds_medium(setup_mcp, monkeypatch, tmp_path):
+    """Hedged synthesis + the exact question-named symbol inlined as a live body
+    → medium with grounding='symbol_body', not low. The 'low → Read' hint the
+    body makes unnecessary must not fire."""
+    import repowise.server.mcp_server as mcp_mod
+    import repowise.server.mcp_server.tool_answer.answer as answer_mod
+    from repowise.server.mcp_server import get_answer
+
+    (tmp_path / "pkg" / "alpha").mkdir(parents=True)
+    (tmp_path / "pkg" / "alpha" / "one.py").write_text(
+        "def min_count_policy() -> int:\n"
+        "    # gate retries at the floor\n"
+        "    return MIN_COUNT\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path))
+
+    _patch_pipeline(monkeypatch, answer_mod, with_symbols=True, symbol=_FN_SYMBOL)
+    _patch_anchor(
+        monkeypatch,
+        answer_mod,
+        {
+            "name": "min_count_policy",
+            "kind": "function",
+            "start_line": 1,
+            "end_line": 3,
+        },
+    )
+    _patch_provider(
+        monkeypatch,
+        answer_mod,
+        "The provided excerpts do not include the full body of min_count_policy.",
+    )
+
+    result = await get_answer("How does min_count_policy work?")
+    assert result["confidence"] == "medium"
+    assert result["grounding"] == "symbol_body"
+    [b] = result["symbol_bodies"]
+    assert b["name"] == "min_count_policy"
+    assert "return MIN_COUNT" in b["source"]
+    assert "cite that directly" in result["note"]
+    # The low-confidence "Read the fallback_targets" hint must be gone.
+    assert "Low confidence" not in (result["_meta"].get("hint") or "")
+
+
+@pytest.mark.asyncio
+async def test_hedged_without_named_body_stays_low(setup_mcp, monkeypatch):
+    """The same hedge, but no anchored body is served → still low (the negative
+    control for the grounding bump)."""
+    import repowise.server.mcp_server.tool_answer.answer as answer_mod
+    from repowise.server.mcp_server import get_answer
+
+    _patch_pipeline(monkeypatch, answer_mod, with_symbols=True, symbol=_FN_SYMBOL)
+    _patch_provider(
+        monkeypatch,
+        answer_mod,
+        "The provided excerpts do not include the full body of min_count_policy.",
+    )
+
+    result = await get_answer("How does min_count_policy work?")
+    assert result["confidence"] == "low"
+    assert "grounding" not in result
+
+
+# ---------------------------------------------------------------------------
 # Symbol anchoring — force the defining file of a question-named symbol into
 # the candidate set when fuzzy retrieval missed it.
 # ---------------------------------------------------------------------------
@@ -485,16 +570,19 @@ async def test_anchor_injects_defining_file_as_dominant_hit():
         )
     ]
     hits = [{"target_path": "core/pipeline/incremental.py", "score": 3.6}]
-    out = await _anchor_symbol_hits(
+    out, homonyms = await _anchor_symbol_hits(
         _FakeSession(rows), "repo1", {"extract_all", "DecisionExtractor"}, hits
     )
     assert out[0]["target_path"] == "core/decisions/extractor.py"
     assert out[0]["_symbol_anchored"] is True
     assert out[0]["score"] > 3.6  # dominates the fuzzy top hit
+    assert not homonyms["union"]  # single resolved def, no union
 
 
 @pytest.mark.asyncio
-async def test_anchor_skips_ambiguous_homonym():
+async def test_anchor_unresolvable_homonym_becomes_union():
+    """A bare homonym (no qualifier) is not injected as a hit — its full def
+    set is returned in homonyms['union'] for the answer-by-union path."""
     from repowise.server.mcp_server.tool_answer.symbols import _anchor_symbol_hits
 
     rows = [
@@ -502,9 +590,30 @@ async def test_anchor_skips_ambiguous_homonym():
         _Sym("extract_all", "b/y.py", parent_name="B", qualified_name="B.extract_all"),
     ]
     hits = [{"target_path": "c/z.py", "score": 2.0}]
-    out = await _anchor_symbol_hits(_FakeSession(rows), "r", {"extract_all"}, hits)
+    out, homonyms = await _anchor_symbol_hits(_FakeSession(rows), "r", {"extract_all"}, hits)
     assert all(not h.get("_symbol_anchored") for h in out)
-    assert out[0]["target_path"] == "c/z.py"  # nothing injected
+    assert out[0]["target_path"] == "c/z.py"  # nothing injected into hits
+    assert {d["file_path"] for d in homonyms["union"]["extract_all"]} == {"a/x.py", "b/y.py"}
+    assert not homonyms["qualified_miss"]
+
+
+@pytest.mark.asyncio
+async def test_anchor_qualified_miss_records_not_found():
+    """The question qualifies the name (Foo.extract_all) but no def sits under
+    Foo — record a qualified miss instead of guessing another Parent's def."""
+    from repowise.server.mcp_server.tool_answer.symbols import _anchor_symbol_hits
+
+    rows = [
+        _Sym("extract_all", "a/x.py", parent_name="A", qualified_name="A.extract_all"),
+        _Sym("extract_all", "b/y.py", parent_name="B", qualified_name="B.extract_all"),
+    ]
+    hits = [{"target_path": "c/z.py", "score": 2.0}]
+    out, homonyms = await _anchor_symbol_hits(
+        _FakeSession(rows), "r", {"extract_all", "Foo.extract_all", "Foo"}, hits
+    )
+    assert homonyms["qualified_miss"] == ["extract_all"]
+    assert not homonyms["union"]  # a qualified miss must NOT fall back to a union
+    assert all(not h.get("_symbol_anchored") for h in out)
 
 
 @pytest.mark.asyncio
@@ -521,10 +630,11 @@ async def test_anchor_disambiguates_homonym_by_named_parent():
         ),
     ]
     hits = [{"target_path": "c/z.py", "score": 2.0}]
-    out = await _anchor_symbol_hits(
+    out, homonyms = await _anchor_symbol_hits(
         _FakeSession(rows), "r", {"extract_all", "DecisionExtractor"}, hits
     )
     assert out[0]["target_path"] == "b/y.py"
+    assert not homonyms["union"]
 
 
 @pytest.mark.asyncio
@@ -536,12 +646,159 @@ async def test_anchor_boosts_existing_hit_without_duplicating():
         {"target_path": "mcp/tool_symbol.py", "score": 9.4},
         {"target_path": "other.py", "score": 7.9},
     ]
-    out = await _anchor_symbol_hits(_FakeSession(rows), "r", {"get_symbol"}, hits)
+    out, _homonyms = await _anchor_symbol_hits(_FakeSession(rows), "r", {"get_symbol"}, hits)
     paths = [h["target_path"] for h in out]
     assert paths.count("mcp/tool_symbol.py") == 1  # boosted, not duplicated
     anchored = next(h for h in out if h["target_path"] == "mcp/tool_symbol.py")
     assert anchored["_symbol_anchored"] is True
     assert anchored["score"] >= 9.4
+
+
+def _write(tmp_path, rel, body):
+    p = tmp_path / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+    return rel
+
+
+def test_union_bodies_inlines_all_defs_under_budget(tmp_path):
+    """Answer-by-union renders every def body (Read-parity) when they fit."""
+    from repowise.server.mcp_server.tool_answer.symbols import build_homonym_union_bodies
+
+    a = _write(tmp_path, "a/x.py", "def _sev(op):\n    return op > 3\n")
+    b = _write(tmp_path, "b/y.py", "def _sev(corr):\n    return corr < 0.1\n")
+    union = {
+        "_sev": [
+            {"name": "_sev", "kind": "function", "file_path": a, "start_line": 1, "end_line": 2,
+             "qualified_name": "_sev", "parent_name": None},
+            {"name": "_sev", "kind": "function", "file_path": b, "start_line": 1, "end_line": 2,
+             "qualified_name": "_sev", "parent_name": None},
+        ]
+    }
+    bodies, more = build_homonym_union_bodies(tmp_path, union)
+    assert len(bodies) == 2 and not more
+    assert {e["path"] for e in bodies} == {a, b}
+    assert "op > 3" in bodies[0]["source"] and "corr < 0.1" in bodies[1]["source"]
+    assert bodies[0]["lines"] == [1, 2]
+
+
+def test_union_bodies_overflow_lists_remainder_as_pointers(tmp_path):
+    """Under a tiny budget, first def always renders; the rest go to
+    more_definitions with a do-NOT-Read get_symbol redirect."""
+    from repowise.server.mcp_server.tool_answer.symbols import build_homonym_union_bodies
+
+    a = _write(tmp_path, "a/x.py", "def _sev(op):\n    return op > 3\n")
+    b = _write(tmp_path, "b/y.py", "def _sev(corr):\n    return corr < 0.1\n")
+    union = {
+        "_sev": [
+            {"name": "_sev", "kind": "function", "file_path": a, "start_line": 1, "end_line": 2,
+             "qualified_name": "_sev", "parent_name": None},
+            {"name": "_sev", "kind": "function", "file_path": b, "start_line": 1, "end_line": 2,
+             "qualified_name": "_sev", "parent_name": None},
+        ]
+    }
+    bodies, more = build_homonym_union_bodies(tmp_path, union, char_budget=5)
+    assert len(bodies) == 1  # first always renders even over budget
+    assert len(more) == 1
+    assert more[0]["symbol_id"] == f"{b}::_sev"
+    assert "do NOT Read" in more[0]["hint"]
+
+
+# ---------------------------------------------------------------------------
+# Answer-by-union incidental gate — a prose question that merely MENTIONS a
+# many-def generic method (to_dict x33) must not dump every unrelated body as a
+# confidence=high answer; it falls through to synthesis. A small genuine union
+# (_severity_for x4) and an explicit bare-symbol lookup still answer by union.
+# ---------------------------------------------------------------------------
+
+
+def _union(name: str, n: int) -> dict:
+    return {name: [{"file_path": f"pkg/f{i}.py", "name": name} for i in range(n)]}
+
+
+def test_union_defers_only_when_prose_and_many_defs():
+    from repowise.server.mcp_server.tool_answer.symbols import union_defers_to_synthesis
+
+    q_prose = "How does a wiki page get its provider_name during indexing?"
+    # Prose + many defs → defer to synthesis.
+    assert union_defers_to_synthesis(q_prose, {"provider_name"}, _union("provider_name", 12))
+    # Small genuine union stays (the _severity_for x4 case) even in prose.
+    assert not union_defers_to_synthesis(
+        "How does _severity_for compute a severity level?",
+        {"_severity_for"},
+        _union("_severity_for", 4),
+    )
+    # Bare symbol lookup (prose does not dominate) still unions at any count.
+    assert not union_defers_to_synthesis("provider_name", {"provider_name"}, _union("provider_name", 12))
+    # No union → nothing to defer.
+    assert not union_defers_to_synthesis(q_prose, {"provider_name"}, {})
+
+
+def test_union_defer_ceiling_is_inclusive():
+    from repowise.server.mcp_server.tool_answer.config import _HOMONYM_UNION_PROSE_DEF_CEILING
+    from repowise.server.mcp_server.tool_answer.symbols import union_defers_to_synthesis
+
+    q = "How is a parsed record serialized with widget_dump before it is stored?"
+    ids = {"widget_dump"}
+    at = _HOMONYM_UNION_PROSE_DEF_CEILING
+    # At the ceiling: still a handful, keep the union.
+    assert not union_defers_to_synthesis(q, ids, _union("widget_dump", at))
+    # One past it: a generic method, defer.
+    assert union_defers_to_synthesis(q, ids, _union("widget_dump", at + 1))
+
+
+def _patch_anchor_union(monkeypatch, answer_mod, union_groups: dict):
+    """Force _anchor_symbol_hits to report a homonym union (no hit boost)."""
+
+    async def _fake_anchor(session, repo_id, question_ids, hits, **kwargs):
+        return hits, {"union": union_groups, "qualified_miss": []}
+
+    monkeypatch.setattr(answer_mod, "_anchor_symbol_hits", _fake_anchor)
+
+
+@pytest.mark.asyncio
+async def test_prose_mention_of_generic_method_synthesizes(setup_mcp, monkeypatch):
+    """A prose question naming a 12-def generic method falls through to synthesis
+    instead of returning grounding='exact_symbol' with a wall of unrelated bodies."""
+    import repowise.server.mcp_server.tool_answer.answer as answer_mod
+    from repowise.server.mcp_server import get_answer
+
+    _patch_pipeline(monkeypatch, answer_mod, with_symbols=False)
+    _patch_anchor_union(monkeypatch, answer_mod, _union("to_dict", 12))
+    _patch_provider(monkeypatch, answer_mod, "The page is serialized in pkg/alpha/one.py.")
+
+    result = await get_answer("How is a parsed file turned into a dict with to_dict before it is stored?")
+    assert result.get("grounding") != "exact_symbol"
+    assert "symbol_bodies" not in result or len(result.get("symbol_bodies") or []) < 12
+
+
+@pytest.mark.asyncio
+async def test_small_union_still_answers_by_union(setup_mcp, monkeypatch, tmp_path):
+    """A small genuine parallel-impl union (3 defs, under the ceiling) still
+    short-circuits to grounding='exact_symbol' — the gate must not over-suppress."""
+    import repowise.server.mcp_server as mcp_mod
+    import repowise.server.mcp_server.tool_answer.answer as answer_mod
+    from repowise.server.mcp_server import get_answer
+
+    (tmp_path / "pkg").mkdir(parents=True)
+    defs = []
+    for i in range(3):
+        (tmp_path / "pkg" / f"f{i}.py").write_text(
+            f"class C:\n    def render_widget(self):\n        return {i}\n",
+            encoding="utf-8",
+        )
+        defs.append(
+            {"file_path": f"pkg/f{i}.py", "name": "render_widget", "start_line": 2, "end_line": 3}
+        )
+    monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path))
+
+    _patch_pipeline(monkeypatch, answer_mod, with_symbols=False)
+    _patch_anchor_union(monkeypatch, answer_mod, {"render_widget": defs})
+    _patch_provider(monkeypatch, answer_mod, "unused — union short-circuits before synthesis")
+
+    result = await get_answer("How does render_widget build its output?")
+    assert result.get("grounding") == "exact_symbol"
+    assert len(result["symbol_bodies"]) == 3
 
 
 # ---------------------------------------------------------------------------

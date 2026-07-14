@@ -213,6 +213,9 @@ _BIOMARKER_DIMENSIONS: dict[str, set[str]] = {
     "io_in_loop": {"performance"},
     "string_concat_in_loop": {"performance"},
     "blocking_sync_in_async": {"performance"},
+    # Phase 6 dialect markers (Java/Go/Rust) - performance-only.
+    "regex_compile_in_loop": {"performance"},
+    "defer_in_loop": {"performance"},
     # Phase 7a loop markers - performance-only, same as the originals.
     "resource_construction_in_loop": {"performance"},
     "lock_in_loop": {"performance"},
@@ -230,6 +233,14 @@ _BIOMARKER_DIMENSIONS: dict[str, set[str]] = {
     "json_parse_in_loop": {"performance"},
     "array_spread_in_reduce": {"performance"},
     "goroutine_in_unbounded_loop": {"performance"},
+    # SQL markers - uncalibrated by construction (no defect corpus covers
+    # procedural SQL), so they are maintainability/performance-only. Every
+    # sql_* name MUST be listed here: an unlisted biomarker defaults into
+    # ``defect`` and would break the golden guarantee.
+    "sql_high_complexity": {"maintainability"},
+    "sql_select_star": {"maintainability"},
+    "sql_update_delete_without_where": {"maintainability"},
+    "sql_cartesian_join": {"performance"},
 }
 
 # Maintainability per-biomarker weight multipliers. Expert-set by definition -
@@ -246,6 +257,11 @@ _MAINTAINABILITY_WEIGHT_MULTIPLIER: dict[str, float] = {
     "god_class": 1.0,
     "large_method": 1.0,
     "nested_complexity": 1.0,
+    # SQL smells ship advisory (0.7) pending a precision spot-check on a
+    # migrations-heavy corpus, mirroring how new perf markers land.
+    "sql_high_complexity": 0.7,
+    "sql_select_star": 0.7,
+    "sql_update_delete_without_where": 0.7,
 }
 
 # Maintainability category per biomarker - an OWN table, independent of the
@@ -259,6 +275,11 @@ _MAINTAINABILITY_CATEGORY: dict[str, str] = {
     "primitive_obsession": "size_and_complexity",
     "dry_violation": "duplication",
     "error_handling": "error_handling",
+    # SQL smells share one capped category so a smell-dense migrations dir
+    # can't dominate the maintainability score.
+    "sql_high_complexity": "sql",
+    "sql_select_star": "sql",
+    "sql_update_delete_without_where": "sql",
 }
 
 # Maintainability per-category caps. Bounded so no single category dominates the
@@ -269,6 +290,7 @@ _MAINTAINABILITY_CATEGORY_CAPS: dict[str, float] = {
     "size_and_complexity": 2.0,
     "duplication": 2.0,
     "error_handling": 2.0,
+    "sql": 2.0,
 }
 
 # A finding's single "home" dimension, used for display and per-pillar
@@ -277,15 +299,28 @@ _MAINTAINABILITY_CATEGORY_CAPS: dict[str, float] = {
 # primary, calibrated role). Multi-dimension membership for scoring lives in
 # ``_BIOMARKER_DIMENSIONS`` - this label is just the finding's primary bucket.
 _MAINTAINABILITY_HOME: frozenset[str] = frozenset(
-    {"low_cohesion", "brain_method", "primitive_obsession", "dry_violation", "error_handling"}
+    {
+        "low_cohesion",
+        "brain_method",
+        "primitive_obsession",
+        "dry_violation",
+        "error_handling",
+        "sql_high_complexity",
+        "sql_select_star",
+        "sql_update_delete_without_where",
+    }
 )
 
 
 # ---------------------------------------------------------------------------
-# Performance dimension (PR3). Shipped at a small, ADVISORY weight - the whole
-# pillar is bounded by a single 1.0 category cap, so even a file riddled with
-# perf hits loses at most one health point on this dimension. Promotion to a
-# co-equal weight waits on PR4's cross-function precision study.
+# Performance dimension (PR3). Originally shipped at a small, ADVISORY weight
+# (a single 1.0 category cap), which left the pillar reading near-perfect even
+# on repos dense with open perf findings. With the cross-function pass landed
+# (PR4) and per-marker precision multipliers in place, the cap is raised to
+# 2.0 so open findings visibly move the score - still a deliberately
+# conservative ceiling for this first release (a file loses at most two
+# points regardless of hit count). Raising it further to a co-equal budget
+# waits on corpus precision data for the remaining advisory markers.
 # ---------------------------------------------------------------------------
 
 # Per-biomarker weight on the performance dimension. ``io_in_loop`` is the
@@ -305,6 +340,12 @@ _PERFORMANCE_WEIGHT_MULTIPLIER: dict[str, float] = {
     # (MARKER_BACKLOG.md); promote to full weight where corpus precision >= 70%.
     # resource_construction is the highest-confidence (classified constructor),
     # serial_await the lowest (cannot prove iteration independence).
+    # Phase 6 dialect markers. Both are high-precision syntactic shapes (Go
+    # `go vet`/`gocritic` ship defer-in-loop; the regex marker gates on a static
+    # literal pattern in Java/Go/Rust). Ship advisory pending this session's
+    # test-repo gate; bounded by the perf category cap either way.
+    "regex_compile_in_loop": 0.6,
+    "defer_in_loop": 0.6,
     "resource_construction_in_loop": 0.7,
     "lock_in_loop": 0.5,
     # PROMOTED 0.5 -> 0.7 (Phase-7c): 100% precision across corpora (7a 22/22 +
@@ -333,6 +374,9 @@ _PERFORMANCE_WEIGHT_MULTIPLIER: dict[str, float] = {
     "array_spread_in_reduce": 0.5,
     "json_parse_in_loop": 0.4,
     "goroutine_in_unbounded_loop": 0.4,
+    # SQL comma-join with no predicate: high-precision by AST shape, advisory
+    # weight pending a corpus spot-check like every new perf marker.
+    "sql_cartesian_join": 0.6,
 }
 
 # All perf biomarkers share one ``performance`` category, so the single cap
@@ -341,6 +385,8 @@ _PERFORMANCE_CATEGORY: dict[str, str] = {
     "io_in_loop": "performance",
     "string_concat_in_loop": "performance",
     "blocking_sync_in_async": "performance",
+    "regex_compile_in_loop": "performance",
+    "defer_in_loop": "performance",
     "resource_construction_in_loop": "performance",
     "lock_in_loop": "performance",
     "serial_await_in_loop": "performance",
@@ -355,11 +401,16 @@ _PERFORMANCE_CATEGORY: dict[str, str] = {
     "json_parse_in_loop": "performance",
     "array_spread_in_reduce": "performance",
     "goroutine_in_unbounded_loop": "performance",
+    "sql_cartesian_join": "performance",
 }
 
-# One bounded performance category cap. ~1.0 keeps performance advisory.
+# One bounded performance category cap. 2.0 is a deliberately conservative
+# first-release ceiling: enough for open findings to register on the pillar,
+# small enough that an all-advisory marker set cannot crater a file. Upgrade
+# path: raise toward the defect-style multi-point budget once the remaining
+# advisory markers clear their corpus precision gates (MARKER_BACKLOG.md).
 _PERFORMANCE_CATEGORY_CAPS: dict[str, float] = {
-    "performance": 1.0,
+    "performance": 2.0,
 }
 
 # Perf biomarkers home to ``performance`` for display / per-pillar filtering.
@@ -368,6 +419,8 @@ _PERFORMANCE_HOME: frozenset[str] = frozenset(
         "io_in_loop",
         "string_concat_in_loop",
         "blocking_sync_in_async",
+        "regex_compile_in_loop",
+        "defer_in_loop",
         "resource_construction_in_loop",
         "lock_in_loop",
         "serial_await_in_loop",
@@ -382,6 +435,7 @@ _PERFORMANCE_HOME: frozenset[str] = frozenset(
         "json_parse_in_loop",
         "array_spread_in_reduce",
         "goroutine_in_unbounded_loop",
+        "sql_cartesian_join",
     }
 )
 
@@ -519,7 +573,7 @@ def score_file(results: Iterable[BiomarkerResult]) -> tuple[dict[str, float | No
       identical to the pre-split ``score_file`` (the load-bearing guarantee).
       ``scores["performance"]`` is now measured (PR3): a file with no perf
       findings scores 10.0; the perf detectors deduct under a single bounded
-      ``performance`` cap. It is still capped low (advisory) and never blends
+      ``performance`` cap (2.0, a conservative ceiling). It never blends
       into ``defect``.
     - ``defect_deductions`` is each finding's contribution to the DEFECT score
       after category capping, parallel to *results*. It populates

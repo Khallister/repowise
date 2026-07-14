@@ -66,6 +66,74 @@ describe("DecisionsTable", () => {
     });
   });
 
+  it("renders a scope badge when the record carries one", () => {
+    render(
+      <DecisionsTable
+        {...baseProps}
+        decisions={[
+          makeDecision({ id: "1", scope: "file" }),
+          makeDecision({ id: "2", title: "Adopt SWR", scope: "cross-module" }),
+        ]}
+      />,
+    );
+    // The scope <select> options share these labels, so exclude them.
+    expect(screen.getAllByText("File").some((el) => el.tagName !== "OPTION")).toBe(true);
+    expect(
+      screen.getAllByText("Cross-module").some((el) => el.tagName !== "OPTION"),
+    ).toBe(true);
+  });
+
+  it("invokes onFiltersChange when the scope filter changes", () => {
+    const onFiltersChange = vi.fn();
+    render(
+      <DecisionsTable
+        {...baseProps}
+        onFiltersChange={onFiltersChange}
+        decisions={[makeDecision({ id: "1", scope: "file" })]}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Filter by scope"), {
+      target: { value: "module" },
+    });
+    expect(onFiltersChange).toHaveBeenCalledWith({
+      status: "all",
+      source: "all",
+      scope: "module",
+    });
+  });
+
+  it("hides the scope filter and ignores a scope value when no record carries scope", () => {
+    render(
+      <DecisionsTable
+        {...baseProps}
+        filters={{ status: "all", source: "all", scope: "file" }}
+        decisions={[
+          makeDecision({ id: "1", title: "Pick Postgres" }),
+          makeDecision({ id: "2", title: "Adopt SWR" }),
+        ]}
+      />,
+    );
+    expect(screen.queryByLabelText("Filter by scope")).not.toBeInTheDocument();
+    // Rows are NOT filtered out by the stale scope value.
+    expect(screen.getByText("Pick Postgres")).toBeInTheDocument();
+    expect(screen.getByText("Adopt SWR")).toBeInTheDocument();
+  });
+
+  it("filters rows client-side by scope", () => {
+    render(
+      <DecisionsTable
+        {...baseProps}
+        filters={{ status: "all", source: "all", scope: "file" }}
+        decisions={[
+          makeDecision({ id: "1", title: "Pick Postgres", scope: "file" }),
+          makeDecision({ id: "2", title: "Adopt SWR", scope: "cross-module" }),
+        ]}
+      />,
+    );
+    expect(screen.getByText("Pick Postgres")).toBeInTheDocument();
+    expect(screen.queryByText("Adopt SWR")).not.toBeInTheDocument();
+  });
+
   it("renders a retry button when an error is supplied with no decisions", () => {
     const onRetry = vi.fn();
     render(

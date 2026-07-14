@@ -13,15 +13,22 @@ from typing import Any
 from sqlalchemy import select
 
 from repowise.core.persistence.models import WikiSymbol
+from repowise.server.mcp_server._verify import verify_and_heal
 from repowise.server.mcp_server.tool_answer.config import (
     _ENRICH_TOP_N_HITS,
     _HIGH_CONFIDENCE_SCORE_FLOOR,
+    _HOMONYM_UNION_BODY_MAX_LINES,
+    _HOMONYM_UNION_CHAR_BUDGET,
+    _HOMONYM_UNION_PROSE_DEF_CEILING,
     _MATCHED_SYMBOL_SOURCE_LINES,
     _MAX_RICH_SIG_LINES,
     _MAX_SYMBOLS_PER_HIT,
     _MAX_SYMBOLS_TOP_HIT,
     _STOPWORDS,
+    _SYNTH_FULL_BODY_MAX_SYMBOLS,
+    _SYNTH_FULL_SOURCE_LINES,
 )
+from repowise.server.mcp_server.tool_search import _prose_dominates
 
 
 def _extract_question_identifiers(question: str) -> set[str]:
@@ -62,12 +69,62 @@ def _extract_question_identifiers(question: str) -> set[str]:
     return ids
 
 
+def union_defers_to_synthesis(
+    question: str, question_ids: set[str], union_groups: dict
+) -> bool:
+    """True when an answer-by-union should fall through to synthesis.
+
+    Answer-by-union is the right reply for a small set of genuine parallel
+    implementations the question is actually about (``_severity_for`` has 4
+    across the biomarkers). It is the WRONG reply when a prose question merely
+    *mentions* a generic method that happens to have many definitions: measured,
+    "how does a wiki page get its provider_name during indexing?" dumped 12
+    unrelated provider stubs as a confidence=high answer, and a ``to_dict``
+    mention dumped 28. Two signals must both hold before deferring, so the
+    narrowest population is affected:
+
+    * ``_prose_dominates`` — the query reads as prose, not a bare symbol lookup.
+      A bare ``provider_name`` (prose does not dominate) still unions: that
+      caller explicitly asked for every definition.
+    * the def count exceeds ``_HOMONYM_UNION_PROSE_DEF_CEILING`` — past a
+      handful, the name is a generic method, not a small parallel-impl set.
+
+    Small genuine unions and explicit lookups are untouched; only a prose
+    question naming a many-def generic method falls through to synthesis (which
+    grounds in the file the question is really about).
+    """
+    if not union_groups:
+        return False
+    total_defs = sum(len(defs) for defs in union_groups.values())
+    if total_defs <= _HOMONYM_UNION_PROSE_DEF_CEILING:
+        return False
+    return _prose_dominates(question, list(question_ids))
+
+
+def _read_repo_text(repo_root: Path | None, file_path: str) -> str | None:
+    """Read a repo file's live text, refusing paths outside the root.
+
+    The single disk read shared by the bounds gate and the signature/body
+    slices below, so a hydrated file is read once rather than once per helper.
+    """
+    if repo_root is None:
+        return None
+    try:
+        abs_path = (repo_root / file_path).resolve()
+        abs_path.relative_to(repo_root.resolve())
+        return abs_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
 def _read_symbol_source(
     repo_root: Path | None,
     file_path: str,
     start_line: int,
     end_line: int,
     max_lines: int = _MATCHED_SYMBOL_SOURCE_LINES,
+    *,
+    text: str | None = None,
 ) -> str | None:
     """Return the literal source body for a symbol, bounded to max_lines.
 
@@ -76,17 +133,16 @@ def _read_symbol_source(
     docstring; what it was missing was the actual code. With 40 lines of
     the method body in front of it, the synthesis step can answer "how
     does X work" without hedging back to "you should inspect the source".
+
+    ``text`` lets a caller that already read the file (the hydrator reads it
+    once for the bounds gate) pass the live source in, so a hydrated file is
+    read once instead of once per symbol.
     """
-    if repo_root is None or start_line < 1:
+    if start_line < 1:
         return None
-    try:
-        abs_path = (repo_root / file_path).resolve()
-        try:
-            abs_path.relative_to(repo_root.resolve())
-        except ValueError:
-            return None
-        text = abs_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    if text is None:
+        text = _read_repo_text(repo_root, file_path)
+    if text is None:
         return None
     lines = text.splitlines()
     if start_line > len(lines):
@@ -98,7 +154,7 @@ def _read_symbol_source(
 
 
 def _read_signature_from_source(
-    repo_root: Path | None, file_path: str, start_line: int
+    repo_root: Path | None, file_path: str, start_line: int, *, text: str | None = None
 ) -> str | None:
     """Read the symbol's actual signature line from disk.
 
@@ -108,19 +164,12 @@ def _read_signature_from_source(
       * decorators (one line above the def)
       * full type annotations across line continuations
 
+    ``text`` reuses the caller's already-read source (see _read_symbol_source).
     None on any failure — caller falls back to the stored signature.
     """
-    if repo_root is None:
-        return None
-    try:
-        abs_path = (repo_root / file_path).resolve()
-        # Defense in depth: never read outside the repo root.
-        try:
-            abs_path.relative_to(repo_root.resolve())
-        except ValueError:
-            return None
-        text = abs_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    if text is None:
+        text = _read_repo_text(repo_root, file_path)
+    if text is None:
         return None
     lines = text.splitlines()
     if not lines or start_line < 1 or start_line > len(lines):
@@ -179,12 +228,27 @@ def _extract_value_answer(hits: list[dict], question_ids: set[str]) -> dict | No
     return candidates[0] if candidates else None
 
 
+def _symbol_def_dict(sym) -> dict:
+    """Plain-dict view of a WikiSymbol def (decouples answer.py from the ORM)."""
+    return {
+        "name": sym.name,
+        "kind": sym.kind,
+        "file_path": sym.file_path,
+        "start_line": sym.start_line,
+        "end_line": sym.end_line,
+        "qualified_name": sym.qualified_name,
+        "parent_name": sym.parent_name,
+    }
+
+
 async def _anchor_symbol_hits(
     session,
     repo_id: str,
     question_ids: set[str],
     hits: list[dict],
-) -> list[dict]:
+    repo_root: Path | None = None,
+    session_factory: Any = None,
+) -> tuple[list[dict], dict[str, Any]]:
     """Inject the defining file of a question-named indexed symbol into hits.
 
     BM25 / vector retrieval misses deep-path files even when the named symbol
@@ -193,14 +257,34 @@ async def _anchor_symbol_hits(
     the definition, so synthesis hedges and ``symbol_bodies`` can't fire. When
     a question identifier resolves to a single indexed function / method /
     class, prepend (or boost) its defining file as the dominant hit so the
-    answer grounds in the actual definition. Homonyms are kept only when the
-    question also names the parent (``DecisionExtractor``) — never guessed.
+    answer grounds in the actual definition.
 
-    Returns ``hits`` re-sorted by score (mutated in place).
+    Homonyms (N>=2 defs of one name) split three ways:
+
+    * The question names the parent / qualifies the name so exactly one def
+      survives → anchor that def (as before).
+    * The question does NOT qualify the name → the whole def set is returned in
+      ``homonyms["union"]`` so the caller can inline the UNION of bodies instead
+      of bailing to a best_guesses pointer list (the pointer list is exactly
+      what triggers the agent's get_symbol/get_context drill). This is the fix
+      for the retrieval-MISS class (``_severity_for`` x 4) - the defs are never
+      in the fuzzy candidate set, so an exact-name index scan is the only thing
+      that surfaces them.
+    * The question qualifies the name (``Parent.leaf``) but NO def matches that
+      qualifier → recorded in ``homonyms["qualified_miss"]`` so the caller can
+      return not-found instead of synthesizing from a same-named symbol
+      elsewhere (a precise query must never degrade to a confident wrong answer).
+
+    Returns ``(hits, homonyms)``; ``hits`` is re-sorted by score (mutated in
+    place). ``homonyms = {"union": {name: [def_dict, ...]}, "qualified_miss":
+    [name, ...]}``.
     """
+    homonyms: dict[str, Any] = {"union": {}, "qualified_miss": []}
     if not question_ids:
-        return hits
+        return hits, homonyms
     qids_lower = {q.lower() for q in question_ids}
+    # Qualifiers the question used (dotted forms like ``decisionextractor.extract_all``).
+    qualifiers = {q for q in qids_lower if "." in q}
     res = await session.execute(
         select(WikiSymbol).where(
             WikiSymbol.repository_id == repo_id,
@@ -212,14 +296,35 @@ async def _anchor_symbol_hits(
     for row in res.scalars().all():
         by_name.setdefault(row.name, []).append(row)
 
+    # Verify bounds against the live file before any body is sliced from a
+    # stored range. Both the answer-by-union bodies (grounding=exact_symbol,
+    # confidence=high) and the anchored tier-0 symbol_bodies serve live source at
+    # these bounds, so a drifted row would otherwise ground the strongest-trust
+    # answer in the wrong lines. Cheap gate first (string check); a re-parse fires
+    # only on a genuine miss and heals the row. One live read per file, cached.
+    _text_cache: dict[str, str | None] = {}
+
+    async def _verified_dict(row) -> dict:
+        d = _symbol_def_dict(row)
+        if row.file_path not in _text_cache:
+            _text_cache[row.file_path] = _read_repo_text(repo_root, row.file_path)
+        text = _text_cache[row.file_path]
+        if text is None:
+            d["_approx"] = True
+            return d
+        check = await verify_and_heal(session_factory, row, text)
+        d["start_line"], d["end_line"] = check.start_line, check.end_line
+        if not check.verified:
+            d["_approx"] = True
+        return d
+
     chosen: list = []
-    for cands in by_name.values():
+    for name, cands in by_name.items():
         if len(cands) == 1:
             chosen.append(cands[0])
             continue
-        # Disambiguate a homonym only when the question names its parent or
-        # the parent appears in the qualified name. Otherwise skip — a wrong
-        # anchor is worse than no anchor.
+        # Disambiguate a homonym when the question names its parent or the
+        # parent appears in the qualified name.
         narrowed = [
             c
             for c in cands
@@ -232,9 +337,23 @@ async def _anchor_symbol_hits(
         ]
         if len(narrowed) == 1:
             chosen.append(narrowed[0])
+            continue
+        # Can't narrow to exactly one. Decide union vs qualified-miss.
+        leaf = (name or "").lower()
+        targeted = any(q.rsplit(".", 1)[-1] == leaf and q != leaf for q in qualifiers)
+        if narrowed:
+            # Qualifier matched >1 def: union of the narrowed set (still all
+            # genuine candidates for the qualified name).
+            homonyms["union"][name] = [await _verified_dict(c) for c in narrowed]
+        elif targeted:
+            # Qualifier present but matched nothing: do not guess.
+            homonyms["qualified_miss"].append(name)
+        else:
+            # Bare homonym, no qualifier: union of every def.
+            homonyms["union"][name] = [await _verified_dict(c) for c in cands]
 
     if not chosen:
-        return hits
+        return hits, homonyms
 
     by_path = {h.get("target_path"): h for h in hits}
     top_score = max((h.get("score", 0.0) for h in hits), default=0.0)
@@ -262,17 +381,98 @@ async def _anchor_symbol_hits(
             target["_symbol_anchored"] = True
         # Stash the exact symbol the question named so symbol_bodies serves it
         # directly — the fuzzy hydration cap drops a far-down method when the
-        # parent class name floods every sibling's qualified-name match.
+        # parent class name floods every sibling's qualified-name match. Serve
+        # verified bounds only: an unrelocatable (approximate) symbol still
+        # boosts its file's rank, but is not stashed for a live-body slice.
+        vd = await _verified_dict(sym)
+        if vd.get("_approx"):
+            continue
         target.setdefault("_anchor_symbols", []).append(
             {
                 "name": sym.name,
                 "kind": sym.kind,
-                "start_line": sym.start_line,
-                "end_line": sym.end_line,
+                "start_line": vd["start_line"],
+                "end_line": vd["end_line"],
             }
         )
     hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
-    return hits
+    return hits, homonyms
+
+
+def build_homonym_union_bodies(
+    repo_root: Path | None,
+    union_groups: dict[str, list[dict]],
+    char_budget: int = _HOMONYM_UNION_CHAR_BUDGET,
+) -> tuple[list[dict], list[dict]]:
+    """Inline the UNION of a homonym's defining bodies, char-budgeted.
+
+    ``union_groups`` maps a symbol name to the list of its indexed defs (from
+    ``_anchor_symbol_hits``). Returns ``(symbol_bodies, more_definitions)``:
+
+    * ``symbol_bodies``: Read-parity entries (same shape as get_answer's
+      existing ``symbol_bodies``: ``path`` / ``name`` / ``lines`` / ``source``,
+      plus ``truncated`` / ``continuation`` when the body was line-capped)
+      rendered greedily until ``char_budget`` is exhausted. The first def always
+      renders even if it alone exceeds the budget (a homonym with one huge def
+      must still answer), matching the CodeGraph "first match always renders"
+      contract.
+    * ``more_definitions``: the defs that did not fit, each ``{file, name,
+      line, symbol_id, hint}`` with a "call get_symbol, do NOT Read" redirect so
+      the agent never falls back to Read for the remainder.
+
+    Defs are ordered by (name, file_path) so output is deterministic across runs.
+    """
+    symbol_bodies: list[dict] = []
+    more: list[dict] = []
+    spent = 0
+    defs: list[dict] = []
+    for name in sorted(union_groups):
+        for d in sorted(union_groups[name], key=lambda x: (x.get("file_path") or "")):
+            defs.append(d)
+
+    for d in defs:
+        path = d.get("file_path")
+        name = d.get("name")
+        start = d.get("start_line") or 0
+        end = d.get("end_line") or 0
+        symbol_id = f"{path}::{name}"
+        # Bounds that failed live verification (symbol moved and could not be
+        # re-located): don't inline a slice at unreliable lines under a
+        # confidence=high envelope. Hand the agent a get_symbol pointer, which
+        # verifies on its own path.
+        body = (
+            None
+            if d.get("_approx")
+            else _read_symbol_source(
+                repo_root, path, start, end, max_lines=_HOMONYM_UNION_BODY_MAX_LINES
+            )
+        )
+        # Budget: always render the first, then only while under budget.
+        if body and (not symbol_bodies or spent + len(body) <= char_budget):
+            served = body.count("\n") + 1
+            end_served = start + served - 1
+            entry: dict = {
+                "path": path,
+                "name": name,
+                "lines": [start, end_served],
+                "source": body,
+            }
+            if end and end > end_served:
+                entry["truncated"] = True
+                entry["continuation"] = f"{path}:{end_served + 1}-{end}"
+            symbol_bodies.append(entry)
+            spent += len(body)
+        else:
+            more.append(
+                {
+                    "file": path,
+                    "name": name,
+                    "line": start,
+                    "symbol_id": symbol_id,
+                    "hint": f"call get_symbol id='{symbol_id}' for this definition, do NOT Read",
+                }
+            )
+    return symbol_bodies, more
 
 
 async def _concept_anchor_hits(
@@ -422,14 +622,35 @@ async def _hydrate_symbols_for_hits(
     )
     by_file: dict[str, list[dict]] = {}
     repo_root = Path(str(ctx.path)) if ctx and ctx.path else None
+    session_factory = getattr(ctx, "session_factory", None)
+    # One live read per hydrated file, shared by the bounds gate and the
+    # signature/body slices. None when unreadable (missing/outside root).
+    text_cache: dict[str, str | None] = {}
     for row in res.scalars().all():
+        if row.file_path not in text_cache:
+            text_cache[row.file_path] = _read_repo_text(repo_root, row.file_path)
+        text = text_cache[row.file_path]
+        # Trust contract (shared with get_symbol): verify the stored bounds
+        # against the live file before slicing a signature or body out of it.
+        # Drift (an edit above the def, or an update lag) otherwise turns into a
+        # garbled signature / body served as if fresh. On a re-parse correction
+        # the row is healed; when the symbol can't be re-located we fall back to
+        # the stored signature and skip the live body — a stored-but-consistent
+        # signature beats a live slice at the wrong lines.
+        if text is not None:
+            check = await verify_and_heal(session_factory, row, text)
+            start_line, end_line, verified = check.start_line, check.end_line, check.verified
+        else:
+            start_line, end_line, verified = row.start_line, row.end_line, False
         # Constants/variables: the stored signature IS the verbatim assignment
         # line. The disk re-read below walks forward looking for a ":"-closed
         # def line and would join unrelated following lines for assignments.
-        if row.kind in ("constant", "variable"):
+        if row.kind in ("constant", "variable") or not verified:
             rich_sig = None
         else:
-            rich_sig = _read_signature_from_source(repo_root, row.file_path, row.start_line)
+            rich_sig = _read_signature_from_source(
+                repo_root, row.file_path, start_line, text=text
+            )
         # Does the symbol name match any identifier from the question?
         name_lower = (row.name or "").lower()
         qname_lower = (row.qualified_name or "").lower()
@@ -450,12 +671,14 @@ async def _hydrate_symbols_for_hits(
             "kind": row.kind,
             "signature": rich_sig or row.signature,
             "docstring": row.docstring or "",
-            "start_line": row.start_line,
-            "end_line": row.end_line,
+            "start_line": start_line,
+            "end_line": end_line,
             "_matched": matched,
         }
-        if matched:
-            src = _read_symbol_source(repo_root, row.file_path, row.start_line, row.end_line)
+        if matched and verified:
+            src = _read_symbol_source(
+                repo_root, row.file_path, start_line, end_line, text=text
+            )
             if src:
                 entry["source_excerpt"] = src
         by_file.setdefault(row.file_path, []).append(entry)
@@ -486,6 +709,31 @@ async def _hydrate_symbols_for_hits(
             if len(kept) >= cap:
                 break
             kept.append(s)
+        # Upgrade the top question-relevant symbols to the inline-body depth
+        # BEFORE the reading-order sort, while `kept` is still in priority order
+        # (anchors, then matched, then unmatched). The default 40-line excerpt
+        # truncates a docstring-heavy definition before its answer-bearing logic,
+        # so synthesis hedges on the exact symbol whose full 120-line body the
+        # response inlines in symbol_bodies. Reading the leading few at the same
+        # depth keeps the LLM's view and the served body consistent. Bounded so a
+        # class-name flood can't balloon the prompt; the rest keep the excerpt.
+        upgraded = 0
+        for s in kept:
+            if upgraded >= _SYNTH_FULL_BODY_MAX_SYMBOLS:
+                break
+            if not s.get("_matched") or not s.get("source_excerpt"):
+                continue
+            fuller = _read_symbol_source(
+                repo_root,
+                path,
+                s["start_line"],
+                s.get("end_line") or 0,
+                max_lines=_SYNTH_FULL_SOURCE_LINES,
+                text=text_cache.get(path),
+            )
+            if fuller:
+                s["source_excerpt"] = fuller
+            upgraded += 1
         # Sort final slice by start_line for natural reading order.
         kept.sort(key=lambda s: s["start_line"])
         h["symbols"] = kept
